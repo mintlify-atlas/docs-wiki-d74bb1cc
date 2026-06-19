@@ -1,0 +1,308 @@
+---
+title: "Locking abstractions: in-process lock and key normalizer"
+sidebarTitle: "Abstractions"
+description: "Volo.Abp.DistributedLocking.Abstractions walkthrough: IAbpDistributedLockHandle, LocalAbpDistributedLock, and the IDistributedLockKeyNormalizer contract."
+---
+
+The abstractions package, `Volo.Abp.DistributedLocking.Abstractions`, holds the public contracts and the fallback in-process implementation of ABP's distributed-locking layer. It is what application code references when it injects `IAbpDistributedLock`, and it is the only package required for unit tests and single-instance hosts. Real cross-node locks (Redis, SQL, Dapr) are layered on top via the `[Dependency(ReplaceServices = true)]` pattern — see the [overview](/locking/overview) for the higher-level picture.
+
+This page focuses on the contracts (`IAbpDistributedLock`, `IAbpDistributedLockHandle`), the key normalizer (`IDistributedLockKeyNormalizer` / `DistributedLockKeyNormalizer`), and the local implementation (`LocalAbpDistributedLock`, `LocalAbpDistributedLockHandle`). The Dapr alternative is documented separately in [Dapr locking](/locking/dapr-locking).
+
+## Package layout
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpDistributedLockingAbstractionsModule.cs` | `AbpModule` | Empty marker module; convention-based DI handles registrations. |
+| `IAbpDistributedLock.cs` | Interface | `TryAcquireAsync(name, timeout, ct)`. |
+| `IAbpDistributedLockHandle.cs` | Interface | `IAsyncDisposable` marker for the acquired lock. |
+| `AbpDistributedLockOptions.cs` | Options | Single `KeyPrefix` property. |
+| `IDistributedLockKeyNormalizer.cs` | Interface | `NormalizeKey(string name) → string`. |
+| `DistributedLockKeyNormalizer.cs` | Class | Default implementation; concatenates `KeyPrefix + name`. |
+| `LocalAbpDistributedLock.cs` | Class | In-process implementation backed by `AsyncKeyedLocker<string>`. |
+| `LocalAbpDistributedLockHandle.cs` | Class | Wraps the local releaser so `DisposeAsync` releases the semaphore. |
+
+## `IDistributedLockKeyNormalizer`
+
+The normalizer is the only customization point on the way from the caller-provided `name` to the backing store. Implementations are called once per `TryAcquireAsync` call by every implementation of `IAbpDistributedLock`:
+
+```csharp Volo.Abp.DistributedLocking.Abstractions/IDistributedLockKeyNormalizer.cs
+public interface IDistributedLockKeyNormalizer
+{
+    string NormalizeKey(string name);
+}
+```
+
+The default implementation prepends `AbpDistributedLockOptions.KeyPrefix`:
+
+```csharp Volo.Abp.DistributedLocking.Abstractions/DistributedLockKeyNormalizer.cs
+public class DistributedLockKeyNormalizer : IDistributedLockKeyNormalizer, ITransientDependency
+{
+    protected AbpDistributedLockOptions Options { get; }
+
+    public DistributedLockKeyNormalizer(IOptions<AbpDistributedLockOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public virtual string NormalizeKey(string name)
+    {
+        return $"{Options.KeyPrefix}{name}";
+    }
+}
+```
+
+That single line is enough to keep distinct applications sharing a single Redis or SQL backend from colliding on the same lock names — set `KeyPrefix = "myapp:"` in the application module and you are done.
+
+For more elaborate transformations (e.g. tenant-scoped prefixes, hash-based shortening to fit a backend's key-length limit), override the normalizer:
+
+```csharp
+public class TenantAwareDistributedLockKeyNormalizer : IDistributedLockKeyNormalizer, ITransientDependency
+{
+    private readonly AbpDistributedLockOptions _options;
+    private readonly ICurrentTenant _currentTenant;
+
+    public TenantAwareDistributedLockKeyNormalizer(
+        IOptions<AbpDistributedLockOptions> options,
+        ICurrentTenant currentTenant)
+    {
+        _options = options.Value;
+        _currentTenant = currentTenant;
+    }
+
+    public string NormalizeKey(string name)
+    {
+        var tenant = _currentTenant.Id?.ToString("N") ?? "host";
+        return $"{_options.KeyPrefix}{tenant}:{name}";
+    }
+}
+```
+
+Register it with `[Dependency(ReplaceServices = true)]` or via `services.Replace(...)` and every `IAbpDistributedLock` implementation will pick it up.
+
+## `IAbpDistributedLockHandle`
+
+The handle is intentionally featureless — just an `IAsyncDisposable`:
+
+```csharp Volo.Abp.DistributedLocking.Abstractions/IAbpDistributedLockHandle.cs
+public interface IAbpDistributedLockHandle : IAsyncDisposable
+{
+}
+```
+
+This is the only API surface application code sees on a successful lock. Concrete implementations (`LocalAbpDistributedLockHandle`, `MedallionAbpDistributedLockHandle`, `DaprAbpDistributedLockHandle`) override `DisposeAsync` to release the underlying backend-specific resource. Callers always wrap the handle in `await using` so that releasing happens whether the critical section succeeds or throws:
+
+```csharp
+await using var handle = await _lock.TryAcquireAsync("queue:cleanup", TimeSpan.FromSeconds(10));
+if (handle == null) return;
+// critical section
+```
+
+If you need to escape the abstraction (for advanced scenarios like sharing a Medallion handle with other DistributedLock APIs), cast via `AbpDistributedLockHandleExtensions.ToDistributedSynchronizationHandle(...)` — but that is only available when you also depend on `Volo.Abp.DistributedLocking`.
+
+## `LocalAbpDistributedLock`
+
+The local implementation is registered as a singleton (because it owns process-wide state — an `AsyncKeyedLocker<string>`). It is used when no other module replaces the service.
+
+```csharp Volo.Abp.DistributedLocking.Abstractions/LocalAbpDistributedLock.cs
+public class LocalAbpDistributedLock : IAbpDistributedLock, ISingletonDependency
+{
+    private readonly AsyncKeyedLocker<string> _localSyncObjects = new(o =>
+    {
+        o.PoolSize = 20;
+        o.PoolInitialFill = 1;
+    });
+
+    protected IDistributedLockKeyNormalizer DistributedLockKeyNormalizer { get; }
+
+    public LocalAbpDistributedLock(IDistributedLockKeyNormalizer distributedLockKeyNormalizer)
+    {
+        DistributedLockKeyNormalizer = distributedLockKeyNormalizer;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        var key = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        var timeoutReleaser = await _localSyncObjects.LockAsync(key, timeout, cancellationToken);
+        if (!timeoutReleaser.EnteredSemaphore)
+        {
+            timeoutReleaser.Dispose();
+            return null;
+        }
+        return new LocalAbpDistributedLockHandle(timeoutReleaser);
+    }
+}
+```
+
+`AsyncKeyedLocker<string>` is a third-party library (from the `AsyncKeyedLock` package) that maintains one `SemaphoreSlim` per distinct key. It pools semaphores (`PoolSize = 20`, `PoolInitialFill = 1`) to avoid allocating one per call. When `LockAsync` returns a releaser whose `EnteredSemaphore` is `false`, the call timed out — the implementation disposes the releaser and returns `null`, matching the `IAbpDistributedLock` contract.
+
+The handle simply forwards `DisposeAsync` to `Dispose` (the locker's releaser is synchronously disposable):
+
+```csharp Volo.Abp.DistributedLocking.Abstractions/LocalAbpDistributedLockHandle.cs
+public class LocalAbpDistributedLockHandle : IAbpDistributedLockHandle
+{
+    private readonly IDisposable _disposable;
+
+    public LocalAbpDistributedLockHandle(IDisposable disposable)
+    {
+        _disposable = disposable;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _disposable.Dispose();
+        return default;
+    }
+}
+```
+
+### Semantics
+
+| Scenario | Behavior |
+| --- | --- |
+| Same process, same key, first caller | Acquires immediately, returns a handle. |
+| Same process, same key, second caller within `timeout` | Waits; acquires when the first caller disposes. |
+| Same process, same key, second caller after `timeout` | Returns `null`. |
+| Different process | Both acquire independently (no cross-process awareness). |
+| `cancellationToken` triggered while waiting | Throws `OperationCanceledException`. |
+
+The local lock works fine for unit tests and single-instance development hosts — but if you scale out to multiple replicas, you must add a real backend. `LocalAbpDistributedLock` does **not** detect that condition; it will happily issue contradictory locks across pods. That is exactly why `MedallionAbpDistributedLock` and `DaprAbpDistributedLock` carry `[Dependency(ReplaceServices = true)]`: depending on the higher-level module is enough to swap in a real implementation.
+
+## Service replacement
+
+The local implementation registers itself with `ISingletonDependency`, plain (no `ReplaceServices = true`). Higher-level implementations use:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MedallionAbpDistributedLock : IAbpDistributedLock, ITransientDependency { … }
+```
+
+ABP's convention-based DI honors `ReplaceServices = true` by removing the previously registered service descriptor for `IAbpDistributedLock` and registering the new one. The result is a clean swap: anything that injected `IAbpDistributedLock` now gets the Medallion (or Dapr) implementation without having to update its registration.
+
+## How application code should use the abstractions
+
+The typical pattern is unchanged across implementations:
+
+```csharp
+public class CleanupWorker : AsyncPeriodicBackgroundWorkerBase
+{
+    private readonly IAbpDistributedLock _lock;
+
+    public CleanupWorker(
+        AbpAsyncTimer timer,
+        IServiceScopeFactory serviceScopeFactory,
+        IAbpDistributedLock @lock)
+        : base(timer, serviceScopeFactory)
+    {
+        _lock = @lock;
+        timer.Period = (int)TimeSpan.FromMinutes(5).TotalMilliseconds;
+    }
+
+    protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext context)
+    {
+        await using var handle = await _lock.TryAcquireAsync(
+            name: "cleanup:orphan-blobs",
+            timeout: TimeSpan.Zero);
+
+        if (handle == null)
+        {
+            return; // another instance is already running the cleanup
+        }
+
+        // …work…
+    }
+}
+```
+
+`TryAcquireAsync(name, timeout: TimeSpan.Zero)` is the standard "leader" pattern — only one instance does the work; the others see `null` and bail.
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant App   as Application code
+    participant Lock  as LocalAbpDistributedLock
+    participant Norm  as DistributedLockKeyNormalizer
+    participant Sem   as AsyncKeyedLocker&lt;string&gt;
+
+    App->>Lock: TryAcquireAsync("cleanup", 5s)
+    Lock->>Norm: NormalizeKey("cleanup")
+    Norm-->>Lock: "myapp:cleanup"
+    Lock->>Sem:  LockAsync("myapp:cleanup", 5s)
+    Sem-->>Lock: releaser (EnteredSemaphore = true)
+    Lock-->>App: LocalAbpDistributedLockHandle
+    App->>Lock: handle.DisposeAsync()
+    Lock->>Sem:  releaser.Dispose()
+```
+
+## Operational notes
+
+- **Singleton vs transient** — the local lock is a singleton because it owns the keyed locker. The Medallion/Dapr replacements are transient because each call gets its own pooled handle from the backend.
+- **Cancellation vs timeout** — `timeout = TimeSpan.Zero` returns immediately with `null` if the lock is held; `timeout = Timeout.InfiniteTimeSpan` waits indefinitely (subject to cancellation). Pick the smallest reasonable timeout for production code so callers can recover quickly.
+- **Reentrancy** — `LocalAbpDistributedLock` is *not* reentrant. A second `TryAcquireAsync` for the same key inside an already-locked critical section will block / time out. Design your code so that a single critical section owns the lock.
+- **Key length / charset** — the abstraction layer does not impose limits; respect the underlying backend's rules (Redis allows arbitrary binary, SQL Server has a 255-byte limit, etc.). Override the normalizer if you need to hash long keys.
+
+## Replacing the local lock without depending on Medallion
+
+For unit tests, you sometimes want to force `LocalAbpDistributedLock` even when the host has `Volo.Abp.DistributedLocking` referenced. The simplest path is to manually re-register the local one:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.Replace(
+        ServiceDescriptor.Singleton<IAbpDistributedLock, LocalAbpDistributedLock>());
+}
+```
+
+`services.Replace` evicts whatever was previously registered (including the Medallion or Dapr one) and installs the local lock. This is convenient in the `TestBase` module of a `WebApplicationFactory`-style test harness.
+
+## Composing with other primitives
+
+`IAbpDistributedLock` composes well with several other ABP building blocks:
+
+| Building block | Composition example |
+| --- | --- |
+| [Background workers](/background/background-workers) | "Singleton leader" — only one replica drives the work, others see `null` and exit. |
+| [Distributed cache](/caching/distributed-cache) | Cache-stampede protection — acquire a per-key lock before recomputing a cache miss. |
+| [Unit of work](/uow) | Cross-host transaction coordination — guard the UoW with a lock keyed on the aggregate id. |
+| [Event bus](/events/distributed-event-bus) | Idempotency — wrap the consumer with a lock keyed on the message id so duplicate deliveries are no-ops. |
+
+## Constants and helpers
+
+The abstractions package does not expose helpers like `WaitForLockAsync(name, maxWait, interval)` — write your own retry loop if you need wait-with-backoff semantics:
+
+```csharp
+public static async Task<IAbpDistributedLockHandle> AcquireWithRetryAsync(
+    this IAbpDistributedLock @lock,
+    string name,
+    TimeSpan maxWait,
+    TimeSpan retryInterval,
+    CancellationToken cancellationToken = default)
+{
+    var deadline = DateTimeOffset.UtcNow + maxWait;
+    while (true)
+    {
+        var handle = await @lock.TryAcquireAsync(name, TimeSpan.Zero, cancellationToken);
+        if (handle != null) return handle;
+
+        if (DateTimeOffset.UtcNow >= deadline)
+            throw new AbpException($"Could not acquire lock '{name}' within {maxWait}.");
+
+        await Task.Delay(retryInterval, cancellationToken);
+    }
+}
+```
+
+Stick with the lower-level `TryAcquireAsync(name, timeout)` for the common case — it pushes the waiting into the backend, which is more efficient than client-side polling.
+
+## Cross-references
+
+- [Locking overview](/locking/overview) — the `Volo.Abp.DistributedLocking` module and the Medallion adapter.
+- [Dapr locking](/locking/dapr-locking) — Dapr-backed implementation that replaces `LocalAbpDistributedLock`.
+- [Background workers](/background/background-workers) — most common consumer of `IAbpDistributedLock`.
+- [Caching overview](/caching/overview) — combine locks with caches for cache-stampede protection.

@@ -1,0 +1,430 @@
+---
+title: "CMS Kit Comments: Generic Threaded Discussion Aggregate"
+sidebarTitle: "Comments"
+description: "Generic Comment aggregate inside CMS Kit, the ICommentRepository contract, CommentManager domain service, allowed-entity registration, idempotency, and the public and admin app services."
+---
+
+The CMS Kit Comments feature is a tiny but very generic threaded‑discussion store: one `Comment` aggregate per row, keyed by `(EntityType, EntityId)` so any other aggregate — blog posts, pages, even other modules' entities — can opt into being commented on by registering itself with `CmsKitCommentOptions`. Replies are modelled as comments with a `RepliedCommentId` parent pointer, idempotency tokens stop double‑submits, and a tiny set of permissions plus an `[Authorize]` attribute on the public service keep it safe. This page maps the source under `Volo.CmsKit.Domain/Volo/CmsKit/Comments/`, lists every type and signature, and shows the public `ICommentPublicAppService` plus the admin moderation service that drives the back‑office.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments). See [Overview](/modules/cms-kit/overview) for how Comments fits with the rest of CMS Kit.
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/"
+Comment.cs
+CommentManager.cs
+ICommentRepository.cs
+ICommentEntityTypeDefinitionStore.cs
+DefaultCommentEntityTypeDefinitionStore.cs
+CommentWithAuthorQueryResultItem.cs
+EntityNotCommentableException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `Comment.cs` | `AggregateRoot<Guid>` | Comment row keyed by `(EntityType, EntityId)`, with optional `RepliedCommentId` |
+| `CommentManager.cs` | `DomainService` | Validates entity type, looks up author, builds the aggregate |
+| `ICommentRepository.cs` | interface | Listing, counting, threaded delete, idempotency check |
+| `ICommentEntityTypeDefinitionStore.cs` | interface | Lookup for which entity types accept comments |
+| `DefaultCommentEntityTypeDefinitionStore.cs` | impl | Reads from `CmsKitCommentOptions.EntityTypes` |
+| `CommentWithAuthorQueryResultItem.cs` | DTO | Projection `(Comment, Author)` used by repository methods |
+| `EntityNotCommentableException.cs` | `BusinessException` | Raised when an entity type was not registered as commentable |
+
+`CmsKitCommentOptions` and `CommentEntityTypeDefinition` live in `Volo.CmsKit.Domain.Shared/Volo/CmsKit/Comments/`.
+
+## Domain model
+
+```mermaid
+erDiagram
+    COMMENT ||--o{ COMMENT : "replies (RepliedCommentId → Id)"
+    CMSUSER ||--o{ COMMENT : "authors"
+
+    COMMENT {
+        Guid Id PK
+        string EntityType
+        string EntityId
+        string Text
+        Guid? RepliedCommentId
+        Guid CreatorId
+        string Url
+        string IdempotencyToken
+        DateTime CreationTime
+        Guid? TenantId
+    }
+```
+
+`EntityType` is a free‑form string — e.g. `"BlogPost"`, `"Page"`, or any user‑defined value — that must be registered via `CmsKitCommentOptions.EntityTypes`. `EntityId` is the *string* form of the target entity's id, so comments can reference both `Guid` aggregates and string‑keyed aggregates without a schema change.
+
+### `Comment`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/Comment.cs"
+public class Comment : AggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator, IMultiTenant
+{
+    public virtual Guid?    TenantId         { get; protected set; }
+    public virtual string   EntityType       { get; protected set; }
+    public virtual string   EntityId         { get; protected set; }
+    public virtual string   Text             { get; protected set; }
+    public virtual Guid?    RepliedCommentId { get; protected set; }
+    public virtual Guid     CreatorId        { get; set; }
+    public virtual DateTime CreationTime     { get; set; }
+    public virtual string   Url              { get; set; }
+    public virtual string   IdempotencyToken { get; set; }
+
+    internal Comment(
+        Guid id,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [NotNull] string text,
+        Guid? repliedCommentId,
+        Guid creatorId,
+        [CanBeNull] string url = null,
+        Guid? tenantId = null) : base(id)
+    {
+        EntityType = Check.NotNullOrWhiteSpace(entityType, nameof(entityType), CommentConsts.MaxEntityTypeLength);
+        EntityId = Check.NotNullOrWhiteSpace(entityId, nameof(entityId), CommentConsts.MaxEntityIdLength);
+        RepliedCommentId = repliedCommentId;
+        CreatorId = creatorId;
+        Url = url;
+        TenantId = tenantId;
+        SetTextInternal(text);
+    }
+
+    public virtual void SetText(string text) => SetTextInternal(text);
+
+    protected virtual void SetTextInternal(string text) =>
+        Text = Check.NotNullOrWhiteSpace(text, nameof(text), CommentConsts.MaxTextLength);
+}
+```
+
+A couple of things worth noting:
+
+- `Url` stores the page URL the comment was posted from, useful for moderation views. It is set by `CommentPublicAppService` from `HttpContext.Request.Path`.
+- `IdempotencyToken` is a client‑supplied opaque token. `ICommentRepository.ExistsAsync(idempotencyToken)` lets the public service reject re‑submits when the browser retries on a slow network. The maximum length is `CommentConsts.MaxIdempotencyTokenLength = 32`.
+- `IMustHaveCreator` integrates with the ABP user lookup so `CreatorId` is always populated from the current user.
+- Constants come from `CommentConsts` (`MaxTextLength = 512`, plus configurable entity type / id / URL caps).
+
+### `CommentManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/CommentManager.cs"
+public class CommentManager : DomainService
+{
+    protected ICommentEntityTypeDefinitionStore DefinitionStore { get; }
+
+    public virtual async Task<Comment> CreateAsync(
+        [NotNull] CmsUser creator,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [NotNull] string text,
+        [CanBeNull] string url = null,
+        [CanBeNull] Guid? repliedCommentId = null)
+    {
+        Check.NotNull(creator, nameof(creator));
+        Check.NotNullOrWhiteSpace(entityType, nameof(entityType), CommentConsts.MaxEntityTypeLength);
+        Check.NotNullOrWhiteSpace(entityId, nameof(entityId), CommentConsts.MaxEntityIdLength);
+        Check.NotNullOrWhiteSpace(text, nameof(text), CommentConsts.MaxTextLength);
+
+        if (!await DefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityNotCommentableException(entityType);
+        }
+
+        return new Comment(
+            GuidGenerator.Create(),
+            entityType, entityId, text,
+            repliedCommentId, creator.Id, url,
+            CurrentTenant.Id);
+    }
+}
+```
+
+`CreateAsync` is the *only* domain operation. The aggregate has its own `SetText`, so updates flow through the aggregate directly inside the public app service.
+
+## Registering commentable entity types
+
+Comments will not accept a write for an entity type that has not been registered. The registration shape lives in `CmsKitCommentOptions`:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/Comments/CmsKitCommentOptions.cs"
+public class CmsKitCommentOptions
+{
+    [NotNull]
+    public List<CommentEntityTypeDefinition> EntityTypes { get; } = new();
+
+    /// <summary>
+    /// Flag to enable/disable ReCaptcha for comment component. Default: false
+    /// </summary>
+    public bool IsRecaptchaEnabled { get; set; }
+
+    /// <summary>
+    /// Indicates the allowed external URLs by entity types, which can be included in a comment.
+    /// </summary>
+    public Dictionary<string, List<string>> AllowedExternalUrls { get; set; } = new();
+}
+```
+
+The Admin Application module registers blog posts as commentable when the Blogs global feature is on:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/CmsKitAdminApplicationModule.cs"
+private void ConfigureCommentOptions()
+{
+    if (GlobalFeatureManager.Instance.IsEnabled<CommentsFeature>())
+    {
+        Configure<CmsKitCommentOptions>(options =>
+        {
+            if (GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>())
+            {
+                options.EntityTypes.AddIfNotContains(
+                    new CommentEntityTypeDefinition(BlogPostConsts.EntityType));
+            }
+        });
+    }
+}
+```
+
+Your application module can add any custom entity type:
+
+```csharp
+Configure<CmsKitCommentOptions>(options =>
+{
+    options.EntityTypes.AddIfNotContains(
+        new CommentEntityTypeDefinition("Product"));
+});
+```
+
+Once registered, a comment with `EntityType == "Product"` will pass `CommentManager.CreateAsync`'s `IsDefinedAsync` check.
+
+`DefaultCommentEntityTypeDefinitionStore` is the default lookup over that list:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/DefaultCommentEntityTypeDefinitionStore.cs"
+public virtual Task<bool> IsDefinedAsync([NotNull] string entityType)
+{
+    Check.NotNullOrWhiteSpace(entityType, nameof(entityType));
+    var isDefined = Options.EntityTypes.Any(x => x.EntityType == entityType);
+    return Task.FromResult(isDefined);
+}
+```
+
+Replace it by registering a different `ICommentEntityTypeDefinitionStore` if you need dynamic registration (for instance, looking up commentable entity types from a database).
+
+## `ICommentRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Comments/ICommentRepository.cs"
+public interface ICommentRepository : IBasicRepository<Comment, Guid>
+{
+    Task<CommentWithAuthorQueryResultItem> GetWithAuthorAsync(Guid id, CancellationToken cancellationToken = default);
+
+    Task<List<CommentWithAuthorQueryResultItem>> GetListAsync(
+        string filter = null,
+        string entityType = null,
+        Guid? repliedCommentId = null,
+        string authorUsername = null,
+        DateTime? creationStartDate = null,
+        DateTime? creationEndDate = null,
+        string sorting = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        CancellationToken cancellationToken = default);
+
+    Task<long> GetCountAsync(
+        string text = null,
+        string entityType = null,
+        Guid? repliedCommentId = null,
+        string authorUsername = null,
+        DateTime? creationStartDate = null,
+        DateTime? creationEndDate = null,
+        CancellationToken cancellationToken = default);
+
+    Task<List<CommentWithAuthorQueryResultItem>> GetListWithAuthorsAsync(
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteWithRepliesAsync(
+        Comment comment,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> ExistsAsync(string idempotencyToken, CancellationToken cancellationToken = default);
+}
+```
+
+Three operational shapes:
+
+| Operation | Used by | Notes |
+| --- | --- | --- |
+| `GetListWithAuthorsAsync(entityType, entityId)` | `ICommentPublicAppService.GetListAsync` | Returns every comment + author for a single entity, then the app service builds the parent/reply tree |
+| `GetListAsync(...)` / `GetCountAsync(...)` | `ICommentAdminAppService.GetListAsync` | Admin search with free‑text, date range, author, parent filter |
+| `DeleteWithRepliesAsync(comment)` | Admin and public delete paths | Cascading delete of a comment subtree |
+| `ExistsAsync(idempotencyToken)` | `CommentPublicAppService.CreateAsync` | Idempotency check on retry |
+| `GetWithAuthorAsync(id)` | Admin detail view | Single fetch with author projection |
+
+Threading is *not* modelled by the storage — the public app service walks the flat list and assembles a tree on the way out, which keeps the schema simple.
+
+## Public app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Comments/ICommentPublicAppService.cs"
+public interface ICommentPublicAppService : IApplicationService
+{
+    Task<ListResultDto<CommentWithDetailsDto>> GetListAsync(string entityType, string entityId);
+
+    Task<CommentDto> CreateAsync(string entityType, string entityId, CreateCommentInput input);
+
+    Task<CommentDto> UpdateAsync(Guid id, UpdateCommentInput input);
+
+    Task DeleteAsync(Guid id);
+}
+```
+
+The implementation is gated and authenticated:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Comments/CommentPublicAppService.cs"
+[RequiresFeature(CmsKitFeatures.CommentEnable)]
+[RequiresGlobalFeature(typeof(CommentsFeature))]
+public class CommentPublicAppService : CmsKitPublicAppServiceBase, ICommentPublicAppService
+{
+    protected ICommentRepository CommentRepository { get; }
+    protected ICmsUserLookupService CmsUserLookupService { get; }
+    public IDistributedEventBus DistributedEventBus { get; }
+    protected CommentManager CommentManager { get; }
+    protected CmsKitCommentOptions CmsCommentOptions { get; }
+
+    public virtual async Task<ListResultDto<CommentWithDetailsDto>> GetListAsync(
+        string entityType, string entityId)
+    {
+        var commentsWithAuthor = await CommentRepository
+            .GetListWithAuthorsAsync(entityType, entityId);
+
+        return new ListResultDto<CommentWithDetailsDto>(
+            ConvertCommentsToNestedStructure(commentsWithAuthor)
+        );
+    }
+
+    [Authorize]
+    public virtual async Task<CommentDto> CreateAsync(
+        string entityType, string entityId, CreateCommentInput input)
+    {
+        CheckExternalUrls(entityType, input.Text);
+
+        if (input.RepliedCommentId.HasValue)
+        {
+            await CommentRepository.GetAsync(input.RepliedCommentId.Value);
+        }
+
+        await CheckIdempotencyTokenUniquenessAsync(input.IdempotencyToken);
+
+        var user = await CmsUserLookupService.GetByIdAsync(CurrentUser.GetId());
+        var comment = await CommentRepository.InsertAsync(
+            await CommentManager.CreateAsync(
+                user,
+                entityType, entityId,
+                input.Text,
+                // ...
+```
+
+Five layered guards apply to a `CreateAsync` call:
+
+1. `[RequiresGlobalFeature(typeof(CommentsFeature))]` — compile‑time gate.
+2. `[RequiresFeature(CmsKitFeatures.CommentEnable)]` — per‑tenant gate.
+3. `[Authorize]` — caller must be authenticated.
+4. `CheckExternalUrls` — strips or rejects external URLs not in `CmsKitCommentOptions.AllowedExternalUrls[entityType]`.
+5. `CheckIdempotencyTokenUniquenessAsync` → `ICommentRepository.ExistsAsync(token)` — rejects re‑submits.
+
+The service then publishes a `CreatedCommentEvent` over the distributed event bus so notification or moderation pipelines can subscribe.
+
+### Reading the tree
+
+`ConvertCommentsToNestedStructure` walks the flat list returned by the repository and builds a `CommentWithDetailsDto` tree with `Replies` populated for every comment whose `RepliedCommentId` matches the parent. The DTO carries the author info and a `Reactions` field for thumbs‑up / thumbs‑down (registered automatically when `ReactionsFeature` is enabled — see [`CmsKitDomainModule`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/CmsKitDomainModule.cs)).
+
+### Anonymous read, authenticated write
+
+`GetListAsync` carries no `[Authorize]`, so anonymous visitors can read comment trees. `CreateAsync`, `UpdateAsync`, and `DeleteAsync` all do, with `DeleteAsync` additionally checking that the current user is either the comment author or holds `CmsKitPublicPermissions.Comments.DeleteAll`:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Permissions/CmsKitPublicPermissions.cs"
+public static class CmsKitPublicPermissions
+{
+    public const string GroupName = "CmsKitPublic";
+
+    public static class Comments
+    {
+        public const string Default   = GroupName + ".Comments";
+        public const string DeleteAll = Default + ".DeleteAll";
+    }
+}
+```
+
+## Admin app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Comments/ICommentAdminAppService.cs"
+public interface ICommentAdminAppService : IApplicationService
+{
+    Task<PagedResultDto<CommentWithAuthorDto>> GetListAsync(CommentGetListInput input);
+
+    Task<CommentWithAuthorDto> GetAsync(Guid id);
+
+    Task DeleteAsync(Guid id);
+}
+```
+
+The admin surface is intentionally minimal — moderation in CMS Kit means *find and delete*. There is no admin update endpoint; if an admin needs to edit a comment they do so as that user. `DeleteAsync` uses `ICommentRepository.DeleteWithRepliesAsync` to cascade so the database never carries orphaned reply rows.
+
+Permission:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Permissions/CmsKitAdminPermissions.cs"
+public static class Comments
+{
+    public const string Default = GroupName + ".Comments";
+    public const string Delete  = Default + ".Delete";
+}
+```
+
+Note the asymmetry with the public side: the *public* surface has `Comments.DeleteAll` (you can delete any comment), while the *admin* surface has `Comments.Delete` (a moderator role). The two never overlap because the public API does not host the admin filter UI and vice versa — see [Admin / Public split](/modules/cms-kit/admin-public-split).
+
+## Events
+
+The public service publishes a `CreatedCommentEvent` after a successful insert:
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Comments/CreatedCommentEvent.cs"
+public class CreatedCommentEvent
+{
+    public Guid Id { get; set; }
+    public string EntityType { get; set; }
+    public string EntityId { get; set; }
+    public Guid? RepliedCommentId { get; set; }
+}
+```
+
+Subscribers — typically email notification or anti‑spam pipelines — register an `IDistributedEventHandler<CreatedCommentEvent>` and receive the event after the unit‑of‑work commits.
+
+## EF Core and MongoDB
+
+`CmsKitEntityFrameworkCoreModule` adds the repository:
+
+```csharp
+options.AddRepository<Comment, EfCoreCommentRepository>();
+```
+
+The EF configuration adds an index on `(EntityType, EntityId)` so `GetListWithAuthorsAsync` is a single index seek, and a unique index on `IdempotencyToken` (where not null) to back the idempotency check. The Mongo implementation mirrors the same shape.
+
+## Feature flag and global feature
+
+- **Global feature** [`CommentsFeature`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/CommentsFeature.cs) — name `CmsKit.Comments`.
+- **Per‑tenant feature** `CmsKitFeatures.CommentEnable` (`"CmsKit.CommentEnable"`).
+
+Both must be on for the app service to serve traffic. See [Admin / Public split](/modules/cms-kit/admin-public-split) for the full table of `[RequiresGlobalFeature]` and `[RequiresFeature]` pairs.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Comments sits inside the package matrix.
+  </Card>
+  <Card title="Reactions" icon="face-smile" href="/modules/cms-kit/reactions">
+    Thumbs‑up / thumbs‑down reactions registered on comment entities.
+  </Card>
+  <Card title="Blogs" icon="rss" href="/modules/cms-kit/blogs">
+    The primary commentable entity type out of the box.
+  </Card>
+  <Card title="Permission System" icon="lock" href="/authz/permission-system">
+    Where `CmsKitAdminPermissions.Comments.Delete` and `CmsKitPublicPermissions.Comments.DeleteAll` plug in.
+  </Card>
+</CardGroup>

@@ -1,0 +1,470 @@
+---
+title: "Bootstrap tag helpers for ABP MVC: forms, grid, modals, tabs"
+sidebarTitle: "Bootstrap"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap: AbpTagHelper base, the abp-* tag helper family (forms, grid, cards, modals, tabs, alerts) and form rendering."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.Bootstrap` is the package that turns Bootstrap 5
+into first‑class Razor by way of strongly‑typed `abp-*` tag helpers. It
+ships the `AbpTagHelper` / `AbpTagHelperService` pair that every other UI
+package extends, plus a comprehensive catalogue of helpers — forms,
+grid, cards, modals, tabs, buttons, alerts, breadcrumbs, dropdowns,
+collapses, progress bars, badges, borders, blockquotes, carousels,
+list groups, navs, paginations, popovers, tables, tooltips, and utility
+classes. This page walks the module entry point, the tag helper plumbing,
+and the form/grid surface that applications use most.
+
+## Module entry point
+
+`AbpAspNetCoreMvcUiBootstrapModule` only needs to depend on
+`AbpAspNetCoreMvcUiModule` and to mount its embedded views into the
+[Virtual File System](/vfs/overview) — its assembly is registered as an
+MVC application part via the parent module's `IMvcBuilder` preconfiguration.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/AbpAspNetCoreMvcUiBootstrapModule.cs"
+[DependsOn(typeof(AbpAspNetCoreMvcUiModule))]
+public class AbpAspNetCoreMvcUiBootstrapModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiBootstrapModule>(
+                "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap");
+        });
+    }
+}
+```
+
+<Info>
+The module purposely does not register any tag helpers explicitly. Tag
+helpers are picked up by `@addTagHelper *, Volo.Abp.AspNetCore.Mvc.UI.Bootstrap`
+in `_ViewImports.cshtml` — the shared theme module adds that for you.
+</Info>
+
+## AbpTagHelper / AbpTagHelperService pattern
+
+Every ABP tag helper inherits from the small `AbpTagHelper` base, which is
+nothing more than a marker tag helper registered as a transient dependency.
+The interesting work happens in a generic subclass that delegates to a
+*service* — this keeps the tag helper itself trivial (just attributes and a
+constructor) and lets the rendering logic be unit‑testable as a plain class.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/AbpTagHelper.cs"
+public abstract class AbpTagHelper : TagHelper, ITransientDependency { }
+
+public abstract class AbpTagHelper<TTagHelper, TService> : AbpTagHelper
+    where TTagHelper : AbpTagHelper<TTagHelper, TService>
+    where TService   : class, IAbpTagHelperService<TTagHelper>
+{
+    protected TService Service { get; }
+
+    public override int Order => Service.Order;
+
+    [HtmlAttributeNotBound]
+    [ViewContext]
+    public ViewContext ViewContext { get; set; } = default!;
+
+    protected AbpTagHelper(TService service)
+    {
+        Service = service;
+        Service.As<AbpTagHelperService<TTagHelper>>().TagHelper = (TTagHelper)this;
+    }
+
+    public override void Init(TagHelperContext context)               => Service.Init(context);
+    public override void Process(TagHelperContext c, TagHelperOutput o) => Service.Process(c, o);
+    public override Task ProcessAsync(TagHelperContext c, TagHelperOutput o) => Service.ProcessAsync(c, o);
+}
+```
+
+The service base centralises the placeholder strings used by composite
+helpers (tabs, accordions, forms, breadcrumbs, ...) when their child tag
+helpers need to inject content into a parent's output:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/AbpTagHelperService.cs"
+public abstract class AbpTagHelperService<TTagHelper> : IAbpTagHelperService<TTagHelper>
+    where TTagHelper : TagHelper
+{
+    protected const string FormGroupContents             = "FormGroupContents";
+    protected const string TabItems                      = "TabItems";
+    protected const string AccordionItems                = "AccordionItems";
+    protected const string BreadcrumbItemsContent        = "BreadcrumbItemsContent";
+    protected const string CarouselItemsContent          = "CarouselItemsContent";
+    protected const string AbpFormContentPlaceHolder     = "{_AbpFormContentPlaceHolder_}";
+    protected const string AbpTabItemActivePlaceholder   = "{_Tab_Active_Placeholder_}";
+    // ...
+
+    public TTagHelper TagHelper { get; internal set; } = default!;
+    public virtual int Order { get; }
+
+    public virtual void Init(TagHelperContext context) { }
+    public virtual void Process(TagHelperContext c, TagHelperOutput o) { }
+    public virtual Task ProcessAsync(TagHelperContext c, TagHelperOutput o)
+    {
+        Process(c, o);
+        return Task.CompletedTask;
+    }
+}
+```
+
+A typical concrete tag helper is therefore extremely small:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Button/AbpButtonTagHelper.cs"
+[HtmlTargetElement("abp-button", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpButtonTagHelper : AbpTagHelper<AbpButtonTagHelper, AbpButtonTagHelperService>, IButtonTagHelperBase
+{
+    public AbpButtonType ButtonType { get; set; } = AbpButtonType.Default;
+    public AbpButtonSize Size       { get; set; } = AbpButtonSize.Default;
+    public string?       BusyText   { get; set; }
+    public string?       Text       { get; set; }
+    public string?       Icon       { get; set; }
+    public bool?         Disabled   { get; set; }
+    public FontIconType  IconType   { get; set; } = FontIconType.FontAwesome;
+    public bool          BusyTextIsHtml { get; set; }
+
+    public AbpButtonTagHelper(AbpButtonTagHelperService service) : base(service) { }
+}
+```
+
+The matching `AbpButtonTagHelperService` resolves localizations through
+`AbpTagHelperLocalizer`, picks the Bootstrap classes for the requested
+`ButtonType`/`Size`, and writes the final markup.
+
+## Forms
+
+The form helpers are the heart of the package. They render
+`<form>`/`<input>`/`<select>` markup that already understands ABP
+validation, label localization, info text, required‑symbol rendering and
+floating labels.
+
+### abp-input
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Form/AbpInputTagHelper.cs"
+public class AbpInputTagHelper : AbpTagHelper<AbpInputTagHelper, AbpInputTagHelperService>
+{
+    public ModelExpression AspFor              { get; set; } = default!;
+
+    public string? Label                       { get; set; }
+    public string? LabelTooltip                { get; set; }
+    public string  LabelTooltipIcon            { get; set; } = "bi-info-circle";
+    public string  LabelTooltipPlacement       { get; set; } = "right";
+    public bool    LabelTooltipHtml            { get; set; } = false;
+
+    [HtmlAttributeName("info")]      public string? InfoText      { get; set; }
+    [HtmlAttributeName("disabled")]  public bool    IsDisabled    { get; set; } = false;
+    [HtmlAttributeName("readonly")]  public bool?   IsReadonly    { get; set; } = false;
+    [HtmlAttributeName("type")]      public string? InputTypeName { get; set; }
+    [HtmlAttributeName("asp-format")] public string? Format        { get; set; }
+
+    public bool   AutoFocus              { get; set; }
+    public AbpFormControlSize Size       { get; set; } = AbpFormControlSize.Default;
+    [HtmlAttributeName("required-symbol")]
+    public bool   DisplayRequiredSymbol  { get; set; } = true;
+
+    public string? Name                 { get; set; }
+    public string? Value                { get; set; }
+    public bool    SuppressLabel        { get; set; }
+
+    [HtmlAttributeName("floating-label")]
+    public bool FloatingLabel           { get; set; }
+
+    public CheckBoxHiddenInputRenderMode? CheckBoxHiddenInputRenderMode { get; set; }
+    public bool AddMarginBottomClass     { get; set; } = true;
+}
+```
+
+Razor usage:
+
+```cshtml
+<abp-input asp-for="Email" label-tooltip="@L["EmailHelp"]" required-symbol="true" />
+<abp-input asp-for="Birthday" type="date" />
+<abp-input asp-for="AcceptTerms" />
+<abp-input asp-for="Notes" floating-label="true" />
+```
+
+### abp-form-content
+
+`abp-form-content` is the placeholder that a parent `<abp-dynamic-form>` (or
+a tab/modal that hosts a form) expands into the rendered form group list.
+It is a self‑closing helper:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Form/AbpFormContentTagHelper.cs"
+[HtmlTargetElement("abp-form-content", TagStructure = TagStructure.WithoutEndTag)]
+public class AbpFormContentTagHelper : AbpTagHelper<AbpFormContentTagHelper, AbpFormContentTagHelperService>, ITransientDependency
+{
+    public AbpFormContentTagHelper(AbpFormContentTagHelperService tagHelperService)
+        : base(tagHelperService) { }
+}
+```
+
+The service emits the `{_AbpFormContentPlaceHolder_}` constant defined in
+`AbpTagHelperService` so the parent can swap it for the accumulated
+`FormGroupItem` list at render time.
+
+### abp-dynamic-form
+
+`abp-dynamic-form` walks the view‑model's property descriptors with
+`AbpFormControl`‑like metadata and renders a complete form, including the
+`<form>` tag attributes (`asp-action`, `asp-controller`, `asp-page`, ...)
+and an optional submit button.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Form/AbpDynamicformTagHelper.cs"
+[HtmlTargetElement("abp-dynamic-form", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpDynamicFormTagHelper : AbpTagHelper<AbpDynamicFormTagHelper, AbpDynamicFormTagHelperService>
+{
+    [HtmlAttributeName("abp-model")] public ModelExpression Model { get; set; } = default!;
+    [HtmlAttributeName("column-size")] public ColumnSize    ColumnSize { get; set; }
+
+    public bool? SubmitButton   { get; set; }
+    public bool? RequiredSymbols { get; set; } = true;
+
+    // Plus the standard MvcFormTagHelper attributes: asp-action, asp-controller,
+    // asp-area, asp-page, asp-page-handler, asp-fragment, asp-route, asp-route-*
+}
+```
+
+A page can then opt into dynamic rendering with a one‑liner:
+
+```cshtml
+<abp-dynamic-form abp-model="Input" asp-page-handler="Save">
+    <abp-form-content />
+    <abp-button type="submit" button-type="Primary" text="@L["Save"]" />
+</abp-dynamic-form>
+```
+
+### FormGroupItem
+
+Composite helpers (tabs, modals, dynamic forms) accumulate their child
+inputs into a list of `FormGroupItem` carried via `TagHelperContext.Items`
+keyed by `FormGroupContents`. Each item knows its rendered HTML, the
+property it represents and a relative order:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Form/FormGroupItem.cs"
+public class FormGroupItem
+{
+    public string HtmlContent { get; set; } = default!;
+    public int    Order       { get; set; }
+    public string PropertyName { get; set; } = default!;
+}
+```
+
+This is how `abp-input` defers its actual rendering when nested inside an
+`abp-dynamic-form`: it just queues a `FormGroupItem` and the parent
+materialises the layout when its `Process` finishes.
+
+### Form helper catalogue
+
+| Tag | Helper | Notes |
+| --- | --- | --- |
+| `<abp-input asp-for="...">` | `AbpInputTagHelper` | Text/number/date/checkbox/textarea — `type` auto‑detected from the model |
+| `<abp-select asp-for="...">` | `AbpSelectTagHelper` | Backed by `SelectItems` from `[SelectItems]`/`IEnumerable<SelectListItem>` |
+| `<abp-radio-input asp-for="..." />` | `AbpRadioInputTagHelper` | Group of radio buttons using `AbpRadioButton[]` |
+| `<abp-form-content />` | `AbpFormContentTagHelper` | Placeholder slot for the auto‑generated form body |
+| `<abp-dynamic-form abp-model="...">` | `AbpDynamicFormTagHelper` | Whole‑form renderer using model metadata |
+| `<abp-validation-summary />` | `AbpValidationAttributeTagHelper` | Validation summary, localizable |
+| Attributes: `[DisplayOrder]`, `[DisabledInput]`, `[DynamicFormIgnore]`, `[InputInfoText]`, `[Placeholder]`, `[ReadOnlyInput]`, `[SelectItems]`, `[TextArea]` | `Form/*.cs` | Drive how `AbpInput`/`AbpSelect` render a property |
+
+## Grid
+
+The grid helpers (`abp-row`/`abp-form-row` and `abp-column`) generate
+Bootstrap 5 grid markup with strongly‑typed sizes, offsets and alignment
+enums.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Grid/AbpRowTagHelper.cs"
+[HtmlTargetElement("abp-row")]
+[HtmlTargetElement("abp-form-row")]
+public class AbpRowTagHelper : AbpTagHelper<AbpRowTagHelper, AbpRowTagHelperService>
+{
+    public VerticalAlign   VAlign  { get; set; } = VerticalAlign.Default;
+    public HorizontalAlign HAlign  { get; set; } = HorizontalAlign.Default;
+    public bool?           Gutters { get; set; } = true;
+}
+```
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Grid/AbpColumnTagHelper.cs"
+public class AbpColumnTagHelper : AbpTagHelper<AbpColumnTagHelper, AbpColumnTagHelperService>
+{
+    public ColumnSize Size    { get; set; }
+    public ColumnSize SizeSm  { get; set; }
+    public ColumnSize SizeMd  { get; set; }
+    public ColumnSize SizeLg  { get; set; }
+    public ColumnSize SizeXl  { get; set; }
+    public ColumnSize SizeXxl { get; set; }
+    public ColumnSize Offset      { get; set; }
+    public ColumnSize OffsetSm    { get; set; }
+    public ColumnSize OffsetMd    { get; set; }
+    public ColumnSize OffsetLg    { get; set; }
+    public ColumnSize OffsetXl    { get; set; }
+    public ColumnSize OffsetXxl   { get; set; }
+    [HtmlAttributeName("order")]
+    public ColumnOrder ColumnOrder { get; set; }
+    public VerticalAlign VAlign    { get; set; } = VerticalAlign.Default;
+}
+```
+
+Razor:
+
+```cshtml
+<abp-row>
+    <abp-column size="_4" size-md="_6">
+        <abp-input asp-for="Name" />
+    </abp-column>
+    <abp-column size="_4" size-md="_6">
+        <abp-input asp-for="Email" />
+    </abp-column>
+</abp-row>
+```
+
+`AbpColumnBreakerTagHelper` exists as an `<abp-column-breaker />` slot for
+splitting a row's auto‑generated form fields.
+
+## Containers, cards, modals, tabs and buttons
+
+These four families wrap Bootstrap's compound components into idiomatic
+Razor with strongly typed enums.
+
+### Containers
+
+`<abp-container fluid="true" />` switches between `.container` and
+`.container-fluid`.
+
+### Cards
+
+`<abp-card>` accepts a `border` enum and adds the standard Bootstrap card
+margin by default:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Card/AbpCardTagHelper.cs"
+public class AbpCardTagHelper : AbpTagHelper<AbpCardTagHelper, AbpCardTagHelperService>
+{
+    public AbpCardBorderColorType Border { get; set; } = AbpCardBorderColorType.Default;
+    public bool AddMarginBottomClass     { get; set; } = true;
+}
+```
+
+Sub‑helpers cover every standard slot: `abp-card-header`, `abp-card-body`,
+`abp-card-footer`, `abp-card-title`, `abp-card-subtitle`, `abp-card-text`,
+`abp-card-image`, `abp-card-link`, `abp-card-background`, `abp-card-text-color`.
+
+### Modals
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Modal/AbpModalTagHelper.cs"
+public class AbpModalTagHelper : AbpTagHelper<AbpModalTagHelper, AbpModalTagHelperService>
+{
+    public AbpModalSize Size       { get; set; } = AbpModalSize.Default;
+    public bool?        Centered   { get; set; } = false;
+    public bool?        Scrollable { get; set; } = false;
+    public bool?        Static     { get; set; } = false;
+}
+```
+
+`abp-modal-header`, `abp-modal-body` and `abp-modal-footer` complete the
+component, with `AbpModalButtons` and `ButtonsAlign` enums for the standard
+footer button row.
+
+### Tabs
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Tab/AbpTabsTagHelper.cs"
+public class AbpTabsTagHelper : AbpTagHelper<AbpTabsTagHelper, AbpTabsTagHelperService>
+{
+    public string?    Name              { get; set; }
+    public TabStyle   TabStyle          { get; set; } = TabStyle.Tab;
+    public ColumnSize VerticalHeaderSize { get; set; } = ColumnSize._3;
+}
+```
+
+`<abp-tab>`, `<abp-tab-link>` and `<abp-tab-dropdown>` are nested inside
+`<abp-tabs>`. The parent merges its children's HTML through the
+`TabItems`/`TabItemsDataTogglePlaceHolder` constants on the service base.
+
+### Buttons
+
+`AbpButtonTagHelper` (shown earlier) is the leaf; `abp-link-button` wraps an
+`<a>`; `abp-button-group`/`abp-button-toolbar` provide layout containers
+with `AbpButtonGroupSize` and `AbpButtonGroupDirection` enums.
+
+## Other tag helper families
+
+The package ships these additional folders. Each follows the same
+TagHelper/Service split as above.
+
+| Folder | Root tag | Purpose |
+| --- | --- | --- |
+| `Alert/` | `abp-alert`, `abp-alert-header`, `abp-alert-link` | Bootstrap alert with `AlertType` |
+| `Badge/` | `abp-badge` | Pill / rectangular badges by `AbpBadgeType` |
+| `Blockquote/` | `abp-blockquote`, `-paragraph`, `-footer` | Quote markup |
+| `Border/` | `abp-border`, `abp-rounded` | Border + rounded utility wrappers |
+| `Breadcrumb/` | `abp-breadcrumb`, `abp-breadcrumb-item` | Page breadcrumb (consumed by themes through `PageLayout`) |
+| `Carousel/` | `abp-carousel`, `abp-carousel-item` | Bootstrap carousel |
+| `Collapse/` | `abp-collapse-body`, `abp-collapse-trigger` | Collapsible regions |
+| `Dropdown/` | `abp-dropdown`, `abp-dropdown-item`, ... | Dropdown menus |
+| `Figure/` | `abp-figure`, `abp-figure-caption` | Image figures |
+| `ListGroup/` | `abp-list-group`, `abp-list-group-item` | List groups |
+| `Nav/` | `abp-nav`, `abp-nav-item`, `abp-nav-link` | Nav lists |
+| `Pagination/` | `abp-paginator` | Page navigation with `PagerModel` |
+| `Popover/` | `abp-popover` | Bootstrap popovers |
+| `ProgressBar/` | `abp-progress-bar` | Progress bars |
+| `Table/` | `abp-table`, `abp-table-head`, ... | Bootstrap tables with `AbpTableBorderStyle` |
+| `Tooltip/` | `abp-tooltip` | Bootstrap tooltips |
+| `Utils/` | `abp-text-bg`, `abp-text-emphasis`, ... | Utility wrappers |
+| `Extensions/` | `AbpTagHelperAttributeListExtensions` | Helpers for merging classes/attributes |
+
+## Localizing labels and validation
+
+`AbpTagHelperLocalizer` is the workhorse used by every form helper to
+resolve labels and validation messages. It looks at `[DisplayName]`,
+`[Display(Name=)]` and `ModelMetadata.DisplayName`, then runs the resulting
+key through the localizer wired up by `AbpAspNetCoreMvcModule` (see
+[ASP.NET Core MVC module](/web/aspnet-core-module) for how that localizer is
+configured). The net effect is that an `abp-input asp-for="Email"`
+automatically picks up the localized `Email` label without the page model
+needing to inject `IStringLocalizer` itself.
+
+## File inventory — `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap`
+
+| Folder | Notable types | Purpose |
+| --- | --- | --- |
+| `AbpAspNetCoreMvcUiBootstrapModule.cs` | `AbpAspNetCoreMvcUiBootstrapModule` | Module entry |
+| `TagHelpers/AbpTagHelper.cs` | `AbpTagHelper`, `AbpTagHelper<,>` | Base classes for every helper |
+| `TagHelpers/AbpTagHelperService.cs` | `AbpTagHelperService<>` | Per‑helper rendering logic |
+| `TagHelpers/AbpTagHelperLocalizer.cs` | `AbpTagHelperLocalizer` | Display name / validation localization |
+| `TagHelpers/Form/` | `AbpInput*`, `AbpSelect*`, `AbpRadio*`, `AbpDynamicform*`, `AbpFormContent*`, `AbpValidation*` + attribute helpers | Forms |
+| `TagHelpers/Grid/` | `AbpRow*`, `AbpColumn*`, `AbpContainer*`, `AbpColumnBreaker*`, `ColumnSize`, `ColumnOrder`, `VerticalAlign`, `HorizontalAlign` | Grid |
+| `TagHelpers/Card/` | `AbpCard*` × 13 helpers | Cards |
+| `TagHelpers/Modal/` | `AbpModal*`, `AbpModalSize`, `AbpModalButtons`, `ButtonsAlign` | Modals |
+| `TagHelpers/Tab/` | `AbpTabs*`, `AbpTab*`, `TabStyle`, `TabItem` | Tabs |
+| `TagHelpers/Button/` | `AbpButton*`, `AbpLinkButton*`, `AbpButtonGroup*`, `AbpButtonToolbar*` | Buttons |
+| `TagHelpers/Alert/` | `AbpAlert*`, `AbpAlertHeader*`, `AbpAlertLink*` | Alerts |
+| `TagHelpers/Badge/` | `AbpBadge*`, `AbpBadgeType` | Badges |
+| `TagHelpers/Border/` | `AbpBorder*`, `AbpRounded*`, `AbpBorderType`, `AbpRoundedType` | Borders |
+| `TagHelpers/Breadcrumb/` | `AbpBreadcrumb*` | Breadcrumbs |
+| `TagHelpers/Carousel/` | `AbpCarousel*` | Carousels |
+| `TagHelpers/Collapse/` | `AbpCollapse*` | Collapsible regions |
+| `TagHelpers/Dropdown/` | `AbpDropdown*` | Dropdowns |
+| `TagHelpers/Figure/` | `AbpFigure*` | Figures |
+| `TagHelpers/ListGroup/` | `AbpListGroup*` | List groups |
+| `TagHelpers/Nav/` | `AbpNav*` | Nav lists |
+| `TagHelpers/Pagination/` | `AbpPaginator*` | Paginators |
+| `TagHelpers/Popover/` | `AbpPopover*` | Popovers |
+| `TagHelpers/ProgressBar/` | `AbpProgressBar*` | Progress bars |
+| `TagHelpers/Table/` | `AbpTable*` family, `AbpTableBorderStyle` | Tables |
+| `TagHelpers/Tooltip/` | `AbpTooltip*` | Tooltips |
+| `TagHelpers/Utils/` | utility wrappers | Spacing/colour helpers |
+| `Microsoft/AspNetCore/Razor/TagHelpers/AbpTagHelperAttributeListExtensions.cs` | `AbpTagHelperAttributeListExtensions` | `TagHelperAttributeList` extensions used internally |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="MVC UI overview" href="/ui-mvc/overview">
+    AbpAspNetCoreMvcUiModule and the rest of the UI stack.
+  </Card>
+  <Card title="Bundling" href="/ui-mvc/bundling">
+    How the abp-script-bundle / abp-style-bundle helpers in
+    Volo.Abp.AspNetCore.Mvc.UI.Bundling render CSS and JS.
+  </Card>
+  <Card title="Theme.Shared" href="/ui-mvc/theme-shared">
+    The layouts that consume tag helpers + PageLayout.
+  </Card>
+  <Card title="ASP.NET Core MVC module" href="/web/aspnet-core-module">
+    Where the underlying MVC pipeline and localizer come from.
+  </Card>
+</CardGroup>

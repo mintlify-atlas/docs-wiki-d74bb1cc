@@ -1,0 +1,359 @@
+---
+title: "Permission Management Persistence: EF Core and MongoDB"
+sidebarTitle: "Persistence"
+description: "Reference for PermissionManagementDbContext, ConfigurePermissionManagement model builder, EfCorePermissionGrantRepository, and the MongoDB equivalents."
+---
+
+The persistence layer ships in two mutually exclusive packages: `Volo.Abp.PermissionManagement.EntityFrameworkCore` and `Volo.Abp.PermissionManagement.MongoDB`. Each owns three tables/collections (`PermissionGrants`, `Permissions`, `PermissionGroups`) and provides repository implementations for the contracts declared in `Volo.Abp.PermissionManagement.Domain`. This page walks the schema, the unique indexes, the repository signatures, and how each provider plugs into a host that already has its own `DbContext` or Mongo context — typically via the "shared DbContext" pattern that lets you keep everything in one database while still using the module's typed repositories.
+
+For the entities the schema describes, see [Domain](/modules/permission-management/domain). For the runtime callers of these repositories, see [Application](/modules/permission-management/application) and [HTTP API](/modules/permission-management/http-api).
+
+## File inventory
+
+### `Volo.Abp.PermissionManagement.EntityFrameworkCore`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpPermissionManagementEntityFrameworkCoreModule.cs` | module | Registers `PermissionManagementDbContext` and the three repositories. |
+| `IPermissionManagementDbContext.cs` | interface | Exposes the three `DbSet`s for the shared-context pattern. |
+| `PermissionManagementDbContext.cs` | DbContext | Default standalone `DbContext` that owns the connection string. |
+| `AbpPermissionManagementDbContextModelBuilderExtensions.cs` | static | `ConfigurePermissionManagement(this ModelBuilder)` model builder. |
+| `EfCorePermissionGrantRepository.cs` | repo | Custom queries over the `PermissionGrants` table. |
+| `EfCorePermissionDefinitionRecordRepository.cs` | repo | Custom queries over `Permissions`. |
+| `EfCorePermissionGroupDefinitionRecordRepository.cs` | repo | Custom queries over `PermissionGroups`. |
+
+### `Volo.Abp.PermissionManagement.MongoDB`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpPermissionManagementMongoDbModule.cs` | module | Registers the Mongo context and the three Mongo repositories. |
+| `IPermissionManagementMongoDbContext.cs` | interface | Exposes the three collections for the shared-context pattern. |
+| `PermissionManagementMongoDbContext.cs` | DbContext | Default standalone context owning the connection string. |
+| `AbpPermissionManagementMongoDbContextExtensions.cs` | static | `ConfigurePermissionManagement(this IMongoModelBuilder)`. |
+| `MongoPermissionGrantRepository.cs` | repo | Custom queries over the `PermissionGrants` collection. |
+| `MongoPermissionDefinitionRecordRepository.cs` | repo | Custom queries over `Permissions`. |
+| `MongoPermissionGroupDefinitionRecordRepository.cs` | repo | Custom queries over `PermissionGroups`. |
+
+## Shared connection-string name
+
+Both packages share the same logical connection name. The constant is in the Domain package:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/AbpPermissionManagementDbProperties.cs
+public static class AbpPermissionManagementDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpPermissionManagement";
+}
+```
+
+In a typical solution you do *not* set a separate connection string named `"AbpPermissionManagement"` — the framework's `IConnectionStringResolver` falls back to `"Default"` automatically. Setting it lets you route the module's data to a different physical database while keeping the rest of the host's data on the default connection.
+
+`DbTablePrefix` resolves to `"Abp"` by default (via `AbpCommonDbProperties`), so the three tables ship as `AbpPermissionGrants`, `AbpPermissions`, `AbpPermissionGroups`. Override either property in `Program.cs` if your naming convention differs.
+
+## EF Core: the schema
+
+The model builder is a single extension method:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.EntityFrameworkCore/Volo/Abp/PermissionManagement/EntityFrameworkCore/AbpPermissionManagementDbContextModelBuilderExtensions.cs
+public static void ConfigurePermissionManagement(
+    [NotNull] this ModelBuilder builder)
+{
+    builder.Entity<PermissionGrant>(b =>
+    {
+        b.ToTable(AbpPermissionManagementDbProperties.DbTablePrefix + "PermissionGrants",
+                  AbpPermissionManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.Name).HasMaxLength(PermissionDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.ProviderName).HasMaxLength(PermissionGrantConsts.MaxProviderNameLength).IsRequired();
+        b.Property(x => x.ProviderKey).HasMaxLength(PermissionGrantConsts.MaxProviderKeyLength).IsRequired();
+
+        b.HasIndex(x => new { x.TenantId, x.Name, x.ProviderName, x.ProviderKey }).IsUnique();
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<PermissionGroupDefinitionRecord>(b =>
+    {
+        b.ToTable(AbpPermissionManagementDbProperties.DbTablePrefix + "PermissionGroups",
+                  AbpPermissionManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.Name).HasMaxLength(PermissionGroupDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.DisplayName).HasMaxLength(PermissionGroupDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+
+        b.HasIndex(x => new { x.Name }).IsUnique();
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<PermissionDefinitionRecord>(b =>
+    {
+        b.ToTable(AbpPermissionManagementDbProperties.DbTablePrefix + "Permissions",
+                  AbpPermissionManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.GroupName).HasMaxLength(PermissionGroupDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.Name).HasMaxLength(PermissionDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.ParentName).HasMaxLength(PermissionDefinitionRecordConsts.MaxNameLength);
+        b.Property(x => x.DisplayName).HasMaxLength(PermissionDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+        b.Property(x => x.Providers).HasMaxLength(PermissionDefinitionRecordConsts.MaxProvidersLength);
+        b.Property(x => x.StateCheckers).HasMaxLength(PermissionDefinitionRecordConsts.MaxStateCheckersLength);
+
+        b.HasIndex(x => new { x.Name }).IsUnique();
+        b.HasIndex(x => new { x.GroupName });
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.TryConfigureObjectExtensions<PermissionManagementDbContext>();
+}
+```
+
+### Table reference
+
+| Table | Columns (logical → SQL) | Unique index | Notes |
+| --- | --- | --- | --- |
+| `AbpPermissionGrants` | `Id` (guid), `TenantId` (guid?), `Name` (nvarchar(128)), `ProviderName` (nvarchar(64)), `ProviderKey` (nvarchar(64)) | `(TenantId, Name, ProviderName, ProviderKey)` | Audit columns from `ConfigureByConvention`; `ProviderKey` is `IsRequired()` even though the C# property is nullable. |
+| `AbpPermissionGroups` | `Id`, `Name` (nvarchar(128)), `DisplayName` (nvarchar(256)) | `(Name)` | Catalog row — written by `StaticPermissionSaver`. |
+| `AbpPermissions` | `Id`, `GroupName`, `Name`, `ParentName?`, `DisplayName`, `Providers?` (comma-joined), `StateCheckers?` (comma-joined), `IsEnabled`, `MultiTenancySide` | `(Name)` + non-unique `(GroupName)` | Catalog row — written by `StaticPermissionSaver`. |
+
+`ConfigureByConvention()` adds the ABP auditing columns (`CreationTime`, `CreatorId`, `LastModificationTime`, …) and concurrency tokens. `ApplyObjectExtensionMappings()` projects any properties registered through `ObjectExtensionManager` (see [Data extensibility](/data/overview)) onto the entity.
+
+### Standalone DbContext
+
+If you want each ABP module on its own physical database, use the shipped `PermissionManagementDbContext`:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.EntityFrameworkCore/Volo/Abp/PermissionManagement/EntityFrameworkCore/PermissionManagementDbContext.cs
+[ConnectionStringName(AbpPermissionManagementDbProperties.ConnectionStringName)]
+public class PermissionManagementDbContext : AbpDbContext<PermissionManagementDbContext>, IPermissionManagementDbContext
+{
+    public DbSet<PermissionGroupDefinitionRecord> PermissionGroups { get; set; }
+    public DbSet<PermissionDefinitionRecord> Permissions { get; set; }
+    public DbSet<PermissionGrant> PermissionGrants { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.ConfigurePermissionManagement();
+    }
+}
+```
+
+`[ConnectionStringName]` ties the context to the `"AbpPermissionManagement"` slot in the connection-string resolver.
+
+### Shared DbContext (recommended)
+
+Most production hosts add the module's `DbSet`s to *their own* `DbContext` so the schema lives in one database. The interface `IPermissionManagementDbContext` is the join point:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.EntityFrameworkCore/Volo/Abp/PermissionManagement/EntityFrameworkCore/IPermissionManagementDbContext.cs
+public interface IPermissionManagementDbContext : IEfCoreDbContext
+{
+    DbSet<PermissionGroupDefinitionRecord> PermissionGroups { get; set; }
+    DbSet<PermissionDefinitionRecord> Permissions { get; set; }
+    DbSet<PermissionGrant> PermissionGrants { get; set; }
+}
+```
+
+Your host's `DbContext` declares the same three `DbSet`s, marks itself with `[ReplaceDbContext(typeof(IPermissionManagementDbContext))]` (ABP convention), and calls `modelBuilder.ConfigurePermissionManagement()` from `OnModelCreating`. The module-side repositories continue to work because they are typed against `IPermissionManagementDbContext`, which the framework resolves to the host context.
+
+### Module registration
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.EntityFrameworkCore/Volo/Abp/PermissionManagement/EntityFrameworkCore/AbpPermissionManagementEntityFrameworkCoreModule.cs
+[DependsOn(typeof(AbpPermissionManagementDomainModule))]
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpPermissionManagementEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<PermissionManagementDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IPermissionManagementDbContext>();
+
+            options.AddRepository<PermissionGroupDefinitionRecord, EfCorePermissionGroupDefinitionRecordRepository>();
+            options.AddRepository<PermissionDefinitionRecord, EfCorePermissionDefinitionRecordRepository>();
+            options.AddRepository<PermissionGrant, EfCorePermissionGrantRepository>();
+        });
+    }
+}
+```
+
+`AddDefaultRepositories<IPermissionManagementDbContext>()` registers `IRepository<TEntity, TKey>` for every entity exposed by the interface. The explicit `AddRepository` calls then override those with the custom-query repositories so callers can use the specialised methods on `IPermissionGrantRepository`.
+
+## EF Core: repository implementations
+
+`EfCorePermissionGrantRepository` is the most-called of the three. Its three custom queries:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.EntityFrameworkCore/Volo/Abp/PermissionManagement/EntityFrameworkCore/EfCorePermissionGrantRepository.cs
+public class EfCorePermissionGrantRepository :
+    EfCoreRepository<IPermissionManagementDbContext, PermissionGrant, Guid>,
+    IPermissionGrantRepository
+{
+    public virtual async Task<PermissionGrant> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(s =>
+                s.Name == name &&
+                s.ProviderName == providerName &&
+                s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<PermissionGrant>> GetListAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<PermissionGrant>> GetListAsync(
+        string[] names, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => names.Contains(s.Name) &&
+                        s.ProviderName == providerName &&
+                        s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+The `IN (...)` variant powers the bulk cache-warm inside `PermissionStore.SetCacheItemsAsync` and `PermissionManager.GetAsync(string[], ...)`. All three queries hit the unique index above, so a check for a single grant becomes a single index seek even at millions of rows.
+
+`EfCorePermissionDefinitionRecordRepository` and `EfCorePermissionGroupDefinitionRecordRepository` follow the same shape — `FindByNameAsync`, `GetListByGroupNameAsync`, plus the conventional `IRepository<T>` surface inherited from `EfCoreRepository<…>`.
+
+## MongoDB: the schema
+
+The MongoDB side has no model builder — collections are conventionally named, and there is no schema enforcement at the database layer. The extension methods set the collection names:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.MongoDB/Volo/Abp/PermissionManagement/MongoDb/AbpPermissionManagementMongoDbContextExtensions.cs
+public static class AbpPermissionManagementMongoDbContextExtensions
+{
+    public static void ConfigurePermissionManagement(
+        this IMongoModelBuilder builder)
+    {
+        builder.Entity<PermissionGroupDefinitionRecord>(b =>
+        {
+            b.CollectionName = AbpPermissionManagementDbProperties.DbTablePrefix + "PermissionGroups";
+        });
+
+        builder.Entity<PermissionDefinitionRecord>(b =>
+        {
+            b.CollectionName = AbpPermissionManagementDbProperties.DbTablePrefix + "Permissions";
+        });
+
+        builder.Entity<PermissionGrant>(b =>
+        {
+            b.CollectionName = AbpPermissionManagementDbProperties.DbTablePrefix + "PermissionGrants";
+        });
+    }
+}
+```
+
+The standalone context:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.MongoDB/Volo/Abp/PermissionManagement/MongoDb/PermissionManagementMongoDbContext.cs
+[ConnectionStringName(AbpPermissionManagementDbProperties.ConnectionStringName)]
+public class PermissionManagementMongoDbContext : AbpMongoDbContext, IPermissionManagementMongoDbContext
+{
+    public IMongoCollection<PermissionGroupDefinitionRecord> PermissionGroups => Collection<PermissionGroupDefinitionRecord>();
+    public IMongoCollection<PermissionDefinitionRecord> Permissions => Collection<PermissionDefinitionRecord>();
+    public IMongoCollection<PermissionGrant> PermissionGrants => Collection<PermissionGrant>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+
+        modelBuilder.ConfigurePermissionManagement();
+    }
+}
+```
+
+<Warning>
+The MongoDB driver does **not** enforce the unique `(TenantId, Name, ProviderName, ProviderKey)` constraint that the EF Core mapping declares. If you need that guarantee at the database layer, create the index manually with `db.AbpPermissionGrants.createIndex({...}, {unique: true})` against your MongoDB cluster as part of provisioning.
+</Warning>
+
+## MongoDB: repository implementations
+
+`MongoPermissionGrantRepository` mirrors the EF Core class one-for-one:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.MongoDB/Volo/Abp/PermissionManagement/MongoDb/MongoPermissionGrantRepository.cs
+public class MongoPermissionGrantRepository :
+    MongoDbRepository<IPermissionManagementMongoDbContext, PermissionGrant, Guid>,
+    IPermissionGrantRepository
+{
+    public virtual async Task<List<PermissionGrant>> GetListAsync(
+        string[] names, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => names.Contains(s.Name) &&
+                        s.ProviderName == providerName &&
+                        s.ProviderKey == providerKey)
+            .ToListAsync(cancellationToken);
+    }
+}
+```
+
+`MongoDB.Driver.Linq` translates the `Contains` expression into a `$in` filter, so the same "one round trip per group" optimisation that EF Core enjoys works here too.
+
+### Module registration
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.MongoDB/Volo/Abp/PermissionManagement/MongoDb/AbpPermissionManagementMongoDbModule.cs
+[DependsOn(
+    typeof(AbpPermissionManagementDomainModule),
+    typeof(AbpMongoDbModule)
+    )]
+public class AbpPermissionManagementMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<PermissionManagementMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IPermissionManagementMongoDbContext>();
+
+            options.AddRepository<PermissionGroupDefinitionRecord, MongoPermissionGroupDefinitionRecordRepository>();
+            options.AddRepository<PermissionDefinitionRecord, MongoPermissionDefinitionRecordRepository>();
+            options.AddRepository<PermissionGrant, MongoPermissionGrantRepository>();
+        });
+    }
+}
+```
+
+## Choosing a provider
+
+| Concern | EF Core | MongoDB |
+| --- | --- | --- |
+| Unique index on `(TenantId, Name, ProviderName, ProviderKey)` | Enforced at DB layer | Manual — create the index yourself. |
+| Migrations | First-class via `dotnet ef migrations` | Not applicable — schema-less. |
+| Object extension columns | `ApplyObjectExtensionMappings()` writes real columns | Stored as `ExtraProperties` BSON bag. |
+| Distributed transactions across modules | `IUnitOfWork` enrols both `DbContext`s | Requires Mongo 4.x replica set; ABP enrolls the session. |
+| Migration to a separate cluster | `[ConnectionStringName]` + a new connection | `[ConnectionStringName]` + a new connection |
+
+The two paths produce functionally identical behaviour from the application layer's point of view. Pick whichever you already use for the rest of your solution; the [data layer overview](/data/overview) covers the trade-offs in more depth.
+
+## Object extensions
+
+Both providers honour `ObjectExtensionManager` so you can tack on extra columns/fields without subclassing the entity:
+
+```csharp
+ObjectExtensionManager.Instance
+    .AddOrUpdateProperty<PermissionGrant, string>("Reason");
+```
+
+In EF Core that becomes a real `nvarchar` column (thanks to `ApplyObjectExtensionMappings()`); in MongoDB it lives inside `ExtraProperties` and round-trips as BSON. The [data extensibility guide](/data/overview) walks through the consumption pattern.
+
+## Cross-references
+
+- The `PermissionGrant` aggregate, the cache layer that this repository feeds, and `StaticPermissionSaver` are documented in [Domain](/modules/permission-management/domain).
+- The setting-management parallel — `Setting` entity, `EfCoreSettingRepository`, `MongoSettingRepository` — is in [Setting management persistence](/modules/setting-management/persistence).
+- The host-level shared DbContext pattern for the Identity module is in [Identity overview](/modules/identity/overview).

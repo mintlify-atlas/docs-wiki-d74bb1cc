@@ -1,0 +1,415 @@
+---
+title: "Embedded Files: AbpEmbeddedFileProvider and Manifest Sets"
+sidebarTitle: "Embedded files"
+description: "Inside the AbpEmbeddedFileProvider, EmbeddedResourceFileInfo, the path-conversion rules, and how ManifestEmbeddedFileProvider integrates with AddEmbedded."
+---
+
+The most common way to ship assets through ABP's Virtual File System is to embed them as resources inside the module's own assembly. This page covers the two providers ABP uses for that — its own `AbpEmbeddedFileProvider` and Microsoft's `ManifestEmbeddedFileProvider` — explains how `EmbeddedResourceFileInfo` represents a single file, and walks through the manifest-resource path conversion that maps `MyCompany.Module.Pages.Home.Index.cshtml` back onto `/Pages/Home/Index.cshtml`.
+
+If you have not already, read [VFS overview](/vfs/overview) for the `AbpVirtualFileSystemOptions.FileSets.AddEmbedded<T>(...)` registration entry point that produces these providers.
+
+## Project setup
+
+To embed files in an assembly you need three things in the `.csproj`:
+
+1. `<GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>` — this is what causes the build to emit the `Microsoft.Extensions.FileProviders.Embedded.Manifest.xml` resource that `ManifestEmbeddedFileProvider` reads.
+2. An `<EmbeddedResource Include="..." />` glob for each asset family you want shipped.
+3. (Optional) `<Content Remove="..." />` for the same globs, so the build does not also copy them to `bin/` as content.
+
+This is exactly what `Volo.Abp.VirtualFileExplorer.Web.csproj` does:
+
+```xml Volo.Abp.VirtualFileExplorer.Web.csproj
+<PropertyGroup>
+  <GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>
+  ...
+</PropertyGroup>
+
+<ItemGroup>
+  <EmbeddedResource Include="Pages\**\*.css" />
+  <EmbeddedResource Include="Pages\**\*.js" />
+  <EmbeddedResource Include="Components\**\*.js" />
+  <EmbeddedResource Include="Components\**\*.css" />
+  <EmbeddedResource Include="wwwroot\**\*.*" />
+  <EmbeddedResource Include="Localization\**\*.json" />
+  <Content Remove="Pages\**\*.css" />
+  <Content Remove="Pages\**\*.js" />
+  <Content Remove="wwwroot\**\*.*" />
+  <Content Remove="Components\**\*.js" />
+  <Content Remove="Components\**\*.css" />
+  <Content Remove="Localization\**\*.json" />
+</ItemGroup>
+
+<ItemGroup>
+  <PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" />
+</ItemGroup>
+```
+
+## Provider selection inside `AddEmbedded<T>`
+
+`VirtualFileSetListExtensions.CreateFileProvider` decides which embedded provider to instantiate by probing for the manifest resource:
+
+```csharp Volo/Abp/VirtualFileSystem/VirtualFileSetListExtensions.cs
+private static IFileProvider CreateFileProvider(
+    [NotNull] Assembly assembly,
+    string? baseNamespace = null,
+    string? baseFolder = null)
+{
+    Check.NotNull(assembly, nameof(assembly));
+
+    var info = assembly.GetManifestResourceInfo(
+        "Microsoft.Extensions.FileProviders.Embedded.Manifest.xml");
+
+    if (info == null)
+    {
+        return new AbpEmbeddedFileProvider(assembly, baseNamespace);
+    }
+
+    if (baseFolder == null)
+    {
+        return new ManifestEmbeddedFileProvider(assembly);
+    }
+
+    return new ManifestEmbeddedFileProvider(assembly, baseFolder);
+}
+```
+
+The decision tree:
+
+| Manifest present? | `baseFolder` passed? | Provider used |
+|-------------------|----------------------|---------------|
+| No  | (any)  | `AbpEmbeddedFileProvider(assembly, baseNamespace)` |
+| Yes | `null` | `ManifestEmbeddedFileProvider(assembly)` |
+| Yes | set    | `ManifestEmbeddedFileProvider(assembly, baseFolder)` |
+
+<Note>
+The `baseNamespace` argument only matters for the ABP fallback provider — `ManifestEmbeddedFileProvider` keys files by their build-time path because the manifest already records the original folder layout. When you ship a manifest, use `baseFolder` to scope the file set; the namespace becomes irrelevant.
+</Note>
+
+## `EmbeddedVirtualFileSetInfo`
+
+When `AddEmbedded<T>` registers the file set, it wraps the provider in an `EmbeddedVirtualFileSetInfo` so that `ReplaceEmbeddedByPhysical<T>` (and the [Virtual File Explorer](/vfs/virtual-file-explorer-module)) can later identify which assembly produced it:
+
+```csharp Volo/Abp/VirtualFileSystem/Embedded/EmbeddedVirtualFileSetInfo.cs
+public class EmbeddedVirtualFileSetInfo : VirtualFileSetInfo
+{
+    public Assembly Assembly { get; }
+
+    public string? BaseFolder { get; }
+
+    public EmbeddedVirtualFileSetInfo(
+        IFileProvider fileProvider,
+        Assembly assembly,
+        string? baseFolder = null)
+        : base(fileProvider)
+    {
+        Assembly = assembly;
+        BaseFolder = baseFolder;
+    }
+}
+```
+
+## `AbpEmbeddedFileProvider`
+
+When the assembly does not ship a manifest, ABP supplies its own provider. It is a `DictionaryBasedFileProvider` that walks `assembly.GetManifestResourceNames()` once, converts each dotted resource name back into a forward-slash virtual path, and stores it in a lazy dictionary.
+
+```csharp Volo/Abp/VirtualFileSystem/Embedded/AbpEmbeddedFileProvider.cs
+public class AbpEmbeddedFileProvider : DictionaryBasedFileProvider
+{
+    [NotNull] public Assembly Assembly { get; }
+    public string? BaseNamespace { get; }
+
+    protected override IDictionary<string, IFileInfo> Files => _files.Value;
+    private readonly Lazy<Dictionary<string, IFileInfo>> _files;
+
+    public AbpEmbeddedFileProvider(
+        [NotNull] Assembly assembly,
+        string? baseNamespace = null)
+    {
+        Check.NotNull(assembly, nameof(assembly));
+        Assembly = assembly;
+        BaseNamespace = baseNamespace;
+        _files = new Lazy<Dictionary<string, IFileInfo>>(CreateFiles, true);
+    }
+
+    public void AddFiles(Dictionary<string, IFileInfo> files)
+    {
+        var lastModificationTime = GetLastModificationTime();
+
+        foreach (var resourcePath in Assembly.GetManifestResourceNames())
+        {
+            if (!BaseNamespace.IsNullOrEmpty() && !resourcePath.StartsWith(BaseNamespace!))
+            {
+                continue;
+            }
+
+            var fullPath = ConvertToRelativePath(resourcePath).EnsureStartsWith('/');
+
+            if (fullPath.Contains("/"))
+            {
+                AddDirectoriesRecursively(
+                    files,
+                    fullPath.Substring(0, fullPath.LastIndexOf('/')),
+                    lastModificationTime);
+            }
+
+            files[fullPath] = new EmbeddedResourceFileInfo(
+                Assembly,
+                resourcePath,
+                fullPath,
+                CalculateFileName(fullPath),
+                lastModificationTime
+            );
+        }
+    }
+    // ...
+}
+```
+
+### Resource-name → virtual-path conversion
+
+`ConvertToRelativePath` is the heart of the fallback provider. C# embedded resources use dotted names — for example `MyCompany.MyModule.Pages.Index.cshtml` — and the provider has to decide where the folder part ends and the file name begins. It assumes that the **last two** dot-separated segments are `name.extension`, and everything before is the folder path:
+
+```csharp
+private string ConvertToRelativePath(string resourceName)
+{
+    if (!BaseNamespace.IsNullOrEmpty())
+    {
+        resourceName = resourceName.Substring(BaseNamespace!.Length + 1);
+    }
+
+    var pathParts = resourceName.Split('.');
+    if (pathParts.Length <= 2)
+    {
+        return resourceName;
+    }
+
+    var folder = pathParts.Take(pathParts.Length - 2).JoinAsString("/");
+    var fileName = pathParts[pathParts.Length - 2] + "." + pathParts[pathParts.Length - 1];
+
+    return folder + "/" + fileName;
+}
+```
+
+| Resource name | `baseNamespace` | Resulting virtual path |
+|---------------|----------------|------------------------|
+| `MyCompany.MyModule.Pages.Index.cshtml` | `MyCompany.MyModule` | `/Pages/Index.cshtml` |
+| `MyCompany.MyModule.wwwroot.libs.main.css` | `MyCompany.MyModule` | `/wwwroot/libs/main.css` |
+| `MyCompany.MyModule.Localization.Resources.en.json` | `MyCompany.MyModule` | `/Localization/Resources/en.json` |
+| `Stamps.Texture.png` | (none) | `Stamps.Texture.png` *(length ≤ 2 — returned as-is)* |
+
+<Warning>
+Because the conversion treats every `.` as a folder separator, file or folder names containing dots — like a localization JSON file called `pt-BR.json` — become `pt/BR.json` under the **ABP** provider. The fallback provider only works correctly for assets whose folder names are valid C# identifier-compatible segments. If you have multi-segment file names, ship the manifest and use `ManifestEmbeddedFileProvider`.
+</Warning>
+
+### Synthetic directory entries
+
+`GetDirectoryContents` on `DictionaryBasedFileProvider` only returns entries whose `VirtualPath` starts with the requested directory. So `AbpEmbeddedFileProvider` walks back from each file and inserts a `VirtualDirectoryFileInfo` for every parent path that does not already exist:
+
+```csharp
+private static void AddDirectoriesRecursively(
+    Dictionary<string, IFileInfo> files,
+    string directoryPath,
+    DateTimeOffset lastModificationTime)
+{
+    if (files.ContainsKey(directoryPath))
+    {
+        return;
+    }
+
+    files[directoryPath] = new VirtualDirectoryFileInfo(
+        directoryPath,
+        CalculateFileName(directoryPath),
+        lastModificationTime
+    );
+
+    if (directoryPath.Contains("/"))
+    {
+        AddDirectoriesRecursively(
+            files,
+            directoryPath.Substring(0, directoryPath.LastIndexOf('/')),
+            lastModificationTime);
+    }
+}
+```
+
+`VirtualDirectoryFileInfo` is a trivial `IFileInfo` whose `IsDirectory` is `true`, `Length` is `0`, and `CreateReadStream()` throws `InvalidOperationException`.
+
+### Last-modified time
+
+The provider stamps every file with the same modification time, taken from the assembly's `.dll` on disk:
+
+```csharp
+private DateTimeOffset GetLastModificationTime()
+{
+    var lastModified = DateTimeOffset.UtcNow;
+    if (!string.IsNullOrEmpty(Assembly.Location))
+    {
+        try
+        {
+            lastModified = File.GetLastWriteTimeUtc(Assembly.Location);
+        }
+        catch (PathTooLongException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+    return lastModified;
+}
+```
+
+In single-file-published apps where `Assembly.Location` is empty, the provider falls back to `DateTimeOffset.UtcNow` at first read.
+
+### Path normalisation
+
+Lookups go through `VirtualFilePathHelper.NormalizePath` before hitting the dictionary, so requests for `/Pages/My-Page.cshtml` and `/Pages/my_page.cshtml` collide (because `-` is normalised to `_` in folder names):
+
+```csharp Volo/Abp/VirtualFileSystem/VirtualFilePathHelper.cs
+internal static class VirtualFilePathHelper
+{
+    public static string NormalizePath(string fullPath)
+    {
+        if (fullPath.Equals("/", StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        var fileName = fullPath;
+        var extension = "";
+
+        if (fileName.Contains("."))
+        {
+            extension = fullPath.Substring(fileName.LastIndexOf(".", StringComparison.Ordinal));
+            if (extension.Contains("/"))
+            {
+                extension = "";
+            }
+            else
+            {
+                fileName = fullPath.Substring(0, fullPath.Length - extension.Length);
+            }
+        }
+
+        return NormalizeChars(fileName) + extension;
+    }
+
+    private static string NormalizeChars(string fileName)
+    {
+        var folderParts = fileName.Replace(".", "/").Split("/");
+        if (folderParts.Length == 1)
+        {
+            return folderParts[0];
+        }
+        return folderParts.Take(folderParts.Length - 1)
+                          .Select(s => s.Replace("-", "_"))
+                          .JoinAsString("/") + "/" + folderParts.Last();
+    }
+}
+```
+
+The rules:
+
+- The literal `"/"` is normalised to the empty string so the root directory matches.
+- The **file name extension** (last `.` segment with no `/`) is preserved verbatim.
+- All other `.` characters in the path are interpreted as `/` separators.
+- Every folder segment (everything before the last `/`) has `-` replaced with `_`.
+
+This intentionally matches the round-trip that `AbpEmbeddedFileProvider` performed when it built the dictionary: dots became slashes, and `-` characters in identifiers became `_` because they are not legal in C# namespaces.
+
+## `EmbeddedResourceFileInfo`
+
+`EmbeddedResourceFileInfo` is the `IFileInfo` produced for every embedded asset. It defers reading until `CreateReadStream()` is called, and caches the stream length on first access:
+
+```csharp Volo/Abp/VirtualFileSystem/Embedded/EmbeddedResourceFileInfo.cs
+public class EmbeddedResourceFileInfo : IFileInfo
+{
+    public bool Exists => true;
+    public long Length { get { /* lazy: opens stream once */ } }
+    public string? PhysicalPath => null;
+    public string VirtualPath { get; }
+    public string Name { get; }
+    public DateTimeOffset LastModified { get; }
+    public bool IsDirectory => false;
+
+    public EmbeddedResourceFileInfo(
+        Assembly assembly,
+        string resourcePath,
+        string virtualPath,
+        string name,
+        DateTimeOffset lastModified) { /* ... */ }
+
+    public Stream CreateReadStream()
+    {
+        var stream = _assembly.GetManifestResourceStream(_resourcePath);
+
+        if (!_length.HasValue && stream != null)
+        {
+            _length = stream.Length;
+        }
+
+        return stream!;
+    }
+}
+```
+
+| Member | Behaviour |
+|--------|-----------|
+| `Exists` | Always `true` — the provider only constructs this type for resources it found. |
+| `Length` | Lazily computed by opening `GetManifestResourceStream` once. |
+| `PhysicalPath` | Always `null` — embedded files have no on-disk location. |
+| `VirtualPath` | The `/`-rooted virtual path, e.g. `/Pages/Index.cshtml`. |
+| `Name` | The trailing file-name segment. |
+| `LastModified` | The `.dll`'s `LastWriteTimeUtc` (or `UtcNow`). |
+| `IsDirectory` | `false`. |
+| `CreateReadStream()` | Returns `Assembly.GetManifestResourceStream(_resourcePath)` directly. |
+
+<Tip>
+`GetVirtualOrPhysicalPathOrNull` (in `AbpFileInfoExtensions`) special-cases `EmbeddedResourceFileInfo` and returns its `VirtualPath` — this is what the dynamic file provider keys on when you push a runtime override of an embedded file. See [File providers](/vfs/file-providers).
+</Tip>
+
+## Integration with `ManifestEmbeddedFileProvider`
+
+When an assembly opts in to `GenerateEmbeddedFilesManifest`, the build emits an XML manifest that records every embedded resource together with its original folder structure. Microsoft's `ManifestEmbeddedFileProvider` (from `Microsoft.Extensions.FileProviders.Embedded`) reads that manifest and serves files as `ManifestFileInfo` / `ManifestDirectoryInfo`.
+
+ABP defers to the manifest provider whenever it is available because:
+
+- It preserves original case and exact folder/file names (no dot-to-slash heuristic is needed).
+- It handles multi-segment file names like `pt-BR.json` correctly.
+- It is shared with ASP.NET Core's own static-file pipeline, so its behaviour is well understood.
+
+The trade-off is a build-time configuration: every consuming project must opt in to `<GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>` and reference the `Microsoft.Extensions.FileProviders.Embedded` package. All first-party ABP UI modules do.
+
+### `baseFolder` scoping
+
+The `baseFolder` parameter on `AddEmbedded<T>(baseFolder: "wwwroot")` is forwarded to `ManifestEmbeddedFileProvider`'s constructor:
+
+```csharp
+return new ManifestEmbeddedFileProvider(assembly, baseFolder);
+```
+
+That tells the manifest provider to root the virtual file system at the manifest entry `baseFolder`, so a request for `/site.css` resolves to the file originally built as `wwwroot/site.css`. This is the standard pattern for exposing only a module's static assets while keeping its Razor `.cshtml` source out of the public virtual tree.
+
+## A real-world registration
+
+The Virtual File Explorer module registers itself the canonical way:
+
+```csharp modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerWebModule.cs
+Configure<AbpVirtualFileSystemOptions>(options =>
+{
+    options.FileSets.AddEmbedded<AbpVirtualFileExplorerWebModule>(
+        "Volo.Abp.VirtualFileExplorer.Web");
+});
+```
+
+Because the project ships `GenerateEmbeddedFilesManifest=true` *and* no `baseFolder` is passed, this evaluates to:
+
+1. Manifest probe finds `Microsoft.Extensions.FileProviders.Embedded.Manifest.xml`.
+2. `new ManifestEmbeddedFileProvider(assembly)` is returned.
+3. `EmbeddedVirtualFileSetInfo` wraps it, remembering `Assembly = <web module assembly>` and `BaseFolder = null`.
+
+The `baseNamespace` argument `"Volo.Abp.VirtualFileExplorer.Web"` is recorded but **ignored** because the manifest provider was chosen — it would only matter if the project had not generated a manifest and ABP had fallen back to `AbpEmbeddedFileProvider`.
+
+## Related pages
+
+- [VFS overview](/vfs/overview) — composite lookup and registration entry points.
+- [Physical files](/vfs/physical-files) — what `ReplaceEmbeddedByPhysical<T>` swaps to.
+- [File providers](/vfs/file-providers) — `DictionaryBasedFileProvider` (base of `AbpEmbeddedFileProvider`) and `DynamicFileProvider`.
+- [Localization](/localization/overview) — uses embedded JSON via `AddVirtualJson`.
+- [UI MVC bundling](/ui-mvc/bundling) — pulls embedded CSS/JS through the VFS.

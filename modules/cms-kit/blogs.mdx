@@ -1,0 +1,568 @@
+---
+title: "CMS Kit Blogs: Blog, BlogPost, and Per-Blog Feature Toggles"
+sidebarTitle: "Blogs"
+description: "Blog and BlogPost aggregates inside CMS Kit, the IBlogRepository and IBlogPostRepository contracts, BlogManager and BlogPostManager domain services, BlogFeature toggles, and the admin and public app services."
+---
+
+The CMS Kit Blogs feature is a self‑contained mini blogging engine inside the bigger CMS Kit bundle. Unlike the standalone [Blogging](/modules/blogging) module, it does not own the entire CMS — it just contributes a `Blog` aggregate (a container with a name and a slug), a `BlogPost` aggregate (the actual posts with status, author, tags, reactions, ratings, and a cover image), and a `BlogFeature` aggregate that lets each blog independently enable comments, reactions, ratings, tags, scroll indexing, and XSS protection. Everything else — tags, comments, reactions, ratings, media — comes from the matching CMS Kit features. This page walks the source tree under `Volo.CmsKit.Domain/Volo/CmsKit/Blogs/`, lists every type, and shows the admin and public app services that sit on top.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs). See [Overview](/modules/cms-kit/overview) for the package matrix.
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/"
+Blog.cs
+BlogPost.cs
+BlogFeature.cs
+BlogFeatureDataSeedContributor.cs
+BlogManager.cs
+BlogPostManager.cs
+BlogFeatureManager.cs
+IBlogRepository.cs
+IBlogPostRepository.cs
+IBlogFeatureRepository.cs
+IDefaultBlogFeatureProvider.cs
+DefaultBlogFeatureProvider.cs
+BlogSlugAlreadyExistException.cs
+BlogPostSlugAlreadyExistException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `Blog.cs` | `FullAuditedAggregateRoot<Guid>` | Blog container with `Name` and `Slug` |
+| `BlogPost.cs` | `FullAuditedAggregateRoot<Guid>` | Individual post with status, author, cover image |
+| `BlogFeature.cs` | `FullAuditedAggregateRoot<Guid>` | One row per (blog, feature‑name, enabled) tuple |
+| `BlogManager.cs` | `DomainService` | Creates and updates `Blog`, enforces slug uniqueness |
+| `BlogPostManager.cs` | `DomainService` | Creates posts, validates author/blog, enforces slug uniqueness scoped to the blog |
+| `BlogFeatureManager.cs` | `DomainService` | Reads / writes per‑blog feature toggles |
+| `IBlogRepository.cs` | interface | Blog lookup, slug existence, listing |
+| `IBlogPostRepository.cs` | interface | Post filtering by blog/author/tag/status, slug lookup |
+| `IBlogFeatureRepository.cs` | interface | Per‑blog feature lookup |
+| `IDefaultBlogFeatureProvider.cs` / `DefaultBlogFeatureProvider.cs` | interface + default impl | Seeds the default set of features for a new blog |
+| `BlogSlugAlreadyExistException.cs` / `BlogPostSlugAlreadyExistException.cs` | `BusinessException` | Localized errors raised by the managers |
+
+## Domain model
+
+```mermaid
+erDiagram
+    BLOG ||--o{ BLOGPOST : "has posts"
+    BLOG ||--o{ BLOGFEATURE : "has feature toggles"
+    CMSUSER ||--o{ BLOGPOST : "authors"
+    BLOGPOST }o..o{ TAG : "tagged via EntityTag"
+    BLOGPOST }o..o{ COMMENT : "commented via Comment"
+    BLOGPOST }o..o{ RATING : "rated via Rating"
+    BLOGPOST }o..o{ USERREACTION : "reacted via UserReaction"
+
+    BLOG {
+        Guid Id PK
+        string Name
+        string Slug
+        Guid? TenantId
+    }
+    BLOGPOST {
+        Guid Id PK
+        Guid BlogId FK
+        Guid AuthorId FK
+        string Title
+        string Slug
+        string ShortDescription
+        string Content
+        Guid? CoverImageMediaId
+        BlogPostStatus Status
+        int EntityVersion
+    }
+    BLOGFEATURE {
+        Guid Id PK
+        Guid BlogId FK
+        string FeatureName
+        bool IsEnabled
+    }
+```
+
+### `Blog`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/Blog.cs"
+public class Blog : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    [NotNull] public virtual string Name  { get; protected set; }
+    [NotNull] public virtual string Slug  { get; protected set; }
+    public virtual Guid? TenantId        { get; protected set; }
+
+    protected internal Blog(
+        Guid id,
+        [NotNull] string name,
+        [NotNull] string slug,
+        [CanBeNull] Guid? tenantId = null) : base(id)
+    {
+        SetName(name);
+        SetSlug(slug);
+        TenantId = tenantId;
+    }
+
+    public virtual void SetName(string name) =>
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), BlogConsts.MaxNameLength);
+
+    public virtual void SetSlug(string slug)
+    {
+        Check.NotNullOrWhiteSpace(slug, nameof(slug), BlogConsts.MaxNameLength);
+        Slug = SlugNormalizer.Normalize(slug);
+    }
+}
+```
+
+A `Blog` is intentionally minimal — it is a *container* identified by a slug. The constructor is `protected internal` because callers must go through `BlogManager.CreateAsync`, which runs the slug‑uniqueness check.
+
+### `BlogPost`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/BlogPost.cs"
+public class BlogPost : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntityVersion
+{
+    public virtual Guid BlogId             { get; protected set; }
+    [NotNull] public virtual string Title  { get; protected set; }
+    [NotNull] public virtual string Slug   { get; protected set; }
+    [NotNull] public virtual string ShortDescription { get; protected set; }
+    public virtual string Content          { get; protected set; }
+    public Guid? CoverImageMediaId         { get; set; }
+    public virtual Guid? TenantId          { get; protected set; }
+    public Guid AuthorId                   { get; set; }
+    public virtual CmsUser Author          { get; set; }
+    public virtual BlogPostStatus Status   { get; set; }
+    public virtual int EntityVersion       { get; protected set; }
+    // ...
+    public virtual void SetDraft()             => Status = BlogPostStatus.Draft;
+    public virtual void SetPublished()         => Status = BlogPostStatus.Published;
+    public virtual void SetWaitingForReview()  => Status = BlogPostStatus.WaitingForReview;
+}
+```
+
+Key points:
+
+- `BlogId` is a foreign‑key reference, never a navigation property — multi‑tenant blogs may live in different databases, so the aggregate must self‑contain.
+- `Author` is a `CmsUser` (the synced projection — see [Overview](/modules/cms-kit/overview#aggregates-inside-volocmskitdomain)), so listing a blog post never crosses the identity bounded context.
+- `Status` is a `BlogPostStatus` enum: `Draft`, `WaitingForReview`, `Published`. The status setters are the only domain methods on the aggregate that change visibility — they are called from the admin app service.
+- `EntityVersion` implements `IHasEntityVersion`, which means optimistic concurrency checks are wired up via `IHasConcurrencyStamp` for the EF and Mongo configurations.
+- `CoverImageMediaId` references a [`MediaDescriptor`](/modules/cms-kit/media-descriptors) — the bytes live in BLOB storage, this aggregate keeps only the id.
+
+### `BlogFeature`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/BlogFeature.cs"
+public class BlogFeature : FullAuditedAggregateRoot<Guid>
+{
+    public Guid   BlogId      { get; protected set; }
+    public string FeatureName { get; protected set; }
+    public bool   IsEnabled   { get; protected internal set; }
+
+    public BlogFeature(Guid blogId, [NotNull] string featureName, bool isEnabled = true)
+    {
+        BlogId = blogId;
+        FeatureName = Check.NotNullOrWhiteSpace(featureName, nameof(featureName));
+        IsEnabled = isEnabled;
+    }
+}
+```
+
+`BlogFeature` is a row per (blog, feature‑name). The default set of feature names is supplied by `DefaultBlogFeatureProvider`:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/DefaultBlogFeatureProvider.cs"
+public virtual Task<List<BlogFeature>> GetDefaultFeaturesAsync(Guid blogId)
+{
+    return Task.FromResult(new List<BlogFeature>
+    {
+        new BlogFeature(blogId, CommentsFeature.Name),
+        new BlogFeature(blogId, ReactionsFeature.Name),
+        new BlogFeature(blogId, RatingsFeature.Name),
+        new BlogFeature(blogId, TagsFeature.Name),
+        new BlogFeature(blogId, BlogPostScrollIndexFeature.Name),
+        new BlogFeature(blogId, BlogConsts.PreventXssFeatureName)
+    });
+}
+```
+
+Override `IDefaultBlogFeatureProvider` in your application module to change the default set per‑tenant or per‑blog‑kind.
+
+## Repositories
+
+### `IBlogRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/IBlogRepository.cs"
+public interface IBlogRepository : IBasicRepository<Blog, Guid>
+{
+    Task<List<Blog>> GetListAsync(
+        string filter = null, string sorting = null,
+        int maxResultCount = int.MaxValue, int skipCount = 0,
+        CancellationToken cancellationToken = default);
+
+    Task<long> GetCountAsync(string filter = null, CancellationToken cancellationToken = default);
+
+    Task<Blog> GetBySlugAsync(string slug, CancellationToken cancellationToken = default);
+
+    Task<bool> ExistsAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<bool> SlugExistsAsync(string slug, CancellationToken cancellationToken = default);
+}
+```
+
+The two `ExistsAsync` overloads are the engines that drive `BlogManager.CheckSlugAsync` and the existence guard in `BlogPostManager.CheckBlogExistenceAsync`. Implementations live in `Volo.CmsKit.EntityFrameworkCore/Volo/CmsKit/Blogs/EfCoreBlogRepository.cs` and `Volo.CmsKit.MongoDB/Volo/CmsKit/Blogs/MongoBlogRepository.cs`.
+
+### `IBlogPostRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/IBlogPostRepository.cs"
+public interface IBlogPostRepository : IBasicRepository<BlogPost, Guid>
+{
+    Task<int> GetCountAsync(
+        string filter = null,
+        Guid? blogId = null,
+        Guid? authorId = null,
+        Guid? tagId = null,
+        BlogPostStatus? statusFilter = null,
+        CancellationToken cancellationToken = default);
+
+    Task<List<BlogPost>> GetListAsync(
+        string filter = null,
+        Guid? blogId = null,
+        Guid? authorId = null,
+        Guid? tagId = null,
+        BlogPostStatus? statusFilter = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        string sorting = null,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> SlugExistsAsync(Guid blogId, string slug, CancellationToken cancellationToken = default);
+    Task<BlogPost> GetBySlugAsync(Guid blogId, string slug, CancellationToken cancellationToken = default);
+
+    Task<List<CmsUser>> GetAuthorsHasBlogPostsAsync(
+        int skipCount, int maxResultCount, string sorting, string filter,
+        CancellationToken cancellationToken = default);
+
+    Task<int> GetAuthorsHasBlogPostsCountAsync(string filter, CancellationToken cancellationToken = default);
+    Task<CmsUser> GetAuthorHasBlogPostAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<bool> HasBlogPostWaitingForReviewAsync(CancellationToken cancellationToken = default);
+}
+```
+
+Three groupings of methods here:
+
+1. **Listing** (`GetListAsync`, `GetCountAsync`) supports filtering by blog, author, tag, status, and free‑text — driven by `BlogPostGetListInput` in both the admin and public DTOs.
+2. **Slug operations** (`SlugExistsAsync`, `GetBySlugAsync`) — note that slug uniqueness is **scoped to a blog**, not globally. Two blogs can have a post called `hello-world`.
+3. **Author projection** — the `GetAuthorsHasBlogPosts*` family returns the set of `CmsUser`s who have at least one post on this site, used by the author lookup in the admin UI.
+
+### `IBlogFeatureRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/IBlogFeatureRepository.cs"
+public interface IBlogFeatureRepository : IBasicRepository<BlogFeature, Guid>
+{
+    Task<List<BlogFeature>> GetListAsync(Guid blogId, CancellationToken cancellationToken = default);
+
+    Task<List<BlogFeature>> GetListAsync(
+        Guid blogId, List<string> featureNames,
+        CancellationToken cancellationToken = default);
+
+    Task<BlogFeature> FindAsync(
+        Guid blogId, string featureName,
+        CancellationToken cancellationToken = default);
+}
+```
+
+## Domain services
+
+### `BlogManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/BlogManager.cs"
+public class BlogManager : DomainService
+{
+    protected IBlogRepository BlogRepository { get; }
+
+    public virtual async Task<Blog> CreateAsync([NotNull] string name, [NotNull] string slug)
+    {
+        await CheckSlugAsync(slug);
+        return new Blog(GuidGenerator.Create(), name, slug, CurrentTenant.Id);
+    }
+
+    public virtual async Task<Blog> UpdateAsync(
+        [NotNull] Blog blog,
+        [NotNull] string name,
+        [NotNull] string slug)
+    {
+        if (slug != blog.Slug)
+        {
+            await CheckSlugAsync(slug);
+        }
+
+        blog.SetName(name);
+        blog.SetSlug(slug);
+        return blog;
+    }
+
+    protected virtual async Task CheckSlugAsync([NotNull] string slug)
+    {
+        if (await BlogRepository.SlugExistsAsync(slug))
+        {
+            throw new BlogSlugAlreadyExistException(slug);
+        }
+    }
+}
+```
+
+The manager's only job is slug uniqueness. The aggregate constructor does the field validation; the repository does the query; the manager binds them together. The factory pattern (`CreateAsync` returns the aggregate but does **not** insert it) is consistent with every other CMS Kit manager.
+
+### `BlogPostManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/BlogPostManager.cs"
+public class BlogPostManager : DomainService
+{
+    protected IBlogPostRepository BlogPostRepository { get; }
+    protected IBlogRepository BlogRepository { get; }
+    protected IDefaultBlogFeatureProvider BlogFeatureProvider { get; }
+
+    public virtual async Task<BlogPost> CreateAsync(
+        [NotNull] CmsUser author,
+        [NotNull] Blog blog,
+        [NotNull] string title,
+        [NotNull] string slug,
+        [NotNull] BlogPostStatus status,
+        [CanBeNull] string shortDescription = null,
+        [CanBeNull] string content = null,
+        [CanBeNull] Guid? coverImageMediaId = null)
+    {
+        Check.NotNull(author, nameof(author));
+        Check.NotNull(blog, nameof(blog));
+        Check.NotNullOrEmpty(title, nameof(title));
+        Check.NotNullOrEmpty(slug, nameof(slug));
+
+        var blogPost = new BlogPost(
+            GuidGenerator.Create(),
+            blog.Id,
+            author.Id,
+            title, slug, shortDescription, content,
+            coverImageMediaId, CurrentTenant.Id, status);
+
+        await CheckSlugExistenceAsync(blog.Id, blogPost.Slug);
+        return blogPost;
+    }
+
+    public virtual async Task SetSlugUrlAsync(BlogPost blogPost, [NotNull] string newSlug)
+    {
+        Check.NotNullOrWhiteSpace(newSlug, nameof(newSlug));
+        await CheckSlugExistenceAsync(blogPost.BlogId, newSlug);
+        blogPost.SetSlug(newSlug);
+    }
+
+    protected virtual async Task CheckSlugExistenceAsync(Guid blogId, string slug)
+    {
+        if (await BlogPostRepository.SlugExistsAsync(blogId, slug))
+        {
+            throw new BlogPostSlugAlreadyExistException(blogId, slug);
+        }
+    }
+
+    protected virtual async Task CheckBlogExistenceAsync(Guid blogId)
+    {
+        if (!await BlogRepository.ExistsAsync(blogId))
+        {
+            throw new EntityNotFoundException(typeof(Blog), blogId);
+        }
+    }
+}
+```
+
+Note the constructor takes the *aggregates* — not the ids — because the manager treats post creation as a domain operation that needs the parent blog and the author in hand. Ids alone would let callers wire a post to a deleted blog.
+
+### `BlogFeatureManager`
+
+`BlogFeatureManager` exposes four operations on per‑blog toggles: `SetAsync`, `SetDefaultsAsync`, `SetIfNotSetAsync`, and `SetDefaultsIfNotSetAsync`. The "if not set" variants are used by data seeders to make seeding idempotent.
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Blogs/BlogFeatureManager.cs"
+public async Task SetAsync(Guid blogId, string featureName, bool isEnabled)
+{
+    var blogFeature = await BlogFeatureRepository.FindAsync(blogId, featureName);
+    if (blogFeature == null)
+    {
+        await BlogFeatureRepository.InsertAsync(
+            new BlogFeature(blogId, featureName, isEnabled));
+    }
+    else
+    {
+        blogFeature.IsEnabled = isEnabled;
+        await BlogFeatureRepository.UpdateAsync(blogFeature);
+    }
+}
+```
+
+## Admin app services
+
+The `Volo.CmsKit.Admin.Application` project hosts:
+
+- `BlogAdminAppService` → `IBlogAdminAppService` — standard CRUD.
+- `BlogPostAdminAppService` → `IBlogPostAdminAppService` — CRUD + publish workflow.
+- `BlogFeatureAdminAppService` → `IBlogFeatureAdminAppService` — per‑blog toggle API.
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/Blogs/BlogAdminAppService.cs"
+[RequiresFeature(CmsKitFeatures.BlogEnable)]
+[RequiresGlobalFeature(typeof(BlogsFeature))]
+[Authorize(CmsKitAdminPermissions.Blogs.Default)]
+public class BlogAdminAppService : CmsKitAdminAppServiceBase, IBlogAdminAppService
+{
+    protected IBlogRepository BlogRepository { get; }
+    protected BlogManager BlogManager { get; }
+    protected BlogFeatureManager BlogFeatureManager { get; }
+    // ...
+    [Authorize(CmsKitAdminPermissions.Blogs.Create)]
+    public virtual async Task<BlogDto> CreateAsync(CreateBlogDto input)
+    {
+        var blog = await BlogManager.CreateAsync(input.Name, input.Slug);
+        input.MapExtraPropertiesTo(blog);
+        // ...
+    }
+}
+```
+
+Every public method on the admin services carries:
+
+1. `[RequiresGlobalFeature(typeof(BlogsFeature))]` — the compile‑time switch.
+2. `[RequiresFeature(CmsKitFeatures.BlogEnable)]` — the per‑tenant runtime switch.
+3. `[Authorize(CmsKitAdminPermissions.Blogs.*)]` — fine‑grained CRUD permission.
+
+See [Permission System](/authz/permission-system) for how the three layers compose.
+
+`IBlogPostAdminAppService` extends a `ICrudAppService` and adds the workflow operations:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Blogs/IBlogPostAdminAppService.cs"
+public interface IBlogPostAdminAppService
+    : ICrudAppService<
+        BlogPostDto,
+        BlogPostListDto,
+        Guid,
+        BlogPostGetListInput,
+        CreateBlogPostDto,
+        UpdateBlogPostDto>
+{
+    Task PublishAsync(Guid id);
+    Task DraftAsync(Guid id);
+    Task<BlogPostDto> CreateAndPublishAsync(CreateBlogPostDto input);
+    Task SendToReviewAsync(Guid id);
+    Task<BlogPostDto> CreateAndSendToReviewAsync(CreateBlogPostDto input);
+    Task<bool> HasBlogPostWaitingForReviewAsync();
+}
+```
+
+`PublishAsync` is gated by `CmsKitAdminPermissions.BlogPosts.Publish` — a separate permission from `Update`, so an editor role can be granted update without being allowed to flip drafts to live.
+
+## Public app services
+
+The public surface, in `Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Blogs/`, looks like this:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Blogs/IBlogPostPublicAppService.cs"
+public interface IBlogPostPublicAppService : IApplicationService
+{
+    Task<PagedResultDto<BlogPostCommonDto>> GetListAsync(
+        [NotNull] string blogSlug, BlogPostGetListInput input);
+
+    Task<BlogPostCommonDto> GetAsync(
+        [NotNull] string blogSlug, [NotNull] string blogPostSlug);
+
+    Task<PagedResultDto<CmsUserDto>> GetAuthorsHasBlogPostsAsync(
+        BlogPostFilteredPagedAndSortedResultRequestDto input);
+
+    Task<CmsUserDto> GetAuthorHasBlogPostAsync(Guid id);
+    Task DeleteAsync(Guid id);
+    Task<string> GetTagNameAsync([NotNull] Guid tagId);
+}
+```
+
+A few design choices:
+
+- **Lookup is by blog slug, not blog id.** The public URL space is `/blog/{blogSlug}/{postSlug}`, so the API mirrors it.
+- **`GetListAsync` accepts a `BlogPostGetListInput`** that lives in the Public contracts project — note it is *not* the admin's `BlogPostGetListInput`; the public one cannot filter by status (only `Published` posts are returned).
+- **`DeleteAsync`** exists on the public surface so an author can delete their own draft; the implementation checks `CurrentUser.GetId() == post.AuthorId` before delegating to the repository.
+- There is no `CreateAsync` on the public surface — drafting happens through the admin.
+
+## Permissions for blogs
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Permissions/CmsKitAdminPermissions.cs"
+public static class Blogs
+{
+    public const string Default  = GroupName + ".Blogs";
+    public const string Create   = Default + ".Create";
+    public const string Update   = Default + ".Update";
+    public const string Delete   = Default + ".Delete";
+    public const string Features = Default + ".Features"; // toggle BlogFeature rows
+}
+
+public static class BlogPosts
+{
+    public const string Default = GroupName + ".BlogPosts";
+    public const string Create  = Default + ".Create";
+    public const string Update  = Default + ".Update";
+    public const string Delete  = Default + ".Delete";
+    public const string Publish = Default + ".Publish";   // flip to BlogPostStatus.Published
+}
+```
+
+`Blogs.Features` is the permission required by `BlogFeatureAdminAppService` to read or modify the per‑blog `BlogFeature` rows. It's separate from `Blogs.Update` because feature toggles often want a different role.
+
+## Feature flags that affect blogs
+
+The `BlogsFeature` global flag (from [`BlogsFeature.cs`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/BlogsFeature.cs)) is the master switch. When `GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>()` is `false`, none of the controllers, services, or auto‑mapper profiles for blogs are wired up.
+
+Inside `CmsKitDomainModule.ConfigureServices`, blog posts are registered with [Reactions](/modules/cms-kit/reactions) and [Ratings](/modules/cms-kit/ratings) only if their respective global features are also on:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/CmsKitDomainModule.cs"
+if (GlobalFeatureManager.Instance.IsEnabled<ReactionsFeature>())
+{
+    Configure<CmsKitReactionOptions>(options =>
+    {
+        if (GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>())
+        {
+            options.EntityTypes.Add(
+                new ReactionEntityTypeDefinition(
+                    BlogPostConsts.EntityType,
+                    reactions: new[]
+                    {
+                        new ReactionDefinition(StandardReactions.Smile),
+                        new ReactionDefinition(StandardReactions.ThumbsUp),
+                        new ReactionDefinition(StandardReactions.ThumbsDown),
+                        // ...
+                    }));
+        }
+    });
+}
+```
+
+The same conditional pattern wires blog posts into [Tags](/modules/cms-kit/tags) (with create/update permissions tied to `BlogPosts.Create` and `BlogPosts.Update`) and [Media descriptors](/modules/cms-kit/media-descriptors) (for cover images).
+
+## EF Core configuration
+
+`CmsKitEntityFrameworkCoreModule` registers three repositories for blogs:
+
+```csharp
+options.AddRepository<Blog,        EfCoreBlogRepository>();
+options.AddRepository<BlogPost,    EfCoreBlogPostRepository>();
+options.AddRepository<BlogFeature, EfCoreBlogFeatureRepository>();
+```
+
+The entity configuration adds indexes on `BlogPost.BlogId + Slug` to back the `SlugExistsAsync(blogId, slug)` query and `Blog.Slug` for `GetBySlugAsync`. MongoDB mirrors this through indexed collections inside `CmsKitMongoDbContext`.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Blogs fits in the package matrix and how the [DependsOn] graph hangs together.
+  </Card>
+  <Card title="Tags" icon="tag" href="/modules/cms-kit/tags">
+    Blog post tagging via the shared `EntityTag` join.
+  </Card>
+  <Card title="Comments" icon="comments" href="/modules/cms-kit/comments">
+    Generic comment store that backs blog post comments.
+  </Card>
+  <Card title="Reactions" icon="face-smile" href="/modules/cms-kit/reactions">
+    Emoji reactions registered for `BlogPostConsts.EntityType`.
+  </Card>
+  <Card title="Ratings" icon="star" href="/modules/cms-kit/ratings">
+    Star ratings on blog posts.
+  </Card>
+  <Card title="Standalone Blogging module" icon="rss" href="/modules/blogging">
+    The older self‑contained Blogging module — contrast with CMS Kit Blogs.
+  </Card>
+</CardGroup>

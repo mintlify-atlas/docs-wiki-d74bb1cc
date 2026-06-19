@@ -1,0 +1,490 @@
+---
+title: "AbpStringLocalizerFactory: Caching, Fallback & Resolution"
+sidebarTitle: "Localizer Factory"
+description: "How AbpStringLocalizerFactory resolves IStringLocalizer instances, caches them per resource, and resolves LocalizedString values across culture fallbacks."
+---
+
+`AbpStringLocalizerFactory` is the ABP-flavored `IStringLocalizerFactory` registered into the DI container during `AbpLocalizationModule.ConfigureServices`. It owns the per-resource cache, talks to the external store for unknown resources, and ultimately produces `AbpDictionaryBasedStringLocalizer` instances that perform the lookup. This page reads through the factory and the localizer it returns, and shows how the fallback chain is assembled.
+
+## Replacement of the default factory
+
+The factory is installed by a small static helper that runs from the module:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+internal static void Replace(IServiceCollection services)
+{
+    services.Replace(ServiceDescriptor.Singleton<IStringLocalizerFactory, AbpStringLocalizerFactory>());
+    services.AddSingleton<ResourceManagerStringLocalizerFactory>();
+}
+```
+
+`Replace` swaps the default factory while keeping `ResourceManagerStringLocalizerFactory` available as `InnerFactory`. Any localization request for a resource type that ABP does not own is forwarded to the inner factory unchanged, which means existing ASP.NET Core consumers keep working.
+
+## ABP extension contract
+
+`IAbpStringLocalizerFactory` adds three operations on top of MEL's `IStringLocalizerFactory`:
+
+```csharp title="framework/src/Volo.Abp.Localization.Abstractions/Microsoft/Extensions/Localization/IAbpStringLocalizerFactory.cs"
+public interface IAbpStringLocalizerFactory
+{
+    IStringLocalizer? CreateDefaultOrNull();
+
+    IStringLocalizer? CreateByResourceNameOrNull([NotNull] string resourceName);
+    
+    Task<IStringLocalizer?> CreateByResourceNameOrNullAsync([NotNull] string resourceName);
+}
+```
+
+`CreateDefaultOrNull` returns a localizer for `AbpLocalizationOptions.DefaultResourceType` (or `null` when no default is configured). `CreateByResourceNameOrNull` and its async counterpart look up resources by string name — the path used when the resource type is unknown to the caller.
+
+Static extensions provide the throwing variants and the safe casts from `IStringLocalizerFactory`:
+
+```csharp title="framework/src/Volo.Abp.Localization.Abstractions/Microsoft/Extensions/Localization/AbpStringLocalizerFactoryExtensions.cs"
+public static IStringLocalizer? CreateDefaultOrNull(this IStringLocalizerFactory localizerFactory)
+{
+    return (localizerFactory as IAbpStringLocalizerFactory)
+        ?.CreateDefaultOrNull();
+}
+
+public static IStringLocalizer? CreateByResourceNameOrNull(
+    this IStringLocalizerFactory localizerFactory,
+    string resourceName)
+{
+    return (localizerFactory as IAbpStringLocalizerFactory)
+        ?.CreateByResourceNameOrNull(resourceName);
+}
+
+[NotNull]
+public static IStringLocalizer CreateByResourceName(
+    this IStringLocalizerFactory localizerFactory,
+    string resourceName)
+{
+    var localizer = localizerFactory.CreateByResourceNameOrNull(resourceName);
+    if (localizer == null)
+    {
+        throw new AbpException("Couldn't find a localizer with given resource name: " + resourceName);
+    }
+    
+    return localizer;
+}
+```
+
+These extensions let calling code use the `IStringLocalizerFactory` type without having to know about ABP — the cast is silent when the factory was not replaced.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `Volo.Abp.Localization.Abstractions/Microsoft/Extensions/Localization/IAbpStringLocalizerFactory.cs` | ABP extension contract over MEL. |
+| `Volo.Abp.Localization.Abstractions/Microsoft/Extensions/Localization/AbpStringLocalizerFactoryExtensions.cs` | Safe casts and throwing helpers. |
+| `Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs` | Factory implementation, cache, `Replace`. |
+| `Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs` | `IAbpStringLocalizer` that performs lookups. |
+| `Volo.Abp.Localization/Volo/Abp/Localization/IAbpStringLocalizer.cs` | Extension contract over `IStringLocalizer`. |
+| `Volo.Abp.Localization/Volo/Abp/Localization/LocalizationResourceContributorList.cs` | Iterates contributors in reverse. |
+| `Volo.Abp.Core/Volo/Abp/Localization/CultureHelper.cs` | Ambient culture switch used during fallback. |
+
+## Factory state
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+public class AbpStringLocalizerFactory : IStringLocalizerFactory, IAbpStringLocalizerFactory
+{
+    protected internal AbpLocalizationOptions AbpLocalizationOptions { get; }
+    protected ResourceManagerStringLocalizerFactory InnerFactory { get; }
+    protected IServiceProvider ServiceProvider { get; }
+    protected IExternalLocalizationStore ExternalLocalizationStore { get; }
+    protected ConcurrentDictionary<string, StringLocalizerCacheItem> LocalizerCache { get; }
+    protected SemaphoreSlim LocalizerCacheSemaphore { get; } = new(1, 1);
+
+    public AbpStringLocalizerFactory(
+        ResourceManagerStringLocalizerFactory innerFactory,
+        IOptions<AbpLocalizationOptions> abpLocalizationOptions,
+        IServiceProvider serviceProvider,
+        IExternalLocalizationStore externalLocalizationStore)
+    {
+        InnerFactory = innerFactory;
+        ServiceProvider = serviceProvider;
+        ExternalLocalizationStore = externalLocalizationStore;
+        AbpLocalizationOptions = abpLocalizationOptions.Value;
+
+        LocalizerCache = new ConcurrentDictionary<string, StringLocalizerCacheItem>();
+    }
+```
+
+The factory is registered as a singleton. The `ConcurrentDictionary` cache is keyed by resource name and guarded by a `SemaphoreSlim` so that contributor initialization runs once per resource even under concurrent first hits.
+
+## Resource lookup
+
+Three entry points produce localizers. `Create(Type)` is invoked by MVC and Razor for `IStringLocalizer<TResource>`:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+public virtual IStringLocalizer Create(Type resourceType)
+{
+    return Create(resourceType, lockCache: true);
+}
+
+private IStringLocalizer Create(Type resourceType, bool lockCache)
+{
+    var resource = AbpLocalizationOptions.Resources.GetOrNull(resourceType);
+    if (resource == null)
+    {
+        return InnerFactory.Create(resourceType);
+    }
+
+    return CreateInternal(resource.ResourceName, resource, lockCache);
+}
+```
+
+If the type is not registered in `AbpLocalizationOptions.Resources`, the call is delegated to `InnerFactory` (the standard MEL resource-manager factory). This is what keeps non-ABP localized resources functional after the replacement.
+
+`CreateByResourceNameOrNull` and `CreateByResourceNameOrNullAsync` look up resources by name and consult the external store before giving up:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+private IStringLocalizer? CreateByResourceNameOrNullInternal(
+    string resourceName,
+    bool lockCache)
+{
+    var resource = AbpLocalizationOptions.Resources.GetOrDefault(resourceName);
+    if (resource == null)
+    {
+        resource = ExternalLocalizationStore.GetResourceOrNull(resourceName);
+        if (resource == null)
+        {
+            return null;
+        }
+    }
+
+    return CreateInternal(resourceName, resource, lockCache);
+}
+```
+
+The async sibling uses `GetResourceOrNullAsync` — the only difference from the sync path is the awaited store call.
+
+`CreateDefaultOrNull` falls back to whatever resource type was configured as the default:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+public IStringLocalizer? CreateDefaultOrNull()
+{
+    if (AbpLocalizationOptions.DefaultResourceType == null)
+    {
+        return null;
+    }
+
+    return Create(AbpLocalizationOptions.DefaultResourceType);
+}
+```
+
+`LocalizableString.Localize` uses this method as a last-resort lookup when the requested resource cannot be located, which is how unknown error code namespaces still produce a string instead of an exception.
+
+## Cache and contributor initialization
+
+`CreateInternal` is the cache gate. It uses a semaphore-protected double-checked lookup so that contributor initialization is single-flight per resource:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+private IStringLocalizer CreateInternal(
+    string resourceName,
+    LocalizationResourceBase resource,
+    bool lockCache)
+{
+    if (LocalizerCache.TryGetValue(resourceName, out var cacheItem))
+    {
+        return cacheItem.Localizer;
+    }
+
+    IStringLocalizer GetOrCreateLocalizer()
+    {
+        // Double check
+        if (LocalizerCache.TryGetValue(resourceName, out var cacheItem2))
+        {
+            return cacheItem2.Localizer;
+        }
+
+        return LocalizerCache.GetOrAdd(
+            resourceName,
+            _ => CreateStringLocalizerCacheItem(resource)
+        ).Localizer;
+    }
+
+    if (lockCache)
+    {
+        using (LocalizerCacheSemaphore.Lock())
+        {
+            return GetOrCreateLocalizer();
+        }
+    }
+    else
+    {
+        return GetOrCreateLocalizer();
+    }
+}
+```
+
+The `lockCache: false` overload is used when the factory recursively builds base localizers — `CreateStringLocalizerCacheItem` already holds the semaphore, so the recursive call must not try to acquire it again.
+
+`CreateStringLocalizerCacheItem` wires up global contributors, runs initialization, and recursively builds localizers for every base resource:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+private StringLocalizerCacheItem CreateStringLocalizerCacheItem(LocalizationResourceBase resource)
+{
+    foreach (var globalContributorType in AbpLocalizationOptions.GlobalContributors)
+    {
+        resource.Contributors.Add(
+            Activator
+                .CreateInstance(globalContributorType)!
+                .As<ILocalizationResourceContributor>()
+        );
+    }
+
+    var context = new LocalizationResourceInitializationContext(resource, ServiceProvider);
+
+    foreach (var contributor in resource.Contributors)
+    {
+        contributor.Initialize(context);
+    }
+
+    return new StringLocalizerCacheItem(
+        new AbpDictionaryBasedStringLocalizer(
+            resource,
+            resource
+                .BaseResourceNames
+                .Select(x => CreateByResourceNameOrNullInternal(x, lockCache: false))
+                .Where(x => x != null)
+                .ToList()!,
+            AbpLocalizationOptions
+        )
+    );
+}
+```
+
+Global contributors are added once per resource at cache-build time. `LocalizationResourceInitializationContext` carries the resource and the service provider — contributors that need DI services (for example, a database-backed contributor that needs `IRepository<…>`) resolve them through this provider.
+
+The async equivalent does the same dance using `await CreateByResourceNameOrNullInternalAsync` so that dynamic stores can resolve base resources without blocking:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+var baseLocalizers = new List<IStringLocalizer>();
+
+foreach (var baseResourceName in resource.BaseResourceNames)
+{
+    var baseLocalizer = await CreateByResourceNameOrNullInternalAsync(baseResourceName, lockCache: false);
+    if (baseLocalizer != null)
+    {
+        baseLocalizers.Add(baseLocalizer);
+    }
+}
+```
+
+The returned `StringLocalizerCacheItem` simply wraps the localizer so the cache holds a typed reference:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs"
+protected class StringLocalizerCacheItem
+{
+    public AbpDictionaryBasedStringLocalizer Localizer { get; }
+
+    public StringLocalizerCacheItem(AbpDictionaryBasedStringLocalizer localizer)
+    {
+        Localizer = localizer;
+    }
+}
+```
+
+## The dictionary-based localizer
+
+`AbpDictionaryBasedStringLocalizer` is the localizer the factory hands back for every ABP resource. Indexers route through `GetLocalizedString`, which delegates to the contributor list and then the base localizers:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs"
+public class AbpDictionaryBasedStringLocalizer : IAbpStringLocalizer
+{
+    public LocalizationResourceBase Resource { get; }
+
+    public List<IStringLocalizer> BaseLocalizers { get; }
+
+    public AbpLocalizationOptions AbpLocalizationOptions { get; }
+
+    public virtual LocalizedString this[string name] => GetLocalizedString(name);
+
+    public virtual LocalizedString this[string name, params object[] arguments] => GetLocalizedStringFormatted(name, arguments);
+```
+
+`GetLocalizedString` runs the per-resource fallback, then the base-localizer fallback, and finally returns a `ResourceNotFound` marker when nothing matched:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs"
+protected virtual LocalizedString GetLocalizedString(string name, string cultureName)
+{
+    var value = GetLocalizedStringOrNull(name, cultureName);
+
+    if (value == null)
+    {
+        foreach (var baseLocalizer in BaseLocalizers)
+        {
+            using (CultureHelper.Use(CultureInfo.GetCultureInfo(cultureName)))
+            {
+                var baseLocalizedString = baseLocalizer[name];
+                if (baseLocalizedString != null && !baseLocalizedString.ResourceNotFound)
+                {
+                    return baseLocalizedString;
+                }
+            }
+        }
+
+        return new LocalizedString(name, name, resourceNotFound: true);
+    }
+
+    return value;
+}
+```
+
+The base-localizer loop ambient-switches to the requested culture with `CultureHelper.Use`. Because base localizers are themselves `AbpDictionaryBasedStringLocalizer` instances, the same fallback runs on each.
+
+### Per-resource fallback chain
+
+`GetLocalizedStringOrNull` is where the in-resource fallback lives:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs"
+protected virtual LocalizedString? GetLocalizedStringOrNull(
+    string name,
+    string cultureName,
+    bool tryDefaults = true)
+{
+    //Try to get from original dictionary (with country code)
+    var strOriginal = Resource.Contributors.GetOrNull(cultureName, name);
+    if (strOriginal != null)
+    {
+        return strOriginal;
+    }
+
+    if (!tryDefaults)
+    {
+        return null;
+    }
+
+    if (AbpLocalizationOptions.TryToGetFromBaseCulture)
+    {
+        //Try to get from same language dictionary (without country code)
+        if (cultureName.Contains("-")) //Example: "tr-TR" (length=5)
+        {
+            var strLang = Resource.Contributors.GetOrNull(CultureHelper.GetBaseCultureName(cultureName), name);
+            if (strLang != null)
+            {
+                return strLang;
+            }
+        }
+    }
+
+    if (AbpLocalizationOptions.TryToGetFromDefaultCulture)
+    {
+        //Try to get from default language
+        if (!Resource.DefaultCultureName.IsNullOrEmpty())
+        {
+            var strDefault = Resource.Contributors.GetOrNull(Resource.DefaultCultureName!, name);
+            if (strDefault != null)
+            {
+                return strDefault;
+            }
+        }
+    }
+
+    //Not found
+    return null;
+}
+```
+
+In sequence: exact culture (for example `tr-TR`), the base culture (`tr` from `CultureHelper.GetBaseCultureName`), and finally the resource's `DefaultCultureName`. Both `TryToGetFromBaseCulture` and `TryToGetFromDefaultCulture` default to `true` in `AbpLocalizationOptions`, but they can be turned off for unit tests or strict-locale applications.
+
+### Formatting
+
+`this[name, params object[] args]` formats with `string.Format` after resolution:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs"
+protected virtual LocalizedString GetLocalizedStringFormatted(string name, string cultureName, params object[] arguments)
+{
+    var localizedString = GetLocalizedString(name, cultureName);
+    return new LocalizedString(name, string.Format(localizedString.Value, arguments), localizedString.ResourceNotFound, localizedString.SearchedLocation);
+}
+```
+
+The `ResourceNotFound` flag is preserved so MVC can render the raw key when a translation is missing.
+
+## `IAbpStringLocalizer` extensions
+
+ABP's localizer interface widens `IStringLocalizer` with awareness of base localizers and dynamic contributors:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/IAbpStringLocalizer.cs"
+public interface IAbpStringLocalizer : IStringLocalizer
+{
+    IEnumerable<LocalizedString> GetAllStrings(
+        bool includeParentCultures,
+        bool includeBaseLocalizers,
+        bool includeDynamicContributors
+    );
+
+    Task<IEnumerable<LocalizedString>> GetAllStringsAsync(
+        bool includeParentCultures
+    );
+    
+    Task<IEnumerable<LocalizedString>> GetAllStringsAsync(
+        bool includeParentCultures,
+        bool includeBaseLocalizers,
+        bool includeDynamicContributors
+    );
+
+    Task<IEnumerable<string>> GetSupportedCulturesAsync();
+}
+```
+
+`includeDynamicContributors: false` is the lever used by the [application configuration endpoint](/web/overview) when shipping static strings to JavaScript — dynamic contributors (database-backed, tenant-scoped) are skipped because they should be resolved per request, not baked into the static payload.
+
+`GetSupportedCulturesAsync` simply delegates to the contributor list:
+
+```csharp title="framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpDictionaryBasedStringLocalizer.cs"
+public Task<IEnumerable<string>> GetSupportedCulturesAsync()
+{
+    return Resource.Contributors.GetSupportedCulturesAsync();
+}
+```
+
+## Resolution sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as IStringLocalizer&lt;TResource&gt;
+    participant Factory as AbpStringLocalizerFactory
+    participant Cache as LocalizerCache
+    participant External as IExternalLocalizationStore
+    participant Localizer as AbpDictionaryBasedStringLocalizer
+    participant Contributors as LocalizationResourceContributorList
+
+    Caller->>Factory: Create(TResource)
+    Factory->>Factory: Resources.GetOrNull(type)
+    alt Type registered
+        Factory->>Cache: GetOrAdd(resourceName)
+        Cache-->>Factory: cached or new item
+    else Unknown type
+        Factory->>External: GetResourceOrNull(name)
+        External-->>Factory: NonTypedLocalizationResource or null
+    end
+    Factory-->>Caller: AbpDictionaryBasedStringLocalizer
+    Caller->>Localizer: this[key]
+    Localizer->>Contributors: GetOrNull(culture, key)
+    Contributors-->>Localizer: LocalizedString?
+    Localizer->>Contributors: GetOrNull(baseCulture, key)
+    Localizer->>Contributors: GetOrNull(DefaultCultureName, key)
+    Localizer->>Localizer: BaseLocalizers[i][key]
+    Localizer-->>Caller: LocalizedString
+```
+
+## Practical notes
+
+<Tip>
+`Create(string baseName, string location)` is the only method ABP forwards directly to the inner factory. Pure ASP.NET Core resources continue to function — but they do not benefit from the contributor model, the external store, or any of the ABP-specific fallbacks.
+</Tip>
+
+<Warning>
+Configurations that change `AbpLocalizationOptions.GlobalContributors` after the first `Create` call do not retroactively apply to cached localizers. Register global contributors during `ConfigureServices`.
+</Warning>
+
+## See also
+
+- [Localization resources](/localization/localization-resources) — naming, contributors, inheritance.
+- [External localization store](/localization/external-localization-store) — backs `CreateByResourceNameOrNullAsync`.
+- [Overview](/localization/overview) — module bootstrap and JSON dictionary builder.
+- [Web layer overview](/web/overview) — how MVC consumes `IStringLocalizer`.

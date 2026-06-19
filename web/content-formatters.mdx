@@ -1,0 +1,292 @@
+---
+title: "ABP Content Formatters: JSON Options and RemoteStreamContent"
+sidebarTitle: "Content formatters"
+description: "How AbpAspNetCoreMvcModule configures System.Text.Json, Newtonsoft.Json and stream binding for IRemoteStreamContent uploads and downloads."
+---
+
+ABP injects a handful of MVC formatters and model binders so JSON
+serialization is consistent with the rest of the framework and so binary
+uploads/downloads use a single abstraction (`IRemoteStreamContent`)
+instead of `IFormFile`/`Stream`/`FileResult` permutations. The wiring
+happens inside `AbpAspNetCoreMvcModule` and uses the helper classes under
+`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/`
+and `…/Json/`.
+
+## File inventory
+
+| File | Role |
+| --- | --- |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Json/MvcCoreBuilderExtensions.cs` | `AddAbpJson()` extension that configures System.Text.Json on `JsonOptions` |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/RemoteStreamContentOutputFormatter.cs` | Writes any `IRemoteStreamContent` to the response body |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/AbpRemoteStreamContentModelBinder.cs` | Reads `multipart/form-data` files into `IRemoteStreamContent` |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/AbpRemoteStreamContentModelBinderProvider.cs` | Provider that picks the binder above |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpMvcOptionsExtensions.cs` | Internal helper that registers the formatter, binders and metadata providers |
+| `Volo.Abp.AspNetCore.Mvc.NewtonsoftJson/Volo/Abp/AspNetCore/Mvc/NewtonsoftJson/AbpAspNetCoreMvcNewtonsoftModule.cs` | Optional Newtonsoft.Json module |
+| `Volo.Abp.Core/Volo/Abp/Content/IRemoteStreamContent.cs`, `RemoteStreamContent.cs` | Stream abstraction shared with dynamic HTTP clients |
+
+## System.Text.Json wiring
+
+`AbpAspNetCoreMvcModule` calls `mvcCoreBuilder.AddAbpJson()` so MVC inherits
+the framework-wide JSON conventions:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Json/MvcCoreBuilderExtensions.cs"
+public static IMvcCoreBuilder AddAbpJson(this IMvcCoreBuilder builder)
+{
+    builder.Services.AddOptions<JsonOptions>()
+        .Configure<IServiceProvider>((options, rootServiceProvider) =>
+        {
+            options.JsonSerializerOptions.ReadCommentHandling = JsonCommentHandling.Skip;
+            options.JsonSerializerOptions.AllowTrailingCommas = true;
+
+            options.JsonSerializerOptions.Converters.Add(new AbpStringToEnumFactory());
+            options.JsonSerializerOptions.Converters.Add(new AbpStringToBooleanConverter());
+            options.JsonSerializerOptions.Converters.Add(new AbpStringToGuidConverter());
+            options.JsonSerializerOptions.Converters.Add(new AbpNullableStringToGuidConverter());
+            options.JsonSerializerOptions.Converters.Add(new ObjectToInferredTypesConverter());
+
+            options.JsonSerializerOptions.TypeInfoResolver = new AbpDefaultJsonTypeInfoResolver(rootServiceProvider
+                .GetRequiredService<IOptions<AbpSystemTextJsonSerializerModifiersOptions>>());
+        });
+
+    return builder;
+}
+```
+
+The converters in `Volo.Abp.Json.SystemTextJson` are responsible for:
+
+- Permissive enum parsing (string ↔ enum).
+- Coercing `"true"` / `"false"` strings into booleans on inbound JSON.
+- Parsing GUIDs (nullable and non-nullable) from strings.
+- Inferring concrete types for `object` values.
+
+The `TypeInfoResolver` lets modules layer in additional serialization
+modifiers via `AbpSystemTextJsonSerializerModifiersOptions` &mdash; the
+extra-property dictionary used for object extending hooks in here.
+
+## Optional Newtonsoft.Json module
+
+For modules that need Newtonsoft features (rich `JObject`, polymorphic
+converters, the legacy contract resolver), ABP ships a separate package:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.NewtonsoftJson/Volo/Abp/AspNetCore/Mvc/NewtonsoftJson/AbpAspNetCoreMvcNewtonsoftModule.cs"
+[DependsOn(typeof(AbpJsonNewtonsoftModule), typeof(AbpAspNetCoreMvcModule))]
+public class AbpAspNetCoreMvcNewtonsoftModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMvcCore().AddNewtonsoftJson();
+
+        context.Services.AddOptions<MvcNewtonsoftJsonOptions>()
+            .Configure<IServiceProvider>((options, rootServiceProvider) =>
+            {
+                options.SerializerSettings.ContractResolver = new AbpCamelCasePropertyNamesContractResolver(
+                    rootServiceProvider.GetRequiredService<AbpDateTimeConverter>());
+            });
+    }
+}
+```
+
+The custom contract resolver keeps camelCase property names while letting
+ABP's `AbpDateTimeConverter` handle clock-aware date conversions.
+
+## RemoteStreamContent: one abstraction for files
+
+`IRemoteStreamContent` lives in `Volo.Abp.Core` and is the type ABP uses
+both server-side and inside dynamic HTTP clients to represent binary
+payloads. Auto-API controllers, the output formatter and the model binder
+all special-case it.
+
+### Output formatter
+
+`RemoteStreamContentOutputFormatter` is inserted at position 0 of
+`MvcOptions.OutputFormatters` by `AbpMvcOptionsExtensions.AddAbp`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/RemoteStreamContentOutputFormatter.cs"
+public class RemoteStreamContentOutputFormatter : OutputFormatter
+{
+    public RemoteStreamContentOutputFormatter()
+    {
+        SupportedMediaTypes.Add(MediaTypeHeaderValue.Parse("*/*"));
+    }
+
+    protected override bool CanWriteType(Type? type)
+    {
+        return typeof(IRemoteStreamContent).IsAssignableFrom(type);
+    }
+
+    public async override Task WriteResponseBodyAsync(OutputFormatterWriteContext context)
+    {
+        var remoteStream = (IRemoteStreamContent?)context.Object;
+
+        if (remoteStream != null)
+        {
+            context.HttpContext.Response.ContentType   = remoteStream.ContentType;
+            context.HttpContext.Response.ContentLength = remoteStream.ContentLength;
+
+            if (!remoteStream.FileName.IsNullOrWhiteSpace() &&
+                !context.HttpContext.Response.Headers.ContainsKey(HeaderNames.ContentDisposition))
+            {
+                var contentDisposition = new ContentDispositionHeaderValue("attachment");
+                contentDisposition.SetHttpFileName(remoteStream.FileName);
+                context.HttpContext.Response.Headers[HeaderNames.ContentDisposition] = contentDisposition.ToString();
+            }
+
+            using (remoteStream)
+            {
+                await remoteStream.GetStream().CopyToAsync(context.HttpContext.Response.Body);
+            }
+        }
+    }
+}
+```
+
+Returning an `IRemoteStreamContent` from any action streams the payload
+directly to the response, sets `Content-Type` / `Content-Length`, and adds
+an `attachment; filename=…` disposition header when a file name is
+available. The formatter accepts `*/*` so any content type negotiates
+through it &mdash; the actual MIME on the wire is the one carried by the
+content itself.
+
+### Model binder for uploads
+
+The companion binder reads multipart form data and any `IFormFile`s into
+new `RemoteStreamContent` instances:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/AbpRemoteStreamContentModelBinder.cs"
+private async Task GetFormFilesAsync(
+    string modelName,
+    ModelBindingContext bindingContext,
+    ICollection<TRemoteStreamContent> postedFiles)
+{
+    var request = bindingContext.HttpContext.Request;
+    if (request.HasFormContentType)
+    {
+        var form = await request.ReadFormAsync();
+
+        foreach (var file in form.Files)
+        {
+            if (file.Length == 0 && string.IsNullOrEmpty(file.FileName)) continue;
+
+            if (file.Name.Equals(modelName, StringComparison.OrdinalIgnoreCase))
+            {
+                postedFiles.Add(new RemoteStreamContent(
+                    file.OpenReadStream(), file.FileName, file.ContentType, file.Length)
+                    .As<TRemoteStreamContent>());
+            }
+        }
+    }
+    else if (bindingContext.IsTopLevelObject)
+    {
+        postedFiles.Add(new RemoteStreamContent(
+            request.Body, null, request.ContentType, request.ContentLength)
+            .As<TRemoteStreamContent>());
+    }
+}
+```
+
+The provider selects this binder when the model type is
+`RemoteStreamContent`, `IRemoteStreamContent`, or an enumerable of either:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ContentFormatters/AbpRemoteStreamContentModelBinderProvider.cs"
+public IModelBinder? GetBinder(ModelBinderProviderContext context)
+{
+    if (context.Metadata.ModelType == typeof(RemoteStreamContent) ||
+        typeof(IEnumerable<RemoteStreamContent>).IsAssignableFrom(context.Metadata.ModelType))
+    {
+        return new AbpRemoteStreamContentModelBinder<RemoteStreamContent>();
+    }
+
+    if (context.Metadata.ModelType == typeof(IRemoteStreamContent) ||
+        typeof(IEnumerable<IRemoteStreamContent>).IsAssignableFrom(context.Metadata.ModelType))
+    {
+        return new AbpRemoteStreamContentModelBinder<IRemoteStreamContent>();
+    }
+
+    return null;
+}
+```
+
+### MVC options wiring
+
+The complete wiring is in `AbpMvcOptionsExtensions.AddAbp` (called from the
+MVC module). It registers the formatter, the binders, and the metadata
+providers that mark `IRemoteStreamContent` parameters as `BindingSource.FormFile`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpMvcOptionsExtensions.cs"
+private static void AddFormatters(MvcOptions options)
+{
+    options.OutputFormatters.Insert(0, new RemoteStreamContentOutputFormatter());
+}
+
+private static void AddModelBinders(MvcOptions options)
+{
+    options.ModelBinderProviders.Insert(0, new AbpDateTimeModelBinderProvider());
+    options.ModelBinderProviders.Insert(1, new AbpExtraPropertiesDictionaryModelBinderProvider());
+    options.ModelBinderProviders.Insert(2, new AbpRemoteStreamContentModelBinderProvider());
+}
+
+private static void AddMetadataProviders(MvcOptions options, IServiceCollection services)
+{
+    options.ModelMetadataDetailsProviders.Add(new AbpDataAnnotationAutoLocalizationMetadataDetailsProvider(services));
+
+    options.ModelMetadataDetailsProviders.Add(new BindingSourceMetadataProvider(typeof(IRemoteStreamContent), BindingSource.FormFile));
+    options.ModelMetadataDetailsProviders.Add(new BindingSourceMetadataProvider(typeof(IEnumerable<IRemoteStreamContent>), BindingSource.FormFile));
+    options.ModelMetadataDetailsProviders.Add(new BindingSourceMetadataProvider(typeof(RemoteStreamContent), BindingSource.FormFile));
+    options.ModelMetadataDetailsProviders.Add(new BindingSourceMetadataProvider(typeof(IEnumerable<RemoteStreamContent>), BindingSource.FormFile));
+    options.ModelMetadataDetailsProviders.Add(new SuppressChildValidationMetadataProvider(typeof(IRemoteStreamContent)));
+    options.ModelMetadataDetailsProviders.Add(new SuppressChildValidationMetadataProvider(typeof(RemoteStreamContent)));
+}
+```
+
+The `SuppressChildValidationMetadataProvider` entries stop ASP.NET Core
+from trying to validate stream payloads as if they were complex DTOs.
+
+`AbpServiceConvention.CanUseFormBodyBinding` consults
+`AbpConventionalControllerOptions.FormBodyBindingIgnoredTypes` to keep
+`IFormFile` / `IRemoteStreamContent` parameters out of the JSON body when
+auto-API rewrites a service signature &mdash; see
+[Auto API controllers](/web/auto-api-controllers#form-body-bound-types-and-ignored-suffixes).
+
+## Example: streaming a file
+
+A typical download endpoint just returns the abstraction:
+
+```csharp
+public class ReportAppService : ApplicationService, IReportAppService
+{
+    public async Task<IRemoteStreamContent> GetMonthlyReportAsync(int year, int month)
+    {
+        var bytes = await _reportGenerator.RenderAsync(year, month);
+        var stream = new MemoryStream(bytes);
+
+        return new RemoteStreamContent(
+            stream,
+            fileName: $"report-{year}-{month:D2}.pdf",
+            contentType: "application/pdf",
+            contentLength: stream.Length);
+    }
+}
+```
+
+The auto-generated controller maps it to `GET /api/app/report/monthly-report`,
+the output formatter streams the PDF, and dynamic HTTP clients see the same
+return type without extra plumbing.
+
+For uploads:
+
+```csharp
+public Task UploadAsync(IRemoteStreamContent file) { /* … */ }
+```
+
+The binder ingests `multipart/form-data` posts, the metadata provider tags
+the parameter as `FormFile`, and the convention skips the
+`FormBodyBindingIgnoredTypes` body re-binding.
+
+## Related reading
+
+- [API conventions](/web/api-conventions) &mdash; how `FormBodyBindingIgnoredTypes`
+  interacts with `CanUseFormBodyBinding`.
+- [Auto API controllers](/web/auto-api-controllers) &mdash; reason these
+  formatters need to special-case generated routes.
+- [API explorer and models](/web/api-explorer-and-models) &mdash; the
+  generated Swagger/proxy metadata reflects the formatter choices.

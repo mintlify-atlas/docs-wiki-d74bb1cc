@@ -1,0 +1,280 @@
+---
+title: "ABP API Versioning: AddAbpApiVersioning and Conventions"
+sidebarTitle: "API versioning"
+description: "How AbpApiVersioningAbstractionsModule, HttpContextRequestedApiVersion and AddAbpApiVersioning integrate Asp.Versioning with ABP conventional controllers."
+---
+
+ABP integrates with the `Asp.Versioning` (formerly
+`Microsoft.AspNetCore.Mvc.Versioning`) library so conventional controllers
+can opt into URL/header/query-string versioning without manually decorating
+every type. The abstraction sits in a tiny module
+(`AbpApiVersioningAbstractionsModule`) which is depended on by
+`AbpAspNetCoreMvcModule`, and the actual MVC wiring is exposed through an
+`AddAbpApiVersioning` extension method.
+
+## File inventory
+
+| File | Role |
+| --- | --- |
+| `Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/IRequestedApiVersion.cs` | Abstraction that exposes the current API version |
+| `Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/NullRequestedApiVersion.cs` | No-op default registered by the abstractions module |
+| `Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/AbpApiVersioningAbstractionsModule.cs` | Registers the null implementation as singleton |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Versioning/HttpContextRequestedApiVersion.cs` | HTTP-aware implementation backed by `HttpContext.GetRequestedApiVersion()` |
+| `Volo.Abp.AspNetCore.Mvc/Microsoft/Extensions/DependencyInjection/AbpApiVersioningExtensions.cs` | `AddAbpApiVersioning` + `ApiVersioningOptions.ConfigureAbp(...)` |
+| `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalControllerSetting.cs` | Source of per-assembly `ApiVersions` / `ApiVersionConfigurer` |
+
+## Abstractions module
+
+`AbpApiVersioningAbstractionsModule` is referenced as a `[DependsOn]` of
+`AbpAspNetCoreMvcModule`, so every web app has the abstraction available
+even when versioning is not actively configured:
+
+```csharp title="framework/src/Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/AbpApiVersioningAbstractionsModule.cs"
+public class AbpApiVersioningAbstractionsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton<IRequestedApiVersion>(NullRequestedApiVersion.Instance);
+    }
+}
+```
+
+The interface itself is a single property:
+
+```csharp title="framework/src/Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/IRequestedApiVersion.cs"
+public interface IRequestedApiVersion
+{
+    string? Current { get; }
+}
+```
+
+`NullRequestedApiVersion.Current` is `null`, which is what unversioned
+hosts return.
+
+## Activating real versioning
+
+Calling `AddAbpApiVersioning` replaces the null implementation with the
+HTTP-aware one, registers ABP's API-controller specification (so the
+versioning library treats conventional controllers as proper API
+controllers), and configures the underlying library:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Microsoft/Extensions/DependencyInjection/AbpApiVersioningExtensions.cs"
+public static IServiceCollection AddAbpApiVersioning(
+    this IServiceCollection services,
+    Action<ApiVersioningOptions> setupAction)
+{
+    services.AddTransient<IRequestedApiVersion, HttpContextRequestedApiVersion>();
+    services.AddTransient<IApiControllerSpecification, AbpConventionalApiControllerSpecification>();
+
+    services.AddApiVersioning(setupAction);
+
+    return services;
+}
+```
+
+Typical wiring inside an `AbpModule`:
+
+```csharp title="MyHttpApiHostModule.cs"
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var mvcOptions = context.Services
+        .ExecutePreConfiguredActions<AbpAspNetCoreMvcOptions>();
+
+    context.Services.AddAbpApiVersioning(options =>
+    {
+        options.ReportApiVersions = true;
+        options.AssumeDefaultVersionWhenUnspecified = true;
+        options.DefaultApiVersion = new ApiVersion(1, 0);
+        options.ApiVersionReader = ApiVersionReader.Combine(
+            new HeaderApiVersionReader("api-version"),
+            new QueryStringApiVersionReader());
+
+        options.ConfigureAbp(mvcOptions);
+    });
+}
+```
+
+`ConfigureAbp` walks every `ConventionalControllerSetting` and merges its
+versioning hints into `ApiVersioningOptions.Conventions`:
+
+```csharp title="AbpApiVersioningExtensions.ConfigureAbp"
+public static void ConfigureAbp(this ApiVersioningOptions options, AbpAspNetCoreMvcOptions mvcOptions)
+{
+    foreach (var setting in mvcOptions.ConventionalControllers.ConventionalControllerSettings)
+    {
+        if (setting.ApiVersionConfigurer == null)
+        {
+            ConfigureApiVersionsByConvention(options, setting);
+        }
+        else
+        {
+            setting.ApiVersionConfigurer.Invoke(options);
+        }
+    }
+}
+
+private static void ConfigureApiVersionsByConvention(ApiVersioningOptions options, ConventionalControllerSetting setting)
+{
+    foreach (var controllerType in setting.ControllerTypes)
+    {
+        var controllerBuilder = options.Conventions.Controller(controllerType);
+
+        if (setting.ApiVersions.Any())
+        {
+            foreach (var apiVersion in setting.ApiVersions)
+            {
+                controllerBuilder.HasApiVersion(apiVersion);
+            }
+        }
+        else
+        {
+            if (!controllerType.IsDefined(typeof(ApiVersionAttribute), true))
+            {
+                controllerBuilder.IsApiVersionNeutral();
+            }
+        }
+    }
+}
+```
+
+The behaviour can be summarized as:
+
+1. If the assembly setting declares versions
+   (`ConventionalControllerSetting.ApiVersions`) → call `HasApiVersion` for
+   each one.
+2. If the controller is decorated with `[ApiVersion(...)]` → respect the
+   attribute (no further work).
+3. Otherwise → mark the controller as version-neutral so the versioning
+   library does not refuse to route it.
+
+If you supply `ApiVersionConfigurer` on the setting, that delegate runs
+instead and you take full ownership of the configuration.
+
+## Per-assembly versioning
+
+The relevant properties on `ConventionalControllerSetting` are
+`ApiVersions` and `ApiVersionConfigurer`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalControllerSetting.cs"
+public List<ApiVersion> ApiVersions { get; }
+
+public Action<ApiVersioningOptions>? ApiVersionConfigurer { get; set; }
+```
+
+A versioned assembly registration therefore looks like:
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers.Create(
+        typeof(BookStoreApplicationModule).Assembly,
+        s =>
+        {
+            s.RootPath = "shop";
+            s.ApiVersions.Add(new ApiVersion(1, 0));
+            s.ApiVersions.Add(new ApiVersion(2, 0));
+        });
+});
+```
+
+When `AddAbpApiVersioning(..., options.ConfigureAbp(...))` runs, both
+versions are wired onto every controller produced from the assembly. Any
+controller that needs a smaller set can fall back to `[ApiVersion]` /
+`[MapToApiVersion]` attributes &mdash; `AspNetCoreApiDescriptionModelProvider`
+already collects them per action:
+
+```csharp title="AspNetCoreApiDescriptionModelProvider.GetSupportedVersions"
+var mapToAttributes = method.GetCustomAttributes<MapToApiVersionAttribute>().ToArray();
+if (mapToAttributes.Any())
+{
+    supportedVersions.AddRange(mapToAttributes.SelectMany(a => a.Versions));
+}
+else
+{
+    supportedVersions.AddRange(controllerType.GetCustomAttributes<ApiVersionAttribute>().SelectMany(a => a.Versions));
+    setting?.ApiVersions.ForEach(supportedVersions.Add);
+}
+```
+
+## Reading the current version
+
+Inside a controller or application service, inject `IRequestedApiVersion`:
+
+```csharp
+public class BookAppService : ApplicationService, IBookAppService
+{
+    private readonly IRequestedApiVersion _requestedApiVersion;
+
+    public BookAppService(IRequestedApiVersion requestedApiVersion)
+    {
+        _requestedApiVersion = requestedApiVersion;
+    }
+
+    public Task<List<BookDto>> GetListAsync()
+    {
+        var version = _requestedApiVersion.Current; // "1.0", "2.0", or null
+        // ... branch behaviour ...
+    }
+}
+```
+
+The HTTP-aware implementation simply forwards to
+`HttpContext.GetRequestedApiVersion()`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Versioning/HttpContextRequestedApiVersion.cs"
+public class HttpContextRequestedApiVersion : IRequestedApiVersion
+{
+    public string? Current => _httpContextAccessor.HttpContext?.GetRequestedApiVersion()?.ToString();
+
+    private readonly IHttpContextAccessor _httpContextAccessor;
+
+    public HttpContextRequestedApiVersion(IHttpContextAccessor httpContextAccessor)
+    {
+        _httpContextAccessor = httpContextAccessor;
+    }
+}
+```
+
+## End-to-end flow
+
+```mermaid
+graph TD
+    A[Request /api/shop/book?api-version=2.0] --> B[Asp.Versioning resolver]
+    B --> C[HttpContext.GetRequestedApiVersion]
+    C --> D[HttpContextRequestedApiVersion]
+    D --> E[IRequestedApiVersion.Current = "2.0"]
+    E --> F[Application service branches on version]
+    B --> G[ConventionalControllerSetting.ApiVersions]
+    G --> H[ApiVersioningOptions.Conventions.Controller(...).HasApiVersion]
+```
+
+## API explorer integration
+
+`AspNetCoreApiDescriptionModelProvider` records the selected version on
+every `ActionApiDescriptionModel`:
+
+```csharp title="AspNetCoreApiDescriptionModelProvider.AddApiDescriptionToModel (excerpt)"
+var controllerModel = moduleModel.GetOrAddController(
+    _options.ControllerNameGenerator(controllerType, setting),
+    FindGroupName(controllerType) ?? apiDescription.GroupName,
+    apiDescription.IsRemoteService(),
+    apiDescription.IsIntegrationService(),
+    apiDescription.GetProperty<ApiVersion>()?.ToString(),
+    controllerType,
+    _modelOptions.IgnoredInterfaces
+);
+```
+
+This is what populates the `apiVersion` field in
+`ApplicationApiDescriptionModel` so dynamic HTTP clients and proxy
+generators emit version-aware code &mdash; see
+[API explorer and models](/web/api-explorer-and-models).
+
+## Related reading
+
+- [API conventions](/web/api-conventions) &mdash; how routes are built and
+  why versioning hooks in cleanly.
+- [Auto API controllers](/web/auto-api-controllers) &mdash; `ApiVersions`
+  appears on every `ConventionalControllerSetting`.
+- [API explorer and models](/web/api-explorer-and-models) &mdash; the
+  consumer of `apiDescription.GetProperty<ApiVersion>()`.

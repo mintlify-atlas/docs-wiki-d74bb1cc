@@ -1,0 +1,471 @@
+---
+title: "Volo.Abp.AspNetCore.Components & Components.Web: Reference"
+sidebarTitle: "Components core"
+description: "AbpComponentBase, UI service contracts, cookie service, server URL provider, claims cache and exception informer in ABP's Blazor core."
+---
+
+`Volo.Abp.AspNetCore.Components` and `Volo.Abp.AspNetCore.Components.Web` are
+the two host-agnostic packages that all ABP Blazor work builds on. The first
+ships the contracts and the abstract `AbpComponentBase` class; the second adds
+browser-facing services — cookies, an HTTP message handler, the claims cache,
+the server URL provider — that are shared by Blazor Server, Blazor
+WebAssembly, and MAUI Blazor Hybrid hosts. This page documents the module
+classes, conventional registrar, replaced services, and the exposed contracts.
+
+## Modules at a glance
+
+| Module                                | DependsOn                                                                                                | Purpose                                                                              |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `AbpAspNetCoreComponentsModule`       | `AbpObjectMappingModule`, `AbpSecurityModule`, `AbpTimingModule`, `AbpMultiTenancyAbstractionsModule`     | Adds `AbpWebAssemblyConventionalRegistrar`; excludes `ComponentBase` from dynamic proxy. |
+| `AbpAspNetCoreComponentsWebModule`    | `AbpUiModule`, `AbpAspNetCoreComponentsModule`                                                           | Replaces `IComponentActivator` with `ServiceProviderComponentActivator`.             |
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpAspNetCoreComponentsModule.cs"
+[DependsOn(
+    typeof(AbpObjectMappingModule),
+    typeof(AbpSecurityModule),
+    typeof(AbpTimingModule),
+    typeof(AbpMultiTenancyAbstractionsModule)
+    )]
+public class AbpAspNetCoreComponentsModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        DynamicProxyIgnoreTypes.Add<ComponentBase>();
+        context.Services.AddConventionalRegistrar(new AbpWebAssemblyConventionalRegistrar());
+    }
+}
+```
+
+Two important effects of `PreConfigureServices`:
+
+1. `DynamicProxyIgnoreTypes.Add<ComponentBase>()` keeps Castle's dynamic proxy
+   pipeline away from Blazor components — they must not be wrapped because
+   Blazor compares the runtime type for diffing.
+2. Adding `AbpWebAssemblyConventionalRegistrar` ensures every component the
+   conventional registrar discovers in your module's assembly is registered as
+   `Transient` so it can be activated through DI per render pass.
+
+The `.Web` module's only job is to swap Blazor's default activator for the ABP
+one:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpAspNetCoreComponentsWebModule.cs"
+[DependsOn(
+    typeof(AbpUiModule),
+    typeof(AbpAspNetCoreComponentsModule)
+    )]
+public class AbpAspNetCoreComponentsWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(
+            ServiceDescriptor.Transient<IComponentActivator,
+                                        ServiceProviderComponentActivator>());
+    }
+}
+```
+
+## `AbpAspNetCoreApplicationCreationOptions`
+
+When you call `services.AddApplication<TStartupModule>(...)` inside a Blazor
+host, the closure receives an `AbpApplicationCreationOptions` — ABP's per-host
+extension types wrap that object so module authors can reach the underlying
+host builder. The base wrapper for plain Blazor scenarios is:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpAspNetCoreApplicationCreationOptions.cs"
+public class AbpAspNetCoreApplicationCreationOptions
+{
+    public AbpApplicationCreationOptions ApplicationCreationOptions { get; }
+
+    public AbpAspNetCoreApplicationCreationOptions(
+        AbpApplicationCreationOptions applicationCreationOptions)
+    {
+        ApplicationCreationOptions = applicationCreationOptions;
+    }
+}
+```
+
+The WebAssembly host introduces `AbpWebAssemblyApplicationCreationOptions`
+which additionally exposes `WebAssemblyHostBuilder HostBuilder` — see the
+[WebAssembly host page](/blazor/components-webassembly).
+
+## `AbpComponentBase` — base class for every page and component
+
+`AbpComponentBase` derives from `OwningComponentBase`, which gives each
+component a private DI scope that is disposed when the component is. On top of
+that base, ABP exposes a curated set of lazily-resolved services so screens can
+write `Logger.LogInformation(...)` or `await Message.Confirm(...)` without
+ceremony.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpComponentBase.cs"
+public abstract class AbpComponentBase : OwningComponentBase
+{
+    protected IStringLocalizerFactory StringLocalizerFactory => LazyGetRequiredService(ref _stringLocalizerFactory)!;
+    protected IStringLocalizer L { get { /* lazy create from LocalizationResource */ } }
+    protected Type? LocalizationResource { get; set; } = typeof(DefaultResource);
+
+    protected ILogger Logger => _lazyLogger.Value;
+    protected ILoggerFactory LoggerFactory => LazyGetRequiredService(ref _loggerFactory)!;
+    protected IAuthorizationService AuthorizationService => LazyGetRequiredService(ref _authorizationService)!;
+    protected ICurrentUser CurrentUser => LazyGetRequiredService(ref _currentUser)!;
+    protected ICurrentTenant CurrentTenant => LazyGetRequiredService(ref _currentTenant)!;
+
+    protected IUiMessageService Message => LazyGetNonScopedRequiredService(ref _message)!;
+    protected IUiNotificationService Notify => LazyGetNonScopedRequiredService(ref _notify)!;
+    protected IUserExceptionInformer UserExceptionInformer => LazyGetNonScopedRequiredService(ref _userExceptionInformer)!;
+    protected IAlertManager AlertManager => LazyGetNonScopedRequiredService(ref _alertManager)!;
+    protected IClock Clock => LazyGetNonScopedRequiredService(ref _clock)!;
+    protected AlertList Alerts => AlertManager.Alerts;
+
+    protected IObjectMapper ObjectMapper { get { /* honors ObjectMapperContext if set */ } }
+    protected Type? ObjectMapperContext { get; set; }
+
+    [Inject]
+    protected IServiceProvider NonScopedServices { get; set; } = default!;
+}
+```
+
+The class distinguishes two resolution paths:
+
+| Helper                                  | Source                                                      | When to use                                                                            |
+| --------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `LazyGetRequiredService<T>`             | `ScopedServices` (the component's owned scope)              | Application-layer services that legitimately live in the component scope (logger, current user, authz). |
+| `LazyGetNonScopedRequiredService<T>`    | `NonScopedServices` (the host root, injected with `[Inject]`)| Cross-component singletons exposed as scoped: message dispatcher, alert manager, clock. |
+
+Using a non-scoped resolver for the UI message/notification services is what
+allows a single Blazorise `UiMessageAlert` mounted in the layout to receive
+`MessageReceived` events triggered from any component on the page.
+
+### Error handling
+
+`HandleErrorAsync` is the supported override point: it logs the exception, then
+asks the active `IUserExceptionInformer` to render it (a snackbar via Blazorise
+by default) and forces a re-render.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpComponentBase.cs"
+protected virtual async Task HandleErrorAsync(Exception exception)
+{
+    if (IsDisposed)
+    {
+        return;
+    }
+
+    Logger.LogException(exception);
+    await InvokeAsync(async () =>
+    {
+        await UserExceptionInformer.InformAsync(new UserExceptionInformerContext(exception));
+        StateHasChanged();
+    });
+}
+```
+
+`UserExceptionInformerContext` is defined alongside the contract in the core
+package.
+
+### Localization defaults
+
+`AbpComponentBase` sets `LocalizationResource = typeof(DefaultResource)` so any
+page works out of the box once the module configures `AbpLocalizationOptions`.
+Override it per page to switch resources:
+
+```csharp
+protected override void OnInitialized()
+{
+    LocalizationResource = typeof(BookStoreResource);
+    base.OnInitialized();
+}
+```
+
+If no resource is configured the property throws a clear exception telling the
+developer to set `LocalizationResource` or
+`AbpLocalizationOptions.DefaultResourceType`.
+
+## UI service contracts
+
+All four contracts live in the core package and are implemented by hosts and UI
+toolkits.
+
+### `IUiMessageService`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/Messages/IUiMessageService.cs"
+public interface IUiMessageService
+{
+    Task Info(string message, string? title = null, Action<UiMessageOptions>? options = null);
+    Task Success(string message, string? title = null, Action<UiMessageOptions>? options = null);
+    Task Warn(string message, string? title = null, Action<UiMessageOptions>? options = null);
+    Task Error(string message, string? title = null, Action<UiMessageOptions>? options = null);
+    Task<bool> Confirm(string message, string? title = null, Action<UiMessageOptions>? options = null);
+}
+```
+
+`SimpleUiMessageService` in the `.Web` package is a no-op fallback used when
+no UI toolkit (Blazorise, LeptonX) is registered. `BlazoriseUiMessageService`
+replaces it; see [Blazorise UI](/blazor/blazorise-ui).
+
+### `IUiNotificationService`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/Notifications/IUiNotificationService.cs"
+public interface IUiNotificationService
+{
+    Task Info(string message, string? title = null, Action<UiNotificationOptions>? options = null);
+    Task Success(string message, string? title = null, Action<UiNotificationOptions>? options = null);
+    Task Warn(string message, string? title = null, Action<UiNotificationOptions>? options = null);
+    Task Error(string message, string? title = null, Action<UiNotificationOptions>? options = null);
+}
+```
+
+Notifications are transient toasts; messages can be modal (`Confirm` returns
+`Task<bool>`). The split mirrors the MVC `IUiMessageService` /
+`IUiNotificationService` contracts so the same shared application services can
+target both UIs.
+
+### `IUiPageProgressService`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/Progression/IUiPageProgressService.cs"
+public interface IUiPageProgressService
+{
+    public event EventHandler<UiPageProgressEventArgs> ProgressChanged;
+
+    Task Go(int? percentage, Action<UiPageProgressOptions>? options = null);
+}
+```
+
+The page progress service is consumed by both HTTP message handlers
+(`AbpBlazorClientHttpMessageHandler` and the MAUI variant) so any remote call
+auto-drives the top-of-page progress bar.
+
+### `IAlertManager` and `AlertList`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/Alerts/IAlertManager.cs"
+public interface IAlertManager
+{
+    AlertList Alerts { get; }
+}
+```
+
+`AlertList` is observable; the Blazorise `PageAlert` component subscribes and
+re-renders when items are added.
+
+### `IUserExceptionInformer`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/ExceptionHandling/IUserExceptionInformer.cs"
+public interface IUserExceptionInformer
+{
+    void Inform(UserExceptionInformerContext context);
+    Task InformAsync(UserExceptionInformerContext context);
+}
+```
+
+`NullUserExceptionInformer` is the default (no UI). The `.Web` package ships
+`UserExceptionInformer`, which routes through `IUiMessageService` and is
+therefore reached by Blazorise's message dialog at runtime.
+
+## `.Web` package contents
+
+The browser-side service surface lives in
+`framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web`.
+
+| Category              | Type / file                                                    | Notes                                                                                          |
+| --------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Module                | `AbpAspNetCoreComponentsWebModule.cs`                          | Replaces `IComponentActivator`.                                                                |
+| App-creation options  | `AbpAspNetCoreApplicationCreationOptions.cs`                   | Base wrapper for host-specific options.                                                        |
+| HTTP handler          | `AbpBlazorClientHttpMessageHandler.cs`                         | XSRF token from `XSRF-TOKEN` cookie + Accept-Language + page progress.                         |
+| Cookies               | `ICookieService.cs`, `CookieService.cs`, `CookieOptions.cs`    | JS-interop wrappers around `abp.utils.*`.                                                      |
+| URL provider          | `IServerUrlProvider.cs`, `DefaultServerUrlProvider.cs`         | Resolves the backend base URL. WASM / MAUI override.                                           |
+| Localization helper   | `AbpBlazorMessageLocalizerHelper.cs`                           | Strongly-typed message localization scaffolding for components.                                |
+| JS utilities          | `IAbpUtilsService.cs`, `AbpUtilsService.cs`                    | `abp.utils.*` interop helpers (e.g. add CSS class to `<body>` for RTL).                        |
+| Configuration cache   | `Configuration/ICurrentApplicationConfigurationCacheResetService.cs`, `NullCurrentApplicationConfigurationCacheResetService.cs` | Replaced per-host (Server publishes a local-event, WASM re-fetches).        |
+| DI accessor           | `DependencyInjection/ComponentsClientScopeServiceProviderAccessor.cs` | Stores the *client* root provider for code outside a component scope (HTTP handlers etc.). |
+| Exception handling    | `ExceptionHandling/AbpExceptionHandlingLogger.cs`, `AbpExceptionHandlingLoggerProvider.cs`, `UserExceptionInformer.cs` | Hooks `ILogger` so unhandled background exceptions reach the UI informer. |
+| Extensibility         | `Extensibility/EntityActions/*`, `Extensibility/TableColumns/*`, `ILookupApiRequestService.cs` | DTOs reused by Blazorise's CRUD page and data grid.                          |
+| Messages fallback     | `Messages/SimpleUiMessageService.cs`                           | No-UI fallback; superseded by Blazorise's implementation.                                      |
+| Security              | `Security/AbpComponentsClaimsCache.cs`, `Security/ApplicationConfigurationChangedService.cs` | Caches the current `ClaimsPrincipal` for components that read it sync.        |
+
+### `ICookieService`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/CookieService.cs"
+[Dependency(ReplaceServices = true)]
+public class CookieService : ICookieService, ITransientDependency
+{
+    public IJSRuntime JsRuntime { get; }
+
+    public async ValueTask SetAsync(string key, string value, CookieOptions? options)
+    {
+        await JsRuntime.InvokeVoidAsync("abp.utils.setCookieValue",
+            key, value,
+            options?.ExpireDate?.ToString("r"),
+            options?.Path,
+            options?.Secure);
+    }
+
+    public async ValueTask<string> GetAsync(string key)
+        => await JsRuntime.InvokeAsync<string>("abp.utils.getCookieValue", key);
+
+    public async ValueTask DeleteAsync(string key, string? path = null)
+        => await JsRuntime.InvokeVoidAsync("abp.utils.deleteCookie", key);
+}
+```
+
+The cookie service is the only Blazor primitive that *talks* to a cookie — it
+is used for the anti-forgery token round-trip in
+`AbpBlazorClientHttpMessageHandler` and by the language switcher in account
+modules.
+
+### `IServerUrlProvider`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/IServerUrlProvider.cs"
+public interface IServerUrlProvider
+{
+    Task<string> GetBaseUrlAsync(string? remoteServiceName = null);
+}
+```
+
+`DefaultServerUrlProvider` returns `"/"`, which is what Blazor Server wants
+(same origin). WebAssembly and MAUI replace it with implementations that read
+`RemoteServiceConfigurationDictionary` from the loaded configuration —
+[Remote services](/http/remote-services) explains the configuration shape.
+
+### `AbpBlazorClientHttpMessageHandler`
+
+This `DelegatingHandler` is registered with every typed HTTP client by the
+WebAssembly module's pre-configuration. It does three things per request:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpBlazorClientHttpMessageHandler.cs"
+protected override async Task<HttpResponseMessage> SendAsync(
+    HttpRequestMessage request, CancellationToken cancellationToken)
+{
+    try
+    {
+        await _uiPageProgressService.Go(null, options =>
+        {
+            options.Type = UiPageProgressType.Info;
+        });
+
+        await SetLanguageAsync(request, cancellationToken);
+        await SetAntiForgeryTokenAsync(request);
+
+        return await base.SendAsync(request, cancellationToken);
+    }
+    finally
+    {
+        await _uiPageProgressService.Go(-1);
+    }
+}
+```
+
+`SetLanguageAsync` pulls `Abp.SelectedLanguage` from `localStorage` and sets
+`Accept-Language`. `SetAntiForgeryTokenAsync` reads the `XSRF-TOKEN` cookie
+through `ICookieService` and adds the `RequestVerificationToken` header on
+unsafe methods, but only when the request targets the same host:port as the
+current navigation URI. The MAUI variant skips the XSRF dance because MAUI
+hybrid apps don't share the browser cookie jar; see
+[components-maui-blazor](/blazor/components-maui-blazor).
+
+### `AbpComponentsClaimsCache`
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/Security/AbpComponentsClaimsCache.cs"
+public class AbpComponentsClaimsCache : IScopedDependency
+{
+    public ClaimsPrincipal Principal { get; private set; } = default!;
+
+    private readonly AuthenticationStateProvider? _authenticationStateProvider;
+
+    public AbpComponentsClaimsCache(
+        IClientScopeServiceProviderAccessor serviceProviderAccessor)
+    {
+        _authenticationStateProvider = serviceProviderAccessor.ServiceProvider
+            .GetService<AuthenticationStateProvider>();
+        if (_authenticationStateProvider != null)
+        {
+            _authenticationStateProvider.AuthenticationStateChanged += async (task) =>
+            {
+                Principal = (await task).User;
+            };
+        }
+    }
+
+    public virtual async Task InitializeAsync()
+    {
+        if (_authenticationStateProvider != null)
+        {
+            var authenticationState = await _authenticationStateProvider
+                .GetAuthenticationStateAsync();
+            Principal = authenticationState.User;
+        }
+    }
+}
+```
+
+The cache exists because `AuthenticationStateProvider` is async, but many ABP
+authorization checks are synchronous. The WASM and MAUI modules call
+`InitializeAsync` during `OnApplicationInitializationAsync` so
+`Principal` is populated before any component renders.
+
+`WebAssemblyCurrentPrincipalAccessor` (WASM) and the MAUI accessor read from
+this cache so anything inheriting `CurrentPrincipalAccessorBase` (and therefore
+`ICurrentUser`, `[Authorize]`, etc.) sees the right user.
+
+### `IClientScopeServiceProviderAccessor`
+
+Plain HTTP handlers run outside a component owning-scope. The accessor lets
+them reach the *client root* service provider that `InitializeApplicationAsync`
+plugged in. The Web package implements it as a singleton:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/DependencyInjection/ComponentsClientScopeServiceProviderAccessor.cs"
+public class ComponentsClientScopeServiceProviderAccessor :
+    IClientScopeServiceProviderAccessor,
+    ISingletonDependency
+{
+    public IServiceProvider ServiceProvider { get; set; } = default!;
+}
+```
+
+`AbpBlazorClientHttpMessageHandler` uses it to resolve
+`IUiPageProgressService`; the WASM and MAUI modules use it during
+`OnApplicationInitializationAsync` to grab the `WebAssemblyCachedApplicationConfigurationClient`
+and `AbpComponentsClaimsCache`.
+
+## Conventional registration in your module
+
+The conventional registrar wires components automatically. You usually only
+need to add **your assembly** to the WASM router options (covered in the
+[theming pipeline page](/blazor/theming-pipeline)) — services such as
+`AppService`s are registered through ABP's standard DI conventions.
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpRouterOptions>(options =>
+    {
+        options.AdditionalAssemblies.Add(typeof(MyBlazorModule).Assembly);
+    });
+}
+```
+
+## Where each contract is implemented
+
+| Contract                                | Default impl (where)                                              | UI impl (Blazorise)                                                                |
+| --------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `IUiMessageService`                     | `SimpleUiMessageService` (`.Web`)                                 | `BlazoriseUiMessageService` (`Volo.Abp.BlazoriseUI`)                                |
+| `IUiNotificationService`                | `NullUiNotificationService` (core)                                | `BlazoriseUiNotificationService`                                                    |
+| `IUiPageProgressService`                | `NullUiPageProgressService` (core)                                | `BlazoriseUiPageProgressService`                                                    |
+| `IUserExceptionInformer`                | `NullUserExceptionInformer` (core) / `UserExceptionInformer` (`.Web`) | Reached via the message service replacement.                                     |
+| `IAlertManager`                         | `AlertManager` (`.Web`)                                           | Used by `PageAlert`.                                                                |
+| `IComponentActivator`                   | `ServiceProviderComponentActivator` (`.Web`)                      | Replaced again by Blazorise's `ComponentActivator` inside `AbpBlazoriseUIModule`.    |
+| `IServerUrlProvider`                    | `DefaultServerUrlProvider` (`.Web`)                               | `WebAssemblyServerUrlProvider` / `MauiBlazorServerUrlProvider`                      |
+| `ICookieService`                        | `CookieService` (`.Web`)                                          | —                                                                                   |
+| `ICurrentApplicationConfigurationCacheResetService` | `NullCurrentApplicationConfigurationCacheResetService`   | `BlazorServerCurrentApplicationConfigurationCacheResetService`                      |
+
+## See also
+
+- [Components.Server](/blazor/components-server) — the server-side host that
+  uses the contracts above.
+- [Components.WebAssembly](/blazor/components-webassembly) — the WASM host that
+  registers `AbpBlazorClientHttpMessageHandler` and initializes the claims
+  cache.
+- [Blazorise UI](/blazor/blazorise-ui) — the default UI toolkit that provides
+  concrete implementations of the message / notification / progress / alert
+  services.
+- [HTTP client integration](/http/http-client) — the typed HTTP client stack
+  that `AbpBlazorClientHttpMessageHandler` plugs into.
+- [UI MVC overview](/ui-mvc/overview) — the MVC equivalent of this stack;
+  mostly relevant when sharing infrastructure across both UIs.

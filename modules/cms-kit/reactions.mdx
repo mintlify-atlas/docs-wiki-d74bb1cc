@@ -1,0 +1,403 @@
+---
+title: "CMS Kit Reactions: Emoji-Style User Reactions With Definition Store"
+sidebarTitle: "Reactions"
+description: "UserReaction aggregate inside CMS Kit, IUserReactionRepository, ReactionManager domain service, per-entity-type allow lists, ReactionDefinitionStore, and the public reaction app service."
+---
+
+The CMS Kit Reactions feature is the small emoji‑bar that lets a signed‑in user click a thumbs‑up, a heart, or a rocket on any entity that has opted in. Each click becomes one `UserReaction` row keyed by `(EntityType, EntityId, CreatorId, ReactionName)`; duplicate clicks are idempotent, removing the reaction is a single‑row delete, and the per‑entity‑type *allow‑list* (only certain reactions are valid for blog posts, only thumbs‑up/down for comments) lives in `CmsKitReactionOptions`. This page walks the source under `Volo.CmsKit.Domain/Volo/CmsKit/Reactions/`, lists every type and signature, and shows the public app service that drives the reaction bar.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions). Reactions on blog posts and comments are registered automatically — see [Blogs](/modules/cms-kit/blogs) and [Comments](/modules/cms-kit/comments).
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/"
+UserReaction.cs
+ReactionManager.cs
+IUserReactionRepository.cs
+CmsKitReactionOptions.cs
+ReactionDefinition.cs
+ReactionEntityTypeDefinition.cs
+IReactionDefinitionStore.cs
+DefaultReactionDefinitionStore.cs
+ReactionSummary.cs
+ReactionSummaryQueryResultItem.cs
+EntityCantHaveReactionException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `UserReaction.cs` | `BasicAggregateRoot<Guid>` | One row per `(EntityType, EntityId, CreatorId, ReactionName)` |
+| `ReactionManager.cs` | `CmsKitDomainServiceBase` | Idempotent create, delete, summary computation |
+| `IUserReactionRepository.cs` | interface | Per‑user lookup, per‑entity summary aggregation |
+| `CmsKitReactionOptions.cs` | options | List of allowed `ReactionEntityTypeDefinition` |
+| `ReactionDefinition.cs` | DTO | `(Name, DisplayName)` — a single reaction available to an entity type |
+| `ReactionEntityTypeDefinition.cs` | DTO | Pair of `(EntityType, Reactions[])` plus optional policies |
+| `IReactionDefinitionStore.cs` / `DefaultReactionDefinitionStore.cs` | interface + impl | Lookup over the options list |
+| `ReactionSummary.cs` | DTO | `(ReactionDefinition, Count)` — the manager's projection |
+| `ReactionSummaryQueryResultItem.cs` | DTO | `(ReactionName, Count)` — repository projection |
+| `EntityCantHaveReactionException.cs` | `BusinessException` | Raised on an unregistered entity type |
+
+The `StandardReactions` constants live at the namespace level and provide compact reaction names: `"_SM"` (smile), `"_TU"` (thumbs‑up), `"_TD"` (thumbs‑down), `"_CF"` (confused), `"_EY"` (eyes), `"_HE"` (heart), `"_HB"` (heart‑broken), `"_WI"` (wink), `"_PR"` (pray), `"_RO"` (rocket), `"_VI"` (victory), `"_RC"` (rock). The two‑character prefix avoids collision with custom user‑defined names.
+
+## Domain model
+
+```mermaid
+erDiagram
+    USERREACTION {
+        Guid Id PK
+        string EntityType
+        string EntityId
+        string ReactionName
+        Guid CreatorId
+        DateTime CreationTime
+        Guid? TenantId
+    }
+```
+
+### `UserReaction`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/UserReaction.cs"
+public class UserReaction : BasicAggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator, IMultiTenant
+{
+    public virtual Guid?    TenantId     { get; protected set; }
+    public virtual string   EntityType   { get; protected set; }
+    public virtual string   EntityId     { get; protected set; }
+    public virtual string   ReactionName { get; protected set; }
+    public virtual Guid     CreatorId    { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+
+    internal UserReaction(
+        Guid id,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [NotNull] string reactionName,
+        Guid creatorId,
+        Guid? tenantId = null) : base(id)
+    {
+        EntityType   = Check.NotNullOrWhiteSpace(entityType, nameof(entityType));
+        EntityId     = Check.NotNullOrWhiteSpace(entityId, nameof(entityId));
+        ReactionName = Check.NotNullOrWhiteSpace(reactionName, nameof(reactionName));
+        CreatorId    = creatorId;
+        TenantId     = tenantId;
+    }
+}
+```
+
+The aggregate has *no behaviour* beyond construction — reactions are immutable. You either have one or you don't. To change a reaction, delete the old row and create a new one (which is exactly what the `ReactionManager.GetOrCreateAsync` + `DeleteAsync` flow does).
+
+### `ReactionManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/ReactionManager.cs"
+public class ReactionManager : CmsKitDomainServiceBase
+{
+    protected IReactionDefinitionStore ReactionDefinitionStore { get; }
+    protected IUserReactionRepository  UserReactionRepository  { get; }
+
+    public virtual async Task<List<ReactionDefinition>> GetReactionsAsync(
+        [NotNull] string entityType)
+    {
+        Check.NotNullOrEmpty(entityType, nameof(entityType));
+        return await ReactionDefinitionStore.GetReactionsAsync(entityType);
+    }
+
+    public virtual async Task<List<ReactionSummary>> GetSummariesAsync(
+        [NotNull] string entityType, [NotNull] string entityId)
+    {
+        Check.NotNullOrWhiteSpace(entityType, nameof(entityType));
+        Check.NotNullOrWhiteSpace(entityId, nameof(entityId));
+
+        var userReactionCounts = (await UserReactionRepository.GetSummariesAsync(entityType, entityId))
+            .ToDictionary(x => x.ReactionName, x => x.Count);
+
+        var reactions = await ReactionDefinitionStore.GetReactionsAsync(entityType);
+
+        return reactions
+            .Select(reaction => new ReactionSummary
+            {
+                Reaction = reaction,
+                Count = userReactionCounts.GetOrDefault(reaction.Name)
+            })
+            .ToList();
+    }
+
+    public virtual async Task<UserReaction> GetOrCreateAsync(
+        Guid creatorId,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [NotNull] string reactionName)
+    {
+        Check.NotNullOrWhiteSpace(entityType, nameof(entityType));
+        Check.NotNullOrWhiteSpace(entityId, nameof(entityId));
+        Check.NotNullOrWhiteSpace(reactionName, nameof(reactionName));
+
+        var existingReaction = await UserReactionRepository
+            .FindAsync(creatorId, entityType, entityId, reactionName);
+        if (existingReaction != null)
+        {
+            return existingReaction;
+        }
+
+        if (!await ReactionDefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityCantHaveReactionException(entityType);
+        }
+
+        return await UserReactionRepository.InsertAsync(
+            new UserReaction(
+                GuidGenerator.Create(),
+                entityType, entityId, reactionName, creatorId,
+                CurrentTenant.Id));
+    }
+
+    public virtual async Task<bool> DeleteAsync(
+        Guid userId,
+        [NotNull] string entityType, [NotNull] string entityId, [NotNull] string reactionName)
+    {
+        // ... find and delete; returns true if a row was deleted
+    }
+}
+```
+
+`GetSummariesAsync` is the engine behind the reaction bar. It walks the *definition* list (so reactions with zero counts still appear with `Count = 0`) and joins each definition to the repository's `(name → count)` projection — a left‑outer join in memory, after one query per side.
+
+`GetOrCreateAsync` returns the existing row if the user has already reacted with this name, which makes "double‑click → still one reaction" the natural UX.
+
+`DeleteAsync` returns a `bool`: `true` if a row existed and was deleted, `false` otherwise. The public app service uses this to map "tried to un‑click a reaction you never made" to a no‑op instead of an error.
+
+## Registering reactive entity types
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/CmsKitReactionOptions.cs"
+public class CmsKitReactionOptions
+{
+    [NotNull]
+    public List<ReactionEntityTypeDefinition> EntityTypes { get; } = new();
+}
+```
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/ReactionEntityTypeDefinition.cs"
+public class ReactionEntityTypeDefinition : PolicySpecifiedDefinition
+{
+    [NotNull]
+    public List<ReactionDefinition> Reactions { get; } = new();
+
+    public ReactionEntityTypeDefinition(
+        [NotNull] string entityType,
+        [NotNull] IEnumerable<ReactionDefinition> reactions,
+        IEnumerable<string> createPolicies = null,
+        IEnumerable<string> updatePolicies = null,
+        IEnumerable<string> deletePolicies = null)
+        : base(entityType, createPolicies, updatePolicies, deletePolicies)
+    {
+        Reactions = Check.NotNull(reactions, nameof(reactions)).ToList();
+    }
+}
+```
+
+Each entity type has a *fixed set* of allowed reactions. Trying to react with a name not in that list yields no error from the repository (the row still goes in), but the public app service joins against the definition store at render time, so an out‑of‑band reaction silently disappears from the UI — register all the reactions you mean to support.
+
+`CmsKitDomainModule` wires standard reactions for blog posts and comments when the matching global features are on:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/CmsKitDomainModule.cs"
+if (GlobalFeatureManager.Instance.IsEnabled<ReactionsFeature>())
+{
+    Configure<CmsKitReactionOptions>(options =>
+    {
+        if (GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>())
+        {
+            options.EntityTypes.Add(
+                new ReactionEntityTypeDefinition(
+                    BlogPostConsts.EntityType,
+                    reactions: new[]
+                    {
+                        new ReactionDefinition(StandardReactions.Smile),
+                        new ReactionDefinition(StandardReactions.ThumbsUp),
+                        new ReactionDefinition(StandardReactions.ThumbsDown),
+                        new ReactionDefinition(StandardReactions.Confused),
+                        new ReactionDefinition(StandardReactions.Eyes),
+                        new ReactionDefinition(StandardReactions.Heart),
+                        new ReactionDefinition(StandardReactions.HeartBroken),
+                        new ReactionDefinition(StandardReactions.Wink),
+                        new ReactionDefinition(StandardReactions.Pray),
+                        new ReactionDefinition(StandardReactions.Rocket),
+                        new ReactionDefinition(StandardReactions.Victory),
+                        new ReactionDefinition(StandardReactions.Rock),
+                    }));
+        }
+
+        if (GlobalFeatureManager.Instance.IsEnabled<CommentsFeature>())
+        {
+            options.EntityTypes.Add(
+                new ReactionEntityTypeDefinition(
+                    CommentConsts.EntityType,
+                    reactions: new[]
+                    {
+                        new ReactionDefinition(StandardReactions.ThumbsUp),
+                        new ReactionDefinition(StandardReactions.ThumbsDown),
+                    }));
+        }
+    });
+}
+```
+
+Note the asymmetry: blog posts get 12 reactions; comments only get thumbs‑up / thumbs‑down. The per‑entity‑type allow‑list lets you keep moderation simple where it matters.
+
+The default reaction definition store is a thin lookup over the options list:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/DefaultReactionDefinitionStore.cs"
+public virtual async Task<List<ReactionDefinition>> GetReactionsAsync([NotNull] string entityType)
+{
+    Check.NotNullOrEmpty(entityType, nameof(entityType));
+    var definition = await GetAsync(entityType);
+    return definition.Reactions;
+}
+
+public virtual Task<ReactionEntityTypeDefinition> GetAsync([NotNull] string entityType)
+{
+    Check.NotNullOrWhiteSpace(entityType, nameof(entityType));
+    var definition = Options.EntityTypes.SingleOrDefault(
+                         x => x.EntityType.Equals(entityType, StringComparison.InvariantCultureIgnoreCase))
+                     ?? throw new EntityCantHaveReactionException(entityType);
+    return Task.FromResult(definition);
+}
+```
+
+`SingleOrDefault` rather than `FirstOrDefault` is deliberate — registering the same entity type twice is a configuration bug and the exception message tells you about it.
+
+## `IUserReactionRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Reactions/IUserReactionRepository.cs"
+public interface IUserReactionRepository : IBasicRepository<UserReaction, Guid>
+{
+    Task<UserReaction> FindAsync(
+        Guid userId,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [NotNull] string reactionName,
+        CancellationToken cancellationToken = default);
+
+    Task<List<UserReaction>> GetListForUserAsync(
+        Guid userId,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        CancellationToken cancellationToken = default);
+
+    Task<List<ReactionSummaryQueryResultItem>> GetSummariesAsync(
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+| Method | Used by | Notes |
+| --- | --- | --- |
+| `FindAsync` | `ReactionManager.GetOrCreateAsync`, `DeleteAsync` | Single‑row lookup by natural key |
+| `GetListForUserAsync` | `ReactionPublicAppService.GetForSelectionAsync` | All of a user's reactions on a single entity (for `IsSelectedByCurrentUser`) |
+| `GetSummariesAsync` | `ReactionManager.GetSummariesAsync` | Grouped count per `ReactionName` |
+
+The `GetSummariesAsync` projection is `(ReactionName, Count)` rather than `(Reaction, Count)` because the repository doesn't know about reaction definitions — the manager joins the projection with the definition store after the query.
+
+## Public app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Reactions/IReactionPublicAppService.cs"
+public interface IReactionPublicAppService : IApplicationService
+{
+    Task<ListResultDto<ReactionWithSelectionDto>> GetForSelectionAsync(
+        string entityType, string entityId);
+
+    Task CreateAsync(string entityType, string entityId, string reaction);
+
+    Task DeleteAsync(string entityType, string entityId, string reaction);
+}
+```
+
+The implementation reads anonymously and writes authenticated:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Reactions/ReactionPublicAppService.cs"
+[RequiresFeature(CmsKitFeatures.ReactionEnable)]
+[RequiresGlobalFeature(typeof(ReactionsFeature))]
+public class ReactionPublicAppService : CmsKitPublicAppServiceBase, IReactionPublicAppService
+{
+    protected IReactionDefinitionStore ReactionDefinitionStore { get; }
+    protected IUserReactionRepository  UserReactionRepository  { get; }
+    protected ReactionManager          ReactionManager         { get; }
+
+    public virtual async Task<ListResultDto<ReactionWithSelectionDto>> GetForSelectionAsync(
+        string entityType, string entityId)
+    {
+        var summaries = await ReactionManager.GetSummariesAsync(entityType, entityId);
+
+        var userReactionsOrNull = CurrentUser.IsAuthenticated
+            ? (await UserReactionRepository.GetListForUserAsync(
+                    CurrentUser.GetId(), entityType, entityId))
+                .GroupBy(x => x.ReactionName)
+                .ToDictionary(x => x.Key, x => x.First())
+            : null;
+
+        var reactionWithSelectionDtos = new List<ReactionWithSelectionDto>();
+
+        foreach (var summary in summaries)
+        {
+            reactionWithSelectionDtos.Add(new ReactionWithSelectionDto
+            {
+                Reaction = ConvertToReactionDto(summary.Reaction),
+                Count = summary.Count,
+                IsSelectedByCurrentUser =
+                    userReactionsOrNull?.ContainsKey(summary.Reaction.Name) ?? false
+            });
+        }
+
+        return new ListResultDto<ReactionWithSelectionDto>(reactionWithSelectionDtos);
+    }
+
+    [Authorize]
+    public virtual async Task CreateAsync(string entityType, string entityId, string reaction) =>
+        await ReactionManager.GetOrCreateAsync(
+            CurrentUser.GetId(), entityType, entityId, reaction);
+
+    [Authorize]
+    public virtual async Task DeleteAsync(string entityType, string entityId, string reaction) =>
+        // delegates to ReactionManager.DeleteAsync
+}
+```
+
+Key choices:
+
+- `GetForSelectionAsync` is anonymous because the count itself is public; only the `IsSelectedByCurrentUser` flag depends on authentication.
+- The dictionary cast is necessary because a user *could* hold the same reaction name twice in a malformed database — `GroupBy → First` is the defensive coalesce.
+- `CreateAsync` returns `void` (well, `Task`); clients re‑fetch via `GetForSelectionAsync` after a mutation to refresh the bar.
+
+There is no admin app service for reactions — moderation, where required, drops down to the repository or runs maintenance queries directly.
+
+## Feature flags
+
+- **Global feature** [`ReactionsFeature`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/ReactionsFeature.cs) — name `CmsKit.Reactions`.
+- **Per‑tenant feature** `CmsKitFeatures.ReactionEnable`.
+
+If `ReactionsFeature` is off, the whole reaction options block in `CmsKitDomainModule` is skipped — no DI registration, no controller, no DTO.
+
+## EF Core and MongoDB
+
+```csharp
+options.AddRepository<UserReaction, EfCoreUserReactionRepository>();
+```
+
+The EF index is a unique compound on `(EntityType, EntityId, CreatorId, ReactionName)` so duplicate clicks racing each other become a single row, not a duplicate.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Reactions sits in the package matrix.
+  </Card>
+  <Card title="Blogs" icon="rss" href="/modules/cms-kit/blogs">
+    Blog posts: 12 standard reactions.
+  </Card>
+  <Card title="Comments" icon="comments" href="/modules/cms-kit/comments">
+    Comments: thumbs‑up / thumbs‑down only.
+  </Card>
+  <Card title="Ratings" icon="star" href="/modules/cms-kit/ratings">
+    A similar pattern — one row per user per entity, with grouped aggregation.
+  </Card>
+</CardGroup>

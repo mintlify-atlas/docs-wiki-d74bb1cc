@@ -1,0 +1,437 @@
+---
+title: "CMS Kit Tags: Tag Aggregate, EntityTag Join, and Popular-Tag Query"
+sidebarTitle: "Tags"
+description: "Tag aggregate keyed by entity type, EntityTag many-to-many join, ITagRepository and IEntityTagRepository, TagManager and EntityTagManager, taggable entity type registration, and admin app services."
+---
+
+The CMS Kit Tags feature is a generic many‑to‑many between any registered entity type and a bag of named tags. The model is a pair: `Tag` carries the tag's `Name` plus the `EntityType` it belongs to (so different entity types live in separate tag namespaces — `BlogPost/csharp` does not collide with `Product/csharp`), and `EntityTag` is the join row pointing a tag at one specific entity id. Two managers split the work — `TagManager` owns the lifecycle of the tag itself, `EntityTagManager` owns the (tag, entity) relationship — and a tiny `PopularTag` projection returns the most‑used tags per entity type. This page walks the source under `Volo.CmsKit.Domain/Volo/CmsKit/Tags/`, lists every type and signature, and shows the admin app services that drive the tagger UI.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags). Blog posts are the only entity type registered as taggable out of the box — see [Blogs](/modules/cms-kit/blogs).
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/"
+Tag.cs
+EntityTag.cs
+TagManager.cs
+EntityTagManager.cs
+ITagRepository.cs
+IEntityTagRepository.cs
+CmsKitTagOptions.cs
+TagEntityTypeDefinitions.cs
+TagEntityTypeDefiniton.cs
+ITagDefinitionStore.cs
+DefaultTagDefinitionStore.cs
+PopularTag.cs
+EntityNotTaggableException.cs
+TagAlreadyExistException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `Tag.cs` | `FullAuditedAggregateRoot<Guid>` | A single tag, namespaced by `EntityType` |
+| `EntityTag.cs` | `Entity` | Composite key `(TagId, EntityId)` |
+| `TagManager.cs` | `DomainService` | Create / rename tags, enforce name uniqueness inside an entity type |
+| `EntityTagManager.cs` | `DomainService` | Attach / detach tags to entities, bulk‑replace |
+| `ITagRepository.cs` | interface | Find by name, listing, related tags, popular tags |
+| `IEntityTagRepository.cs` | interface | Join‑row operations, entity‑id filtering |
+| `CmsKitTagOptions.cs` | options | Wrapper for the typed list below |
+| `TagEntityTypeDefinitions.cs` | `List<TagEntityTypeDefiniton>` | Strongly‑typed list of allowed entity types |
+| `TagEntityTypeDefiniton.cs` | DTO | `(EntityType, DisplayName, CRUD policies)` |
+| `ITagDefinitionStore.cs` / `DefaultTagDefinitionStore.cs` | interface + impl | Lookup over the options list |
+| `PopularTag.cs` | DTO | `(Id, Name, Count)` projection |
+| `EntityNotTaggableException.cs` / `TagAlreadyExistException.cs` | `BusinessException` | Localised errors raised by the managers |
+
+## Domain model
+
+```mermaid
+erDiagram
+    TAG ||--o{ ENTITYTAG : "Id → TagId"
+    ENTITYTAG }o..|| "any entity" : "EntityId references"
+
+    TAG {
+        Guid Id PK
+        string EntityType
+        string Name
+        Guid? TenantId
+    }
+    ENTITYTAG {
+        Guid TagId PK,FK
+        string EntityId PK
+        Guid? TenantId
+    }
+```
+
+`EntityTag` carries `EntityId` as a *string* so it can reference both `Guid` and string‑keyed aggregates without a schema change. The composite key is `(TagId, EntityId)` — a tag can only be applied to a given entity once.
+
+### `Tag`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/Tag.cs"
+public class Tag : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid?  TenantId   { get; protected set; }
+    [NotNull] public virtual string EntityType { get; protected set; }
+    [NotNull] public virtual string Name       { get; protected set; }
+
+    public Tag(
+        Guid id,
+        [NotNull] string entityType,
+        [NotNull] string name,
+        Guid? tenantId = null) : base(id)
+    {
+        EntityType = Check.NotNullOrEmpty(entityType, nameof(entityType), TagConsts.MaxEntityTypeLength);
+        Name = Check.NotNullOrEmpty(name, nameof(name), TagConsts.MaxNameLength);
+        TenantId = tenantId;
+    }
+
+    public virtual void SetName([NotNull] string name) =>
+        Name = Check.NotNullOrEmpty(name, nameof(name), TagConsts.MaxNameLength);
+
+    public virtual void SetEntityType(string entityType) =>
+        EntityType = Check.NotNullOrEmpty(entityType, nameof(entityType), TagConsts.MaxEntityTypeLength);
+}
+```
+
+`Name` is unique per `EntityType` but not globally — that uniqueness lives in `TagManager.CheckSlugAsync`‑style logic and is also enforced by a unique compound index in the persistence layer.
+
+### `EntityTag`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/EntityTag.cs"
+public class EntityTag : Entity, IMultiTenant
+{
+    public virtual Guid    TagId    { get; set; }
+    public virtual string  EntityId { get; set; }
+    public virtual Guid?   TenantId { get; set; }
+
+    internal EntityTag(Guid tagId, [NotNull] string entityId, Guid? tenantId = null)
+    {
+        TagId = tagId;
+        EntityId = Check.NotNullOrEmpty(entityId, nameof(entityId));
+        TenantId = tenantId;
+    }
+
+    public override object[] GetKeys() => new object[] { TagId, EntityId };
+}
+```
+
+`Entity` (not `Entity<Guid>`) is the base class because the composite primary key has no surrogate id. `GetKeys()` declares the natural key for ABP's repository plumbing.
+
+### `TagManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/TagManager.cs"
+public class TagManager : DomainService
+{
+    protected ITagRepository      TagRepository      { get; }
+    protected ITagDefinitionStore TagDefinitionStore { get; }
+
+    public virtual async Task<Tag> GetOrAddAsync([NotNull] string entityType, [NotNull] string name)
+    {
+        var tag = await TagRepository.FindAsync(entityType, name);
+        if (tag == null)
+        {
+            tag = await CreateAsync(GuidGenerator.Create(), entityType, name);
+            await TagRepository.InsertAsync(tag);
+        }
+        return tag;
+    }
+
+    public virtual async Task<Tag> CreateAsync(Guid id,
+                                               [NotNull] string entityType,
+                                               [NotNull] string name)
+    {
+        if (!await TagDefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityNotTaggableException(entityType);
+        }
+
+        if (await TagRepository.AnyAsync(entityType, name))
+        {
+            throw new TagAlreadyExistException(entityType, name);
+        }
+
+        return new Tag(id, entityType, name, CurrentTenant.Id);
+    }
+
+    public virtual async Task<Tag> UpdateAsync(Guid id, [NotNull] string name)
+    {
+        Check.NotNullOrEmpty(name, nameof(name));
+
+        var tag = await TagRepository.GetAsync(id);
+
+        if (name != tag.Name &&
+            await TagRepository.AnyAsync(tag.EntityType, name))
+        {
+            throw new TagAlreadyExistException(tag.EntityType, name);
+        }
+
+        tag.SetName(name);
+        return tag;
+    }
+}
+```
+
+`GetOrAddAsync` is the lazy creator — it is the entry point `EntityTagManager.SetEntityTagsAsync` calls when the user types a new tag in the UI. `UpdateAsync` allows renaming a tag without changing its identity, which preserves all existing `EntityTag` rows.
+
+### `EntityTagManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/EntityTagManager.cs"
+public class EntityTagManager : DomainService
+{
+    protected IEntityTagRepository  EntityTagRepository { get; }
+    protected ITagRepository        TagRepository       { get; }
+    protected ITagDefinitionStore   TagDefinitionStore  { get; }
+    protected TagManager            TagManager          { get; }
+
+    public virtual async Task<EntityTag> AddTagToEntityAsync(
+        [NotNull] Guid tagId,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [CanBeNull] Guid? tenantId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!await TagDefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityNotTaggableException(entityType);
+        }
+
+        var entityTag = new EntityTag(tagId, entityId, tenantId);
+        return await EntityTagRepository.InsertAsync(entityTag, cancellationToken: cancellationToken);
+    }
+
+    public virtual async Task RemoveTagFromEntityAsync(
+        [NotNull] Guid tagId,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        [CanBeNull] Guid? tenantId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var entityTag = await EntityTagRepository.FindAsync(tagId, entityId, tenantId, cancellationToken);
+        await EntityTagRepository.DeleteAsync(entityTag, cancellationToken: cancellationToken);
+    }
+
+    public async Task SetEntityTagsAsync(string entityType, string entityId, List<string> tags)
+    {
+        var existingTags = await TagRepository.GetAllRelatedTagsAsync(entityType, entityId);
+
+        var deletedTags = existingTags.Where(x => !tags.Contains(x.Name)).ToList();
+        var addedTags = tags.Where(x => !existingTags.Any(a => a.Name == x));
+
+        await EntityTagRepository.DeleteManyAsync(deletedTags.Select(s => s.Id).ToArray(), entityId);
+
+        foreach (var addedTag in addedTags)
+        {
+            var tag = await TagManager.GetOrAddAsync(entityType, addedTag);
+            await AddTagToEntityAsync(tag.Id, entityType, entityId, CurrentTenant?.Id);
+        }
+    }
+
+    public async Task<List<string>> GetEntityIdsFilteredByTagAsync(
+        [NotNull] Guid tagId,
+        [CanBeNull] Guid? tenantId,
+        CancellationToken cancellationToken = default) =>
+        await EntityTagRepository.GetEntityIdsFilteredByTagAsync(tagId, tenantId, cancellationToken);
+
+    public async Task<List<string>> GetEntityIdsFilteredByTagNameAsync(
+        [NotNull] string tagName,
+        [NotNull] string entityType,
+        [CanBeNull] Guid? tenantId,
+        CancellationToken cancellationToken = default) =>
+        await EntityTagRepository.GetEntityIdsFilteredByTagNameAsync(tagName, entityType, tenantId, cancellationToken);
+}
+```
+
+`SetEntityTagsAsync` is the *replace* operation the admin editor calls. It diffs the desired list against the existing one, deletes the removed tags, calls `TagManager.GetOrAddAsync` to find or create each new tag, then inserts the join rows. The call is *not* wrapped in an explicit transaction — it relies on the ambient unit of work to commit or roll back atomically.
+
+The two `GetEntityIdsFilteredByTag*` methods power "show all blog posts tagged X" — they return *entity ids*, not entities, because the tag system has no knowledge of any particular aggregate.
+
+## Registering taggable entity types
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/TagEntityTypeDefiniton.cs"
+public class TagEntityTypeDefiniton : PolicySpecifiedDefinition, IEquatable<TagEntityTypeDefiniton>
+{
+    [CanBeNull] public virtual ILocalizableString DisplayName { get; }
+
+    public TagEntityTypeDefiniton(
+        [NotNull] string entityType,
+        [CanBeNull] ILocalizableString displayName = null,
+        IEnumerable<string> createPolicies = null,
+        IEnumerable<string> updatePolicies = null,
+        IEnumerable<string> deletePolicies = null)
+        : base(entityType, createPolicies, updatePolicies, deletePolicies)
+    {
+        DisplayName = displayName;
+    }
+}
+```
+
+`PolicySpecifiedDefinition` carries three permission arrays — create / update / delete — so that registering an entity type for tagging also says *which permissions* allow each operation. This is how the admin UI knows whether the current user can create a brand‑new tag versus simply pick an existing one.
+
+The CMS Kit Admin Application module registers blog posts as taggable when both global features are on:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/CmsKitAdminApplicationModule.cs"
+Configure<CmsKitTagOptions>(opts =>
+{
+    if (GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>())
+    {
+        opts.EntityTypes.AddIfNotContains(
+            new TagEntityTypeDefiniton(
+                BlogPostConsts.EntityType,
+                LocalizableString.Create<CmsKitResource>("BlogPost"),
+                createPolicies: new[]
+                {
+                    CmsKitAdminPermissions.BlogPosts.Create,
+                    CmsKitAdminPermissions.BlogPosts.Update
+                },
+                updatePolicies: new[]
+                {
+                    CmsKitAdminPermissions.BlogPosts.Create,
+                    CmsKitAdminPermissions.BlogPosts.Update
+                },
+                deletePolicies: new[]
+                {
+                    CmsKitAdminPermissions.BlogPosts.Create,
+                    CmsKitAdminPermissions.BlogPosts.Update
+                }));
+    }
+});
+```
+
+Notice the policies say *"you can tag a blog post if you can either create or update one"* — separate `BlogPosts.Create` and `BlogPosts.Update` are listed so either is sufficient.
+
+`DefaultTagDefinitionStore.GetTagEntityTypeDefinitionListAsync()` returns the full list, used by `ITagAdminAppService.GetTagDefinitionsAsync` to power the entity‑type dropdown in the admin UI.
+
+## `ITagRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/ITagRepository.cs"
+public interface ITagRepository : IBasicRepository<Tag, Guid>
+{
+    Task<Tag>  GetAsync ([NotNull] string entityType, [NotNull] string name, CancellationToken cancellationToken = default);
+    Task<bool> AnyAsync ([NotNull] string entityType, [NotNull] string name, CancellationToken cancellationToken = default);
+    Task<Tag>  FindAsync([NotNull] string entityType, [NotNull] string name, CancellationToken cancellationToken = default);
+
+    Task<List<Tag>> GetListAsync(
+        string filter, int maxResultCount = int.MaxValue, int skipCount = 0,
+        string sorting = null, CancellationToken cancellationToken = default);
+
+    Task<int> GetCountAsync(string filter, CancellationToken cancellationToken = default);
+
+    Task<List<Tag>> GetAllRelatedTagsAsync(
+        [NotNull] string entityType, [NotNull] string entityId,
+        CancellationToken cancellationToken = default);
+
+    Task<List<PopularTag>> GetPopularTagsAsync(
+        [NotNull] string entityType, int maxCount,
+        CancellationToken cancellationToken = default);
+}
+```
+
+| Method | Used by |
+| --- | --- |
+| `FindAsync(entityType, name)` | `TagManager.GetOrAddAsync` |
+| `AnyAsync(entityType, name)` | `TagManager.CreateAsync` / `UpdateAsync` (uniqueness guard) |
+| `GetAllRelatedTagsAsync(entityType, entityId)` | `EntityTagManager.SetEntityTagsAsync` |
+| `GetPopularTagsAsync(entityType, maxCount)` | Public/admin "tag cloud" widgets |
+
+## `IEntityTagRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Tags/IEntityTagRepository.cs"
+public interface IEntityTagRepository : IBasicRepository<EntityTag>
+{
+    Task<EntityTag> FindAsync(
+        [NotNull] Guid tagId,
+        [NotNull] string entityId,
+        [CanBeNull] Guid? tenantId,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteManyAsync(Guid[] tagIds, string entityId, CancellationToken cancellationToken = default);
+
+    Task<List<string>> GetEntityIdsFilteredByTagAsync(
+        [NotNull] Guid tagId,
+        [CanBeNull] Guid? tenantId,
+        CancellationToken cancellationToken = default);
+
+    Task<List<string>> GetEntityIdsFilteredByTagNameAsync(
+        [NotNull] string tagName,
+        [NotNull] string entityType,
+        [CanBeNull] Guid? tenantId = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+`DeleteManyAsync` accepts an array of tag ids plus a single entity id and removes the matching join rows in one round trip — used by `EntityTagManager.SetEntityTagsAsync` to bulk‑detach all removed tags in a single call.
+
+## Admin app services
+
+There are two admin services:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Tags/ITagAdminAppService.cs"
+public interface ITagAdminAppService
+    : ICrudAppService<TagDto, Guid, TagGetListInput, TagCreateDto, TagUpdateDto>
+{
+    Task<List<TagDefinitionDto>> GetTagDefinitionsAsync();
+}
+```
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Tags/IEntityTagAdminAppService.cs"
+public interface IEntityTagAdminAppService : IApplicationService
+{
+    Task AddTagToEntityAsync(EntityTagCreateDto input);
+    Task RemoveTagFromEntityAsync(EntityTagRemoveDto input);
+    Task SetEntityTagsAsync(EntityTagSetDto input);
+}
+```
+
+Why two? `ITagAdminAppService` manages the *tag library* — list, create, rename, delete tags themselves. `IEntityTagAdminAppService` manages the *join* — attach existing tags to a particular entity. The split mirrors the manager split (`TagManager` vs `EntityTagManager`) and lets the admin UI use one for tag administration screens and the other for the tag picker on blog posts.
+
+### Permissions
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Permissions/CmsKitAdminPermissions.cs"
+public static class Tags
+{
+    public const string Default = GroupName + ".Tags";
+    public const string Create  = Default + ".Create";
+    public const string Update  = Default + ".Update";
+    public const string Delete  = Default + ".Delete";
+}
+```
+
+These guard the tag library. The *entity*‑side operations rely on the policies inside each `TagEntityTypeDefiniton` — for blog posts they map to `BlogPosts.Create` and `BlogPosts.Update`.
+
+## Public exposure
+
+There is no `ITagPublicAppService` in the contracts directly — the public tag controller, `TagPublicController` in `Volo.CmsKit.Public.HttpApi/Volo/CmsKit/Public/Tags/`, is read‑only and lets the public renderer fetch the tag list or popular tags for an entity type. The matching app service implementation is `TagAppService` in `Volo.CmsKit.Common.Application/Volo/CmsKit/Tags/TagAppService.cs` (shared between admin and public reads).
+
+## Feature flags
+
+- **Global feature** [`TagsFeature`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/TagsFeature.cs) — name `CmsKit.Tags`.
+- **Per‑tenant feature** `CmsKitFeatures.TagEnable`.
+
+Without `TagsFeature`, the tag options block in `CmsKitDomainModule` is skipped and no tag definition lookups land.
+
+## EF Core and MongoDB
+
+```csharp
+options.AddRepository<Tag,        EfCoreTagRepository>();
+options.AddRepository<EntityTag,  EfCoreEntityTagRepository>();
+```
+
+The EF builder adds a unique compound on `(EntityType, Name, TenantId)` for `Tag` (so the same tag name can live in two tenants) and on `(TagId, EntityId, TenantId)` for `EntityTag`. The popular‑tag query is a `GROUP BY TagId / COUNT(*)` joined with `Tag`, ordered descending and limited.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Tags sits in the package matrix.
+  </Card>
+  <Card title="Blogs" icon="rss" href="/modules/cms-kit/blogs">
+    The only entity type registered as taggable by default.
+  </Card>
+  <Card title="Permission System" icon="lock" href="/authz/permission-system">
+    How the `createPolicies` / `updatePolicies` arrays on `TagEntityTypeDefiniton` plug in.
+  </Card>
+  <Card title="Admin / Public split" icon="layer-group" href="/modules/cms-kit/admin-public-split">
+    The reasoning behind splitting `TagAppService` (read) from `TagAdminAppService` (write).
+  </Card>
+</CardGroup>

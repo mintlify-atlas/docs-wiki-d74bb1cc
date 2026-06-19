@@ -1,0 +1,483 @@
+---
+title: "ABP application startup: factory, modules, initialization"
+sidebarTitle: "Application Startup"
+description: "Trace AbpApplicationFactory: service wiring, [DependsOn] sort, the three ConfigureServices phases, and InitializeAsync via lifecycle contributors."
+---
+
+ABP boots through a precise, four-stage choreography: an `AbpApplicationFactory` constructs an `IAbpApplication` over an `IServiceCollection`, the `ModuleLoader` discovers and topologically sorts every `[DependsOn]` module reachable from the startup module, `AbpApplicationBase.ConfigureServices` runs a three-phase service registration pass (pre / configure / post), and finally `InitializeAsync` walks each `IModuleLifecycleContributor` registered in `AbpModuleLifecycleOptions` to drive `OnPreApplicationInitialization` → `OnApplicationInitialization` → `OnPostApplicationInitialization` against each module instance.
+
+This page traces a single host startup from the first `AbpApplicationFactory.CreateAsync<TStartupModule>(...)` call (or `WebApplication.UseAbp(...)` in ASP.NET Core hosts) all the way to the moment `app.Run()` starts accepting HTTP requests, citing the exact source files and members involved at every step. Use it as the canonical map when you want to understand which hook to override, when the DI container is built, or what is allowed to call what during which phase.
+
+## Source map
+
+The startup flow lives almost entirely under the framework's core package:
+
+| File | Role |
+| ---- | ---- |
+| `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationFactory.cs` | Static entry point. Constructs `AbpApplicationWithInternalServiceProvider` or `AbpApplicationWithExternalServiceProvider`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs` | Shared base class. Owns `Modules`, `Services`, `ServiceProvider`, the three `ConfigureServices` phases, and `InitializeModulesAsync`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationWithInternalServiceProvider.cs` | Internal-SP host: builds the `IServiceProvider` itself and owns the root scope. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationWithExternalServiceProvider.cs` | External-SP host: ASP.NET Core / Generic Host hands in the SP through `InitializeAsync(serviceProvider)`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Internal/InternalServiceCollectionExtensions.cs` | `AddCoreAbpServices` registers `ModuleLoader`, `AssemblyFinder`, and the four default `IModuleLifecycleContributor`s. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs` | Discovers module types reachable from `StartupModuleType`, applies plug-in sources, and `SortByDependencies(...)`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs` | Walks `[DependsOn]` attributes via `IDependedTypesProvider` to compute the transitive closure. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs` | Iterates lifecycle contributors × modules during `InitializeModulesAsync` / `ShutdownModulesAsync`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DefaultModuleLifecycleContributor.cs` | The four built-in contributors: `OnPreApplicationInitialization`, `OnApplicationInitialization`, `OnPostApplicationInitialization`, `OnApplicationShutdown`. |
+| `framework/src/Volo.Abp.AspNetCore/Microsoft/AspNetCore/Builder/AbpApplicationBuilderExtensions.cs` | ASP.NET Core glue: `InitializeApplicationAsync(this IApplicationBuilder)`. |
+
+## The flow at a glance
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Program.cs / Host
+    participant Factory as AbpApplicationFactory
+    participant App as AbpApplicationBase
+    participant Loader as ModuleLoader
+    participant Modules as Module instances
+    participant SP as IServiceProvider
+    participant Mgr as ModuleManager
+    participant Contributors as IModuleLifecycleContributor[]
+
+    Host->>Factory: CreateAsync&lt;TStartupModule&gt;(optionsAction)
+    Factory->>App: new AbpApplicationWithInternalServiceProvider(...)
+    App->>App: AddCoreServices() + AddCoreAbpServices()
+    App->>Loader: LoadModules(services, startup, plugIns)
+    Loader->>Modules: Activator.CreateInstance(moduleType)
+    Loader-->>App: IAbpModuleDescriptor[] (sorted)
+    Factory->>App: await ConfigureServicesAsync()
+    App->>Modules: PreConfigureServicesAsync(context)
+    App->>Modules: ConfigureServicesAsync(context)
+    App->>Modules: PostConfigureServicesAsync(context)
+    Host->>App: InitializeAsync(serviceProvider)
+    App->>SP: BuildServiceProviderFromFactory().CreateScope()
+    App->>Mgr: InitializeModulesAsync(context)
+    loop for each contributor
+      loop for each module
+        Mgr->>Contributors: InitializeAsync(context, module)
+        Contributors->>Modules: OnPreApplicationInitializationAsync(...)
+        Contributors->>Modules: OnApplicationInitializationAsync(...)
+        Contributors->>Modules: OnPostApplicationInitializationAsync(...)
+      end
+    end
+    Mgr-->>App: "Initialized all ABP modules."
+    App-->>Host: ready for requests
+```
+
+## Stage 1 — Entry point: `AbpApplicationFactory`
+
+Every ABP host starts at one of the static `Create` / `CreateAsync` overloads on `AbpApplicationFactory`. The async overloads always set `SkipConfigureServices = true` so that the framework can `await` the async `ConfigureServicesAsync` instead of the synchronous variant invoked inline by the base constructor.
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationFactory.cs"
+public async static Task<IAbpApplicationWithInternalServiceProvider> CreateAsync<TStartupModule>(
+    Action<AbpApplicationCreationOptions>? optionsAction = null)
+    where TStartupModule : IAbpModule
+{
+    var app = Create(typeof(TStartupModule), options =>
+    {
+        options.SkipConfigureServices = true;
+        optionsAction?.Invoke(options);
+    });
+    await app.ConfigureServicesAsync();
+    return app;
+}
+```
+
+There are two host shapes:
+
+<Steps>
+<Step title="Internal service provider">
+`Create<TStartupModule>(optionsAction)` returns an `AbpApplicationWithInternalServiceProvider`. It allocates its own `ServiceCollection`, builds the container in `CreateServiceProvider()`, and owns the root `IServiceScope`. Console apps and tests use this path.
+</Step>
+
+<Step title="External service provider">
+`Create<TStartupModule>(services, optionsAction)` returns an `AbpApplicationWithExternalServiceProvider`. The caller — usually `WebApplicationBuilder` or `HostBuilder` — owns the `IServiceCollection` and later supplies the built `IServiceProvider` to `InitializeAsync(serviceProvider)`. ASP.NET Core hosts use this path.
+</Step>
+</Steps>
+
+Both shapes call into `AbpApplicationBase`'s `internal` constructor, which is the actual factory of work — `AbpApplicationFactory` itself is just a typed facade.
+
+## Stage 2 — `AbpApplicationBase` constructor: registering the core
+
+The base constructor wires up the singletons every other piece of ABP relies on, registers an `ObjectAccessor<IServiceProvider>` placeholder so that classes resolved before the SP is built can capture it later, then asks the `ModuleLoader` to enumerate modules.
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"
+internal AbpApplicationBase(
+    Type startupModuleType,
+    IServiceCollection services,
+    Action<AbpApplicationCreationOptions>? optionsAction)
+{
+    StartupModuleType = startupModuleType;
+    Services = services;
+
+    services.TryAddObjectAccessor<IServiceProvider>();
+
+    var options = new AbpApplicationCreationOptions(services);
+    optionsAction?.Invoke(options);
+
+    ApplicationName = GetApplicationName(options);
+
+    services.AddSingleton<IAbpApplication>(this);
+    services.AddSingleton<IApplicationInfoAccessor>(this);
+    services.AddSingleton<IModuleContainer>(this);
+    services.AddSingleton<IAbpHostEnvironment>(new AbpHostEnvironment()
+    {
+        EnvironmentName = options.Environment
+    });
+
+    services.AddCoreServices();
+    services.AddCoreAbpServices(this, options);
+
+    Modules = LoadModules(services, options);
+
+    if (!options.SkipConfigureServices)
+    {
+        ConfigureServices();
+    }
+}
+```
+
+`AddCoreServices` adds `AddOptions`, `AddLogging`, and `AddLocalization`. `AddCoreAbpServices` (in `InternalServiceCollectionExtensions`) then installs the `ModuleLoader`, the `AssemblyFinder`, the `InitLoggerFactory`, and — critically — the default lifecycle contributors:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/Internal/InternalServiceCollectionExtensions.cs"
+services.Configure<AbpModuleLifecycleOptions>(options =>
+{
+    options.Contributors.Add<OnPreApplicationInitializationModuleLifecycleContributor>();
+    options.Contributors.Add<OnApplicationInitializationModuleLifecycleContributor>();
+    options.Contributors.Add<OnPostApplicationInitializationModuleLifecycleContributor>();
+    options.Contributors.Add<OnApplicationShutdownModuleLifecycleContributor>();
+});
+```
+
+The ordering of `Contributors` is the ordering of the initialization hooks — see [Stage 5](#stage-5---initializeasync-and-the-lifecycle-contributors) — and you can add your own contributor (e.g. for tracing or warm-up tasks) by configuring `AbpModuleLifecycleOptions`.
+
+## Stage 3 — `ModuleLoader`: discovery and topological sort
+
+`AbpApplicationBase.LoadModules` delegates to `services.GetSingletonInstance<IModuleLoader>().LoadModules(...)`. The default implementation does three things:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs"
+public IAbpModuleDescriptor[] LoadModules(
+    IServiceCollection services,
+    Type startupModuleType,
+    PlugInSourceList plugInSources)
+{
+    var modules = GetDescriptors(services, startupModuleType, plugInSources);
+    modules = SortByDependency(modules, startupModuleType);
+    return modules.ToArray();
+}
+```
+
+<Steps>
+<Step title="Walk [DependsOn] transitively">
+`AbpModuleHelper.FindAllModuleTypes` does a depth-first traversal from the startup module, following every `IDependedTypesProvider` attribute (`[DependsOn]` is the canonical one) and logging the tree through the `IInitLoggerFactory` so it shows up in the `"Loaded ABP modules:"` block of your logs.
+</Step>
+
+<Step title="Instantiate every module">
+For each discovered type, `CreateAndRegisterModule` constructs the module via `Activator.CreateInstance(moduleType)` (so modules must have a parameterless constructor) and registers the instance as a singleton with its concrete type. This is the only time a module is ever instantiated — every later phase calls back into the same object.
+</Step>
+
+<Step title="Merge plug-in modules">
+Plug-in sources from `AbpApplicationCreationOptions.PlugInSources` (set via `options.PlugInSources.AddFolder(...)`, `AddTypes(...)`, etc.) are appended, deduplicated against the already-discovered set, and marked with `IsLoadedAsPlugIn = true`.
+</Step>
+
+<Step title="Sort by dependency">
+`SortByDependency` performs a topological sort using `m => m.Dependencies` and then forces the startup module to the last position with `sortedModules.MoveItem(m => m.Type == startupModuleType, modules.Count - 1)`. This is the order all subsequent phases iterate in.
+</Step>
+</Steps>
+
+The resulting `IReadOnlyList<IAbpModuleDescriptor>` is stored on `AbpApplicationBase.Modules` and exposed via `IModuleContainer.Modules`, which is what `ModuleManager` reads later.
+
+## Stage 4 — `ConfigureServices`: pre, configure, post
+
+After `LoadModules`, the constructor calls `ConfigureServices()` synchronously **only if `SkipConfigureServices` is false**. Because the async factory overloads always set the skip flag, real ASP.NET Core hosts run `await app.ConfigureServicesAsync()` instead. Both methods are identical except for sync vs async dispatch, and both call the same three phases in the same order on the same `Modules` list.
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"
+public virtual async Task ConfigureServicesAsync()
+{
+    CheckMultipleConfigureServices();
+
+    var context = new ServiceConfigurationContext(Services);
+    Services.AddSingleton(context);
+
+    foreach (var module in Modules)
+    {
+        if (module.Instance is AbpModule abpModule)
+        {
+            abpModule.ServiceConfigurationContext = context;
+        }
+    }
+
+    //PreConfigureServices
+    foreach (var module in Modules.Where(m => m.Instance is IPreConfigureServices))
+    {
+        await ((IPreConfigureServices)module.Instance).PreConfigureServicesAsync(context);
+    }
+
+    //ConfigureServices (auto-registration first, then user hook)
+    foreach (var module in Modules) { /* AddAssembly + module.ConfigureServicesAsync(context) */ }
+
+    //PostConfigureServices
+    foreach (var module in Modules.Where(m => m.Instance is IPostConfigureServices))
+    {
+        await ((IPostConfigureServices)module.Instance).PostConfigureServicesAsync(context);
+    }
+    /* ... */
+}
+```
+
+A single `ServiceConfigurationContext` instance flows through all three phases. Each `AbpModule` gets the context assigned to a property so `Configure<TOptions>(...)`, `context.Services.AddTransient<...>()`, and `PreConfigure<TOptions>(...)` work uniformly without parameter passing.
+
+### Phase A — `PreConfigureServices`
+
+Modules that implement `IPreConfigureServices` get a chance to drop hints that other modules need to see during `ConfigureServices`. Two canonical examples:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcModule.cs"
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    DynamicProxyIgnoreTypes.Add<ControllerBase>();
+    DynamicProxyIgnoreTypes.Add<PageModel>();
+    DynamicProxyIgnoreTypes.Add<ViewComponent>();
+
+    context.Services.AddConventionalRegistrar(new AbpAspNetCoreMvcConventionalRegistrar());
+}
+```
+
+This phase typically registers conventional registrars, contributes assemblies to `DynamicProxyIgnoreTypes`, and uses `PreConfigure<TOptions>(...)` to seed options that the next phase will consume.
+
+### Phase B — `ConfigureServices` (auto-registration + user hook)
+
+For each module, ABP first runs **conventional service registration** across every assembly in `module.AllAssemblies` (unless the module sets `SkipAutoServiceRegistration = true`), then calls the module's own `ConfigureServicesAsync(context)`:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"
+foreach (var module in Modules)
+{
+    if (module.Instance is AbpModule abpModule)
+    {
+        if (!abpModule.SkipAutoServiceRegistration)
+        {
+            foreach (var assembly in module.AllAssemblies)
+            {
+                if (!assemblies.Contains(assembly))
+                {
+                    Services.AddAssembly(assembly);
+                    assemblies.Add(assembly);
+                }
+            }
+        }
+    }
+
+    await module.Instance.ConfigureServicesAsync(context);
+}
+```
+
+`Services.AddAssembly` is where `ITransientDependency`, `IScopedDependency`, `ISingletonDependency`, and `[ExposeServices]` are picked up — and it's also where each [interceptor registrar](/di/castle-dynamic-proxy) (such as `UnitOfWorkInterceptorRegistrar`, `AuthorizationInterceptorRegistrar`, `ValidationInterceptorRegistrar`, `AuditingInterceptorRegistrar`) attaches to the conventional registrar pipeline.
+
+### Phase C — `PostConfigureServices`
+
+The final pass lets modules look at the assembled `IServiceCollection` and apply finishing moves. The MVC module, for example, sorts application parts here to enforce the same module dependency order at the controller-discovery layer:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcModule.cs"
+public override void PostConfigureServices(ServiceConfigurationContext context)
+{
+    ApplicationPartSorter.Sort(
+        context.Services.GetSingletonInstance<ApplicationPartManager>(),
+        context.Services.GetSingletonInstance<IModuleContainer>()
+    );
+}
+```
+
+When the three phases are done, each `AbpModule.ServiceConfigurationContext` is cleared (`null!`) to prevent leaks, the `_configuredServices` flag is set, and `TryToSetEnvironment` defaults `EnvironmentName` to `Production` if no environment was supplied.
+
+<Note>
+**You can call `Configure<TOptions>` from any phase**, but only `PreConfigure<TOptions>` is read back by other modules during their own `ConfigureServices`. See [the modularity overview](/modularity/overview) for the rules of thumb.
+</Note>
+
+## Stage 5 — `InitializeAsync` and the lifecycle contributors
+
+For console apps the host calls `await app.InitializeAsync()`. For ASP.NET Core hosts the equivalent is invoked from `AbpApplicationBuilderExtensions.InitializeApplicationAsync`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore/Microsoft/AspNetCore/Builder/AbpApplicationBuilderExtensions.cs"
+public async static Task InitializeApplicationAsync(this IApplicationBuilder app)
+{
+    app.ApplicationServices.GetRequiredService<ObjectAccessor<IApplicationBuilder>>().Value = app;
+    var application = app.ApplicationServices.GetRequiredService<IAbpApplicationWithExternalServiceProvider>();
+    var applicationLifetime = app.ApplicationServices.GetRequiredService<IHostApplicationLifetime>();
+
+    applicationLifetime.ApplicationStopping.Register(() =>
+    {
+        AsyncHelper.RunSync(() => application.ShutdownAsync());
+    });
+
+    applicationLifetime.ApplicationStopped.Register(() =>
+    {
+        application.Dispose();
+    });
+
+    await application.InitializeAsync(app.ApplicationServices);
+}
+```
+
+For the internal-SP host, `InitializeAsync` builds the SP itself first:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationWithInternalServiceProvider.cs"
+public async Task InitializeAsync()
+{
+    CreateServiceProvider();
+    await InitializeModulesAsync();
+}
+
+public IServiceProvider CreateServiceProvider()
+{
+    if (ServiceProvider != null) return ServiceProvider;
+
+    ServiceScope = Services.BuildServiceProviderFromFactory().CreateScope();
+    SetServiceProvider(ServiceScope.ServiceProvider);
+
+    return ServiceProvider!;
+}
+```
+
+`SetServiceProvider` does the critical assignment that completes the SP-bootstrap chicken-and-egg: it writes the now-built provider into the `ObjectAccessor<IServiceProvider>` registered way back in stage 2, unblocking any object that captured the accessor earlier.
+
+`InitializeModulesAsync` opens a service scope, writes the buffered init logs, then asks `ModuleManager` to run the contributors:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"
+protected virtual async Task InitializeModulesAsync()
+{
+    using (var scope = ServiceProvider.CreateScope())
+    {
+        WriteInitLogs(scope.ServiceProvider);
+        await scope.ServiceProvider
+            .GetRequiredService<IModuleManager>()
+            .InitializeModulesAsync(new ApplicationInitializationContext(scope.ServiceProvider));
+    }
+}
+```
+
+`ModuleManager.InitializeModulesAsync` is a double loop: **outer** is the contributor list (from `AbpModuleLifecycleOptions.Contributors`), **inner** is every module in the sorted list. So **every contributor runs against every module before the next contributor begins**:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs"
+public virtual async Task InitializeModulesAsync(ApplicationInitializationContext context)
+{
+    foreach (var contributor in _lifecycleContributors)
+    {
+        foreach (var module in _moduleContainer.Modules)
+        {
+            try
+            {
+                await contributor.InitializeAsync(context, module.Instance);
+            }
+            catch (Exception ex)
+            {
+                throw new AbpInitializationException(/* ... */);
+            }
+        }
+    }
+
+    _logger.LogInformation("Initialized all ABP modules.");
+}
+```
+
+With the default contributor ordering, this produces the well-known sequence:
+
+1. `OnPreApplicationInitializationAsync` — every module that implements `IOnPreApplicationInitialization`.
+2. `OnApplicationInitializationAsync` — every module that implements `IOnApplicationInitialization` (this is where most ASP.NET Core middleware pipelines are configured via `app.UseConfiguredEndpoints()` and friends).
+3. `OnPostApplicationInitializationAsync` — every module that implements `IOnPostApplicationInitialization` (typically reserved for warm-up calls that must run after the middleware pipeline is fully built).
+
+Each contributor is a tiny adapter — for example:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DefaultModuleLifecycleContributor.cs"
+public class OnApplicationInitializationModuleLifecycleContributor : ModuleLifecycleContributorBase
+{
+    public async override Task InitializeAsync(ApplicationInitializationContext context, IAbpModule module)
+    {
+        if (module is IOnApplicationInitialization onApplicationInitialization)
+        {
+            await onApplicationInitialization.OnApplicationInitializationAsync(context);
+        }
+    }
+    /* ... */
+}
+```
+
+A typical `OnApplicationInitialization` for an ASP.NET Core module composes the middleware pipeline in this exact phase:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+
+    app.UseAbpRequestLocalization();
+    app.UseRouting();
+    app.UseAuthentication();
+    app.UseAuthorization();
+    app.UseUnitOfWork();
+    app.UseConfiguredEndpoints();
+}
+```
+
+The order of `UseXxx` calls inside a single module's hook matters; the order of **modules** is the topological order computed back in stage 3.
+
+## Stage 6 — Steady state and shutdown
+
+After `InitializeModulesAsync` returns, the host completes its own startup and the application begins accepting work. `IHostApplicationLifetime` already holds the registrations made by `InitializeApplicationAsync`:
+
+- `ApplicationStopping` → `application.ShutdownAsync()`
+- `ApplicationStopped` → `application.Dispose()`
+
+`ShutdownAsync` mirrors `InitializeAsync` in reverse:
+
+```csharp title="framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"
+public virtual async Task ShutdownAsync()
+{
+    using (var scope = ServiceProvider.CreateScope())
+    {
+        await scope.ServiceProvider
+            .GetRequiredService<IModuleManager>()
+            .ShutdownModulesAsync(new ApplicationShutdownContext(scope.ServiceProvider));
+    }
+}
+```
+
+`ModuleManager.ShutdownModulesAsync` reverses the module list (`_moduleContainer.Modules.Reverse()`) so that dependents shut down before their dependencies, and then runs the `OnApplicationShutdownModuleLifecycleContributor` against each one.
+
+## What runs when — a quick reference
+
+<AccordionGroup>
+<Accordion title="DI container is not built yet" defaultOpen="true">
+During `PreConfigureServices`, `ConfigureServices`, and `PostConfigureServices` you can only call into the `IServiceCollection`. There is no `IServiceProvider`. Anything you need at this stage must come from singletons registered via `services.GetSingletonInstance<T>()` (the framework keeps a small allow-list of helpers — `IAbpHostEnvironment`, `IModuleContainer`, `IConfiguration`, etc.).
+</Accordion>
+
+<Accordion title="DI container exists but middleware is not configured">
+`OnPreApplicationInitialization` runs after the SP is built but before most modules have called `app.UseXxx`. This is a good place to schedule work that must execute before the request pipeline (e.g. cache warm-up, data seeding through `IDataSeeder`, or migrating distributed-event outbox tables).
+</Accordion>
+
+<Accordion title="Middleware pipeline is being assembled">
+`OnApplicationInitialization` is when the middleware order is materialized. Module dependency order plus the order of `app.UseXxx` calls inside each hook together define the runtime pipeline that requests traverse — see [Request lifecycle (MVC)](/flows/request-lifecycle-mvc).
+</Accordion>
+
+<Accordion title="Everything is up; do final hooks">
+`OnPostApplicationInitialization` runs after every other module — including the startup module — has had its `OnApplicationInitialization` callback. The startup module is intentionally last because `SortByDependency` moved it to the end of the list in stage 3.
+</Accordion>
+</AccordionGroup>
+
+## Failure modes and observability
+
+Every phase wraps its module callback in a `try`/`catch` that re-throws as an `AbpInitializationException` carrying the failing module's `AssemblyQualifiedName`. So when you see:
+
+```text
+An error occurred during ConfigureServicesAsync phase of the module
+Volo.Abp.Identity.AbpIdentityDomainModule, ... See the inner exception for details.
+```
+
+…you know exactly which phase and which module the framework was inside. The same wrapper exists for the `Pre`/`Post` phases and for the lifecycle contributors during `InitializeModulesAsync`.
+
+`AbpApplicationBase.WriteInitLogs` flushes the buffered `IInitLogger<AbpApplicationBase>` entries through the just-built `ILogger<AbpApplicationBase>`, which is why the `"Loaded ABP modules:"` tree shows up just before `"Initialized all ABP modules."` in your logs — the tree was captured during stage 3 when no `ILogger` existed yet.
+
+## Where to go next
+
+- The **[Module loader and dependency sort](/modularity/overview)** page walks through the topological sort algorithm and the rules for `[DependsOn]` cycles.
+- The **[Conventional service registration](/di/conventional-registration)** page explains what `services.AddAssembly(assembly)` does during stage 4 and how the four interceptor registrars hook in.
+- The **[Application initialization contributors](/modularity/module-lifecycle)** page documents how to add your own `IModuleLifecycleContributor`.
+- For the next hop after startup completes, see **[Request lifecycle (MVC)](/flows/request-lifecycle-mvc)** which picks up the trace from the first HTTP request.
+- For console / worker hosts the **[Background job execution](/flows/background-job-execution)** flow shows what `await app.InitializeAsync()` unblocks.

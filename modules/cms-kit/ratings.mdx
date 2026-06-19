@@ -1,0 +1,365 @@
+---
+title: "CMS Kit Ratings: Per-User Star Counts on Any Entity"
+sidebarTitle: "Ratings"
+description: "Rating aggregate keyed by entity type and id, IRatingRepository, RatingManager domain service, grouped star-count query, and the public IRatingPublicAppService gated by RatingsFeature."
+---
+
+The CMS Kit Ratings feature lets any registered entity collect a one‑per‑user star rating between `MinStarCount` and `MaxStarCount` (1‑5 by default). The model is intentionally minimal — a single `Rating` aggregate keyed by `(EntityType, EntityId, CreatorId)`, a `RatingManager.SetStarAsync` that updates‑or‑inserts on a per‑user basis, and a grouped aggregation query that returns the distribution (`"5 stars: 12 ratings, 4 stars: 3, …"`). There is no admin app service — moderation of ratings is rare enough that the module assumes you will fall back to direct repository access if you ever need it. This page maps the source under `Volo.CmsKit.Domain/Volo/CmsKit/Ratings/`, lists every type and signature, and shows the public app service that drives the star widget.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings). Ratings on blog posts are registered automatically — see [Blogs](/modules/cms-kit/blogs).
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/"
+Rating.cs
+RatingManager.cs
+IRatingRepository.cs
+CmsKitRatingOptions.cs
+RatingEntityTypeDefinition.cs
+IRatingEntityTypeDefinitionStore.cs
+DefaultRatingEntityTypeDefinitionStore.cs
+RatingWithStarCountQueryResultItem.cs
+EntityCantHaveRatingException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `Rating.cs` | `BasicAggregateRoot<Guid>` | One row per `(EntityType, EntityId, CreatorId)`, with `StarCount` |
+| `RatingManager.cs` | `DomainService` | Upsert: `SetStarAsync(user, entityType, entityId, count)` |
+| `IRatingRepository.cs` | interface | Current user rating lookup, grouped star aggregation |
+| `CmsKitRatingOptions.cs` | options | List of allowed `RatingEntityTypeDefinition` |
+| `RatingEntityTypeDefinition.cs` | DTO | Marker — "this entity type can be rated" |
+| `IRatingEntityTypeDefinitionStore.cs` / `DefaultRatingEntityTypeDefinitionStore.cs` | interface + impl | Lookup over the options list |
+| `RatingWithStarCountQueryResultItem.cs` | DTO | `(StarCount, Count)` projection |
+| `EntityCantHaveRatingException.cs` | `BusinessException` | Raised on an unregistered entity type |
+
+## Domain model
+
+```mermaid
+erDiagram
+    RATING {
+        Guid Id PK
+        string EntityType
+        string EntityId
+        short StarCount
+        Guid CreatorId
+        DateTime CreationTime
+        Guid? TenantId
+    }
+```
+
+The aggregate carries no explicit foreign key — `EntityType` plus `EntityId` describe the target, and `CreatorId` (an `IUser.Id`) identifies the rater. The combination of all three is the natural key the repository enforces.
+
+### `Rating`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/Rating.cs"
+public class Rating : BasicAggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator
+{
+    public virtual Guid?    TenantId    { get; protected set; }
+    public virtual string   EntityType  { get; protected set; }
+    public virtual string   EntityId    { get; protected set; }
+    public virtual short    StarCount   { get; protected set; }
+    public virtual Guid     CreatorId   { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+
+    internal Rating(
+        Guid id,
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        short starCount,
+        Guid creatorId,
+        Guid? tenantId = null) : base(id)
+    {
+        EntityType = Check.NotNullOrWhiteSpace(entityType, nameof(entityType), RatingConsts.MaxEntityTypeLength);
+        EntityId = Check.NotNullOrWhiteSpace(entityId, nameof(entityId), RatingConsts.MaxEntityIdLength);
+        SetStarCount(starCount);
+        CreatorId = creatorId;
+        TenantId = tenantId;
+    }
+
+    public virtual void SetStarCount(short starCount)
+    {
+        if (starCount <= RatingConsts.MaxStarCount && starCount >= RatingConsts.MinStarCount)
+        {
+            StarCount = starCount;
+        }
+        else
+        {
+            throw new ArgumentOutOfRangeException(
+                $"Choosen star must between {RatingConsts.MinStarCount} and {RatingConsts.MaxStarCount}");
+        }
+    }
+}
+```
+
+`StarCount` is a `short` — half stars are not supported. The range check is done in the aggregate itself rather than the DTO so any caller (even direct repository writes from a test) cannot create an out‑of‑band rating.
+
+### `RatingManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/RatingManager.cs"
+public class RatingManager : DomainService
+{
+    protected IRatingRepository RatingRepository { get; }
+    protected IRatingEntityTypeDefinitionStore RatingDefinitionStore { get; }
+
+    public async Task<Rating> SetStarAsync(
+        CmsUser user, string entityType, string entityId, short starCount)
+    {
+        var currentUserRating = await RatingRepository.GetCurrentUserRatingAsync(
+            entityType, entityId, user.Id);
+
+        if (currentUserRating != null)
+        {
+            currentUserRating.SetStarCount(starCount);
+            return await RatingRepository.UpdateAsync(currentUserRating);
+        }
+
+        if (!await RatingDefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityCantHaveRatingException(entityType);
+        }
+
+        return await RatingRepository.InsertAsync(
+            new Rating(
+                GuidGenerator.Create(),
+                entityType, entityId,
+                starCount, user.Id,
+                CurrentTenant.Id));
+    }
+}
+```
+
+`SetStarAsync` is an *upsert*:
+
+1. If the user already rated this entity, update the existing row.
+2. Otherwise, check the entity type is registered, then insert.
+
+Note the asymmetry: the definition check only runs on insert. This is fine because if a row already exists, the type was valid at insertion time and the definition store still references it implicitly. Disabling a rating entity type does not break or hide existing ratings.
+
+## Registering ratable entity types
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/CmsKitRatingOptions.cs"
+public class CmsKitRatingOptions
+{
+    [NotNull]
+    public List<RatingEntityTypeDefinition> EntityTypes { get; } = new();
+}
+```
+
+The CMS Kit domain module wires blog posts in automatically when both `RatingsFeature` and `BlogsFeature` are globally enabled:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/CmsKitDomainModule.cs"
+if (GlobalFeatureManager.Instance.IsEnabled<RatingsFeature>())
+{
+    Configure<CmsKitRatingOptions>(options =>
+    {
+        if (GlobalFeatureManager.Instance.IsEnabled<BlogsFeature>())
+        {
+            options.EntityTypes.Add(new RatingEntityTypeDefinition(BlogPostConsts.EntityType));
+        }
+        // TODO: Define entity types here which can be rated.
+    });
+}
+```
+
+Your application module adds custom entity types the same way:
+
+```csharp
+Configure<CmsKitRatingOptions>(options =>
+{
+    options.EntityTypes.Add(new RatingEntityTypeDefinition("Product"));
+});
+```
+
+`DefaultRatingEntityTypeDefinitionStore` is the default lookup over that list, used by `RatingManager.SetStarAsync`.
+
+## `IRatingRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Ratings/IRatingRepository.cs"
+public interface IRatingRepository : IBasicRepository<Rating, Guid>
+{
+    Task<Rating> GetCurrentUserRatingAsync(
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        Guid userId,
+        CancellationToken cancellationToken = default);
+
+    Task<List<RatingWithStarCountQueryResultItem>> GetGroupedStarCountsAsync(
+        [NotNull] string entityType,
+        [NotNull] string entityId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Two specialised methods plus the standard `IBasicRepository`:
+
+- **`GetCurrentUserRatingAsync`** — single row lookup by `(EntityType, EntityId, UserId)`. Returns `null` for users who haven't voted. Used by both the manager (to decide insert vs update) and the public app service (to compute `IsSelectedByCurrentUser`).
+- **`GetGroupedStarCountsAsync`** — server‑side `GROUP BY StarCount` aggregation. Returns one `RatingWithStarCountQueryResultItem` per non‑empty star value. The EF Core implementation issues `SELECT StarCount, COUNT(*) FROM Ratings WHERE EntityType = @t AND EntityId = @i GROUP BY StarCount`. The Mongo implementation runs an equivalent `$group` pipeline.
+
+```csharp
+public class RatingWithStarCountQueryResultItem
+{
+    public short StarCount { get; set; }
+    public int   Count     { get; set; }
+}
+```
+
+## Public app service
+
+There is no admin app service for ratings — the contract for the back‑office assumes that ratings are user‑contributed content that admins do not edit, only delete (which is handled at the repository level via maintenance tooling).
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Ratings/IRatingPublicAppService.cs"
+public interface IRatingPublicAppService : IApplicationService
+{
+    Task<RatingDto> CreateAsync(string entityType, string entityId, CreateUpdateRatingInput input);
+    Task DeleteAsync(string entityType, string entityId);
+    Task<List<RatingWithStarCountDto>> GetGroupedStarCountsAsync(string entityType, string entityId);
+}
+```
+
+The input shape uses ABP's `DynamicRange` validator so the bound check matches the aggregate's:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Ratings/CreateUpdateRatingInput.cs"
+public class CreateUpdateRatingInput
+{
+    [Required]
+    [DynamicRange(
+        typeof(RatingConsts), typeof(int),
+        nameof(RatingConsts.MinStarCount),
+        nameof(RatingConsts.MaxStarCount))]
+    public short StarCount { get; set; }
+}
+```
+
+Notice the method name is `CreateAsync` even though `RatingManager.SetStarAsync` is actually an upsert — a user calling `CreateAsync` twice does not error; the second call updates the existing rating.
+
+### Implementation
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Ratings/RatingPublicAppService.cs"
+[RequiresFeature(CmsKitFeatures.RatingEnable)]
+[RequiresGlobalFeature(typeof(RatingsFeature))]
+public class RatingPublicAppService : CmsKitPublicAppServiceBase, IRatingPublicAppService
+{
+    protected IRatingRepository RatingRepository { get; }
+    public ICmsUserLookupService CmsUserLookupService { get; }
+    protected RatingManager RatingManager { get; }
+
+    [Authorize]
+    public virtual async Task<RatingDto> CreateAsync(
+        string entityType, string entityId, CreateUpdateRatingInput input)
+    {
+        var userId = CurrentUser.GetId();
+        var user = await CmsUserLookupService.GetByIdAsync(userId);
+
+        var rating = await RatingManager.SetStarAsync(user, entityType, entityId, input.StarCount);
+
+        return ObjectMapper.Map<Rating, RatingDto>(rating);
+    }
+
+    [Authorize]
+    public virtual async Task DeleteAsync(string entityType, string entityId)
+    {
+        var rating = await RatingRepository.GetCurrentUserRatingAsync(
+            entityType, entityId, CurrentUser.GetId());
+
+        if (rating.CreatorId != CurrentUser.GetId())
+        {
+            throw new AbpAuthorizationException();
+        }
+
+        await RatingRepository.DeleteAsync(rating.Id);
+    }
+
+    public virtual async Task<List<RatingWithStarCountDto>> GetGroupedStarCountsAsync(
+        string entityType, string entityId)
+    {
+        var ratings = await RatingRepository.GetGroupedStarCountsAsync(entityType, entityId);
+
+        var userRatingOrNull = CurrentUser.IsAuthenticated
+            ? await RatingRepository.GetCurrentUserRatingAsync(entityType, entityId, CurrentUser.GetId())
+            : null;
+
+        var ratingWithStarCountDto = new List<RatingWithStarCountDto>();
+
+        foreach (var rating in ratings)
+        {
+            ratingWithStarCountDto.Add(
+                new RatingWithStarCountDto
+                {
+                    StarCount = rating.StarCount,
+                    Count = rating.Count,
+                    IsSelectedByCurrentUser =
+                        userRatingOrNull != null && userRatingOrNull.StarCount == rating.StarCount
+                });
+        }
+
+        return ratingWithStarCountDto;
+    }
+}
+```
+
+Two things to call out:
+
+- `GetGroupedStarCountsAsync` is **anonymous‑readable** but conditionally enriches each bucket with `IsSelectedByCurrentUser` when the caller is authenticated. The current user's rating is fetched once and compared in‑memory rather than joined in the grouped query.
+- `DeleteAsync` defensively re‑checks `rating.CreatorId != CurrentUser.GetId()` even though `GetCurrentUserRatingAsync(..., CurrentUser.GetId())` already filtered by the caller. This belt‑and‑braces guard catches the impossible‑but‑future case of the repository signature changing.
+
+### DTOs
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Ratings/RatingDto.cs"
+public class RatingDto
+{
+    public Guid     Id           { get; set; }
+    public string   EntityType   { get; set; }
+    public string   EntityId     { get; set; }
+    public short    StarCount    { get; set; }
+    public Guid     CreatorId    { get; set; }
+    public DateTime CreationTime { get; set; }
+}
+```
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Ratings/RatingWithStarCountDto.cs"
+public class RatingWithStarCountDto
+{
+    public short StarCount               { get; set; }
+    public int   Count                   { get; set; }
+    public bool  IsSelectedByCurrentUser { get; set; }
+}
+```
+
+## Feature flags
+
+- **Global feature** [`RatingsFeature`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/RatingsFeature.cs) — name `CmsKit.Ratings`.
+- **Per‑tenant feature** `CmsKitFeatures.RatingEnable`.
+
+Without `RatingsFeature`, `CmsKitDomainModule` skips the rating options registration entirely — the type system stays clean, no rating routes are exposed, and no DI registrations land.
+
+## EF Core and MongoDB
+
+```csharp
+options.AddRepository<Rating, EfCoreRatingRepository>();
+```
+
+The EF entity builder adds a unique index on `(EntityType, EntityId, CreatorId)` so the upsert path is a single index‑seek check. Without this index, concurrent first‑time votes from the same user could create duplicate rows. The MongoDB implementation declares the same compound index on the `Ratings` collection.
+
+## Permissions
+
+There are no rating permissions in either `CmsKitAdminPermissions` or `CmsKitPublicPermissions`. The public service relies purely on `[Authorize]` (caller must be authenticated) plus the `CreatorId == CurrentUser.GetId()` guard inside `DeleteAsync`. See [Permission System](/authz/permission-system) for how to add your own if you want fine‑grained moderation.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Ratings sits in the package matrix.
+  </Card>
+  <Card title="Blogs" icon="rss" href="/modules/cms-kit/blogs">
+    Blog posts are the only entity type registered for ratings out of the box.
+  </Card>
+  <Card title="Reactions" icon="face-smile" href="/modules/cms-kit/reactions">
+    Emoji reactions — a similar pattern with a definition store and per‑user uniqueness.
+  </Card>
+  <Card title="Admin / Public split" icon="layer-group" href="/modules/cms-kit/admin-public-split">
+    Why ratings have no admin app service.
+  </Card>
+</CardGroup>

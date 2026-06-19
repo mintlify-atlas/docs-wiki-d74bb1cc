@@ -1,0 +1,715 @@
+---
+title: "Audit helper, store, scope, and contributors in Volo.Abp.Auditing"
+sidebarTitle: "Helper & contributors"
+description: "Full enumeration of IAuditingHelper, IAuditingStore, IAuditLogScope, AmbientAuditingScope, AuditLogContributor, AbpAuditingOptions selectors, and how each decides what becomes an audit log."
+---
+
+`AuditingManager` is only the choreographer. The real decisions — *should this method call be recorded?*, *should this entity type produce history rows?*, *what extra fields go onto the in-flight `AuditLogInfo`?* — live in `IAuditingHelper`, the registered `IAuditingStore`, the ambient `IAuditLogScope`, and the `AuditLogContributor` chain configured through `AbpAuditingOptions`. This page enumerates every one of those collaborators with the actual signatures from `framework/src/Volo.Abp.Auditing`, so you can tell at a glance which abstraction you should extend for a given customisation.
+
+For the high-level picture of how these pieces are wired into a request, start with the [auditing overview](/auditing/overview). For the persistence side that consumes the `AuditLogInfo` produced here, see the [audit logging module](/modules/audit-logging).
+
+## File inventory
+
+Every file referenced on this page sits in `framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing`:
+
+| File | Role |
+| --- | --- |
+| `IAuditingHelper.cs` | Decision API: `ShouldSaveAudit`, `IsEntityHistoryEnabled`, factories for `AuditLogInfo` and `AuditLogActionInfo`. |
+| `AuditingHelper.cs` | Default implementation; the only place that snapshots ambient identity. |
+| `IAuditingStore.cs` | Single-method sink: `Task SaveAsync(AuditLogInfo)`. |
+| `SimpleLogAuditingStore.cs` | Default sink — logs `auditInfo.ToString()`. Replaced by `AuditingStore` when the audit-logging module is referenced. |
+| `IAuditLogScope.cs` | One property: the in-flight `AuditLogInfo Log`. |
+| `AuditLogScope.cs` | Default scope implementation — a frozen reference to the `AuditLogInfo` created at `BeginScope`. |
+| `IAuditLogSaveHandle.cs` | The `IDisposable` returned by `BeginScope`; exposes `SaveAsync()`. |
+| `IAuditingManager.cs` | `Current` and `BeginScope()` — see the [overview](/auditing/overview). |
+| `AuditingManager.cs` | Default manager — wraps `IAmbientScopeProvider<IAuditLogScope>`. |
+| `AuditLogContributor.cs` | Abstract base for contributors: virtual `PreContribute` and `PostContribute`. |
+| `AuditLogContributionContext.cs` | Argument passed to contributors — exposes `ServiceProvider` and `AuditInfo`. |
+| `AbpAuditingOptions.cs` | The options bag. All the toggles live here. |
+| `AuditingInterceptor.cs` | Dynamic-proxy interceptor that records `AuditLogActionInfo` for `[Audited]` methods. |
+| `AuditingInterceptorRegistrar.cs` | Registers the interceptor against the right types during DI setup. |
+| `IAuditPropertySetter.cs` / `AuditPropertySetter.cs` | Stamps `IHasCreationTime`/`IHasModificationTime`/`IDeletionAuditedObject` properties. |
+| `JsonAuditSerializer.cs` | Default `IAuditSerializer` — serialises method parameters into `AuditLogActionInfo.Parameters`. |
+| `EntityHistorySelectorList.cs` / `IEntityHistorySelectorList.cs` | The `NamedTypeSelector` list used by `IsEntityHistoryEnabled`. |
+
+## IAuditingHelper: the decision API
+
+Two methods decide what gets logged; three more build the log records:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditingHelper.cs"
+public interface IAuditingHelper
+{
+    bool ShouldSaveAudit(MethodInfo? methodInfo, bool defaultValue = false, bool ignoreIntegrationServiceAttribute = false);
+
+    bool IsEntityHistoryEnabled(Type entityType, bool defaultValue = false);
+
+    AuditLogInfo CreateAuditLogInfo();
+
+    AuditLogActionInfo CreateAuditLogAction(
+        AuditLogInfo auditLog,
+        Type? type,
+        MethodInfo method,
+        object?[] arguments
+    );
+
+    AuditLogActionInfo CreateAuditLogAction(
+        AuditLogInfo auditLog,
+        Type? type,
+        MethodInfo method,
+        IDictionary<string, object?> arguments
+    );
+}
+```
+
+### ShouldSaveAudit
+
+`ShouldSaveAudit` is called by `AuditingInterceptor.ShouldIntercept`. The full implementation:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingHelper.cs"
+public virtual bool ShouldSaveAudit(
+    MethodInfo? methodInfo,
+    bool defaultValue = false,
+    bool ignoreIntegrationServiceAttribute = false)
+{
+    if (methodInfo == null) return false;
+    if (!methodInfo.IsPublic) return false;
+
+    if (methodInfo.IsDefined(typeof(AuditedAttribute), true))
+        return true;
+
+    if (methodInfo.IsDefined(typeof(DisableAuditingAttribute), true))
+        return false;
+
+    var classType = methodInfo.DeclaringType;
+    if (classType != null)
+    {
+        var shouldAudit = AuditingInterceptorRegistrar
+            .ShouldAuditTypeByDefaultOrNull(classType, ignoreIntegrationServiceAttribute);
+        if (shouldAudit != null)
+            return shouldAudit.Value;
+    }
+
+    return defaultValue;
+}
+```
+
+The order matters:
+
+1. Non-public methods are never audited.
+2. A `[Audited]` attribute on the method always wins.
+3. A `[DisableAuditing]` attribute on the method always loses.
+4. Otherwise defer to `AuditingInterceptorRegistrar.ShouldAuditTypeByDefaultOrNull`, which checks the *type*:
+   - `[Audited]` on the type → `true`.
+   - `[DisableAuditing]` on the type → `false`.
+   - `IAuditingEnabled` marker interface → `true` (unless the type carries `[IntegrationService]` *and* `ignoreIntegrationServiceAttribute == false`).
+   - No verdict → `null`.
+5. Fall through to `defaultValue` (always `false` from the interceptor; the HTTP layer flips it to `true` when needed).
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingInterceptorRegistrar.cs"
+public static bool? ShouldAuditTypeByDefaultOrNull(Type type, bool ignoreIntegrationServiceAttribute)
+{
+    if (type.IsDefined(typeof(AuditedAttribute), true))
+        return true;
+
+    if (type.IsDefined(typeof(DisableAuditingAttribute), true))
+        return false;
+
+    if (typeof(IAuditingEnabled).IsAssignableFrom(type))
+    {
+        if (ignoreIntegrationServiceAttribute ||
+            !IntegrationServiceAttribute.IsDefinedOrInherited(type))
+        {
+            return true;
+        }
+    }
+
+    return null;
+}
+```
+
+`IApplicationService` and `IController` extend `IAuditingEnabled` indirectly, which is why app services and MVC controllers are audited automatically.
+
+### IsEntityHistoryEnabled
+
+`IsEntityHistoryEnabled` is called by EF Core's `AbpDbContext` (and the equivalent MongoDB plumbing) before extracting an `EntityChangeInfo` from a tracked entry:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingHelper.cs"
+public virtual bool IsEntityHistoryEnabled(Type entityType, bool defaultValue = false)
+{
+    if (!entityType.IsPublic) return false;
+
+    if (Options.IgnoredTypes.Any(t => t.IsAssignableFrom(entityType)))
+        return false;
+
+    if (entityType.IsDefined(typeof(AuditedAttribute), true))
+        return true;
+
+    foreach (var propertyInfo in entityType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+    {
+        if (propertyInfo.IsDefined(typeof(AuditedAttribute)))
+            return true;
+    }
+
+    if (entityType.IsDefined(typeof(DisableAuditingAttribute), true))
+        return false;
+
+    if (Options.EntityHistorySelectors.Any(selector => selector.Predicate(entityType)))
+        return true;
+
+    return defaultValue;
+}
+```
+
+Several knobs come together here:
+
+| Source | Effect |
+| --- | --- |
+| `Options.IgnoredTypes` | Hard block — `Stream`, `Expression`, `CancellationToken` by default. |
+| `[Audited]` on the entity type | Force-enable history for the whole entity. |
+| `[Audited]` on any public property | Force-enable history (even if the class has no class-level attribute). |
+| `[DisableAuditing]` on the entity type | Force-disable, after the property scan. |
+| `Options.EntityHistorySelectors` | A named predicate list — first match wins. `AddAllEntities()` is the common shortcut. |
+| `defaultValue` | The provider-side default (usually `false`). |
+
+### CreateAuditLogInfo and CreateAuditLogAction
+
+`CreateAuditLogInfo` is the single point where ambient identity is captured:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingHelper.cs"
+public virtual AuditLogInfo CreateAuditLogInfo()
+{
+    var auditInfo = new AuditLogInfo
+    {
+        ApplicationName = Options.ApplicationName,
+        TenantId = CurrentTenant.Id,
+        TenantName = CurrentTenant.Name,
+        UserId = CurrentUser.Id,
+        UserName = CurrentUser.UserName,
+        ClientId = CurrentClient.Id,
+        CorrelationId = CorrelationIdProvider.Get(),
+        ExecutionTime = Clock.Now,
+        ImpersonatorUserId = CurrentUser.FindImpersonatorUserId(),
+        ImpersonatorUserName = CurrentUser.FindImpersonatorUserName(),
+        ImpersonatorTenantId = CurrentUser.FindImpersonatorTenantId(),
+        ImpersonatorTenantName = CurrentUser.FindImpersonatorTenantName(),
+    };
+
+    ExecutePreContributors(auditInfo);
+    return auditInfo;
+}
+```
+
+The dependencies it pulls from DI are the canonical ABP ambient services:
+
+- `ICurrentUser`, `ICurrentTenant`, `ICurrentClient` from the security/multi-tenancy stack.
+- `IClock` for `ExecutionTime` (UTC vs. local controlled by `AbpClockOptions`).
+- `ICorrelationIdProvider` (`Volo.Abp.Tracing`) for `CorrelationId`.
+
+`CreateAuditLogAction` is the per-method-call builder. It converts `object?[]` arguments to a name→value dictionary, then serialises via `IAuditSerializer`:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingHelper.cs"
+public virtual AuditLogActionInfo CreateAuditLogAction(
+    AuditLogInfo auditLog,
+    Type? type,
+    MethodInfo method,
+    IDictionary<string, object?> arguments)
+{
+    var actionInfo = new AuditLogActionInfo
+    {
+        ServiceName = type != null ? type.FullName! : "",
+        MethodName = method.Name,
+        Parameters = SerializeConvertArguments(arguments),
+        ExecutionTime = Clock.Now
+    };
+    return actionInfo;
+}
+```
+
+`SerializeConvertArguments` walks each argument, replaces values whose type appears in `Options.IgnoredTypes` with `null`, and runs the result through the registered `IAuditSerializer`. On any serialisation error it logs a warning and returns `"{}"` — so a bad serialiser never breaks the request:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingHelper.cs"
+protected virtual string SerializeConvertArguments(IDictionary<string, object?> arguments)
+{
+    try
+    {
+        if (arguments.IsNullOrEmpty()) return "{}";
+        var dictionary = new Dictionary<string, object?>();
+        foreach (var argument in arguments)
+        {
+            if (argument.Value != null && Options.IgnoredTypes.Any(t => t.IsInstanceOfType(argument.Value)))
+                dictionary[argument.Key] = null;
+            else
+                dictionary[argument.Key] = argument.Value;
+        }
+        return AuditSerializer.Serialize(dictionary);
+    }
+    catch (Exception ex)
+    {
+        Logger.LogException(ex, LogLevel.Warning);
+        return "{}";
+    }
+}
+```
+
+## IAuditSerializer and JsonAuditSerializer
+
+The parameter serialiser is a one-method interface so anyone can swap it:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditSerializer.cs"
+public interface IAuditSerializer
+{
+    string Serialize(object obj);
+}
+```
+
+The default implementation uses `System.Text.Json` with a custom `TypeInfoResolver` that honours `[DisableAuditing]` at three levels (class, property, declaring type) and skips properties whose type is in `Options.IgnoredTypes`:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/JsonAuditSerializer.cs"
+public class JsonAuditSerializer : IAuditSerializer, ITransientDependency
+{
+    public string Serialize(object obj)
+        => JsonSerializer.Serialize(obj, CreateJsonSerializerOptions());
+
+    protected virtual JsonSerializerOptions CreateJsonSerializerOptions()
+    {
+        return JsonSerializerOptionsCache.GetOrAdd(nameof(JsonAuditSerializer), _ =>
+        {
+            var settings = new JsonSerializerOptions()
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+                {
+                    Modifiers =
+                    {
+                        jsonTypeInfo =>
+                        {
+                            if (Options.IgnoredTypes.Any(t => t.IsAssignableFrom(jsonTypeInfo.Type)) ||
+                                jsonTypeInfo.Type.GetCustomAttributes(typeof(DisableAuditingAttribute), false).Any())
+                            {
+                                if (jsonTypeInfo.Kind == JsonTypeInfoKind.Object)
+                                    jsonTypeInfo.Properties.Clear();
+                            }
+
+                            foreach (var property in jsonTypeInfo.Properties)
+                            {
+                                if (Options.IgnoredTypes.Any(t => t.IsAssignableFrom(property.PropertyType)))
+                                    property.ShouldSerialize = (_, _) => false;
+
+                                if (property.AttributeProvider != null &&
+                                    property.AttributeProvider.GetCustomAttributes(typeof(DisableAuditingAttribute), false).Any())
+                                    property.ShouldSerialize = (_, _) => false;
+                            }
+                        }
+                    }
+                }
+            };
+            return settings;
+        });
+    }
+}
+```
+
+The `JsonSerializerOptions` are cached after first use, so the reflection-driven `Modifiers` only run once per process.
+
+## IAuditingStore and SimpleLogAuditingStore
+
+Saving is intentionally one-shot. There is no batching, no flush window — `AuditingManager.SaveAsync` calls `IAuditingStore.SaveAsync` exactly once per scope.
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditingStore.cs"
+public interface IAuditingStore
+{
+    Task SaveAsync(AuditLogInfo auditInfo);
+}
+```
+
+The default, registered with `TryRegister = true`:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/SimpleLogAuditingStore.cs"
+[Dependency(TryRegister = true)]
+public class SimpleLogAuditingStore : IAuditingStore, ISingletonDependency
+{
+    public ILogger<SimpleLogAuditingStore> Logger { get; set; }
+    public SimpleLogAuditingStore() { Logger = NullLogger<SimpleLogAuditingStore>.Instance; }
+
+    public Task SaveAsync(AuditLogInfo auditInfo)
+    {
+        Logger.LogInformation(auditInfo.ToString());
+        return Task.FromResult(0);
+    }
+}
+```
+
+The `TryRegister = true` makes it a no-op once a real `IAuditingStore` is registered — that is precisely how the [audit-logging module's `AuditingStore`](/modules/audit-logging) supersedes it without any explicit swap.
+
+<Tip>
+If you only need an alternate sink (e.g. write audit logs to Elasticsearch instead of SQL), implement `IAuditingStore` and register it as a normal singleton — your registration wins and `SimpleLogAuditingStore` drops out.
+</Tip>
+
+## IAuditLogScope and the ambient flow
+
+The scope itself is a one-property contract:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditLogScope.cs"
+public interface IAuditLogScope
+{
+    AuditLogInfo Log { get; }
+}
+```
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditLogScope.cs"
+public class AuditLogScope : IAuditLogScope
+{
+    public AuditLogInfo Log { get; }
+    public AuditLogScope(AuditLogInfo log) { Log = log; }
+}
+```
+
+`AuditingManager` stores this through `IAmbientScopeProvider<IAuditLogScope>` (the same mechanism that drives [unit of work](/uow) ambient flow). The provider, in turn, stashes the value into an `AsyncLocal<T>` keyed by `"Volo.Abp.Auditing.IAuditLogScope"`, so the scope flows across `await` boundaries naturally — but does **not** leak across thread-pool threads that don't share the async context.
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingManager.cs"
+private const string AmbientContextKey = "Volo.Abp.Auditing.IAuditLogScope";
+
+public IAuditLogScope? Current => _ambientScopeProvider.GetValue(AmbientContextKey);
+
+public IAuditLogSaveHandle BeginScope()
+{
+    var ambientScope = _ambientScopeProvider.BeginScope(
+        AmbientContextKey,
+        new AuditLogScope(_auditingHelper.CreateAuditLogInfo())
+    );
+    return new DisposableSaveHandle(this, ambientScope, Current!.Log, Stopwatch.StartNew());
+}
+```
+
+Two practical consequences:
+
+1. From anywhere — middleware, a contributor, an EF Core SaveChanges interceptor — you can call `auditingManager.Current?.Log.EntityChanges.Add(...)` to enrich the in-flight record.
+2. Inside a background worker that does *not* run inside an audit scope, `Current` is `null`. The worker must call `BeginScope()` itself, or the `AuditingInterceptor` will do it lazily via `ProcessWithNewAuditingScopeAsync` for the first intercepted call.
+
+## AuditingInterceptor: who actually calls all of this
+
+The interceptor is the consumer of every API above. The short version:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingInterceptor.cs"
+public override async Task InterceptAsync(IAbpMethodInvocation invocation)
+{
+    using (var serviceScope = _serviceScopeFactory.CreateScope())
+    {
+        var auditingHelper = serviceScope.ServiceProvider.GetRequiredService<IAuditingHelper>();
+        var auditingOptions = serviceScope.ServiceProvider.GetRequiredService<IOptions<AbpAuditingOptions>>().Value;
+
+        if (!ShouldIntercept(invocation, auditingOptions, auditingHelper))
+        {
+            await invocation.ProceedAsync();
+            return;
+        }
+
+        var auditingManager = serviceScope.ServiceProvider.GetRequiredService<IAuditingManager>();
+        if (auditingManager.Current != null)
+        {
+            await ProceedByLoggingAsync(invocation, auditingOptions, auditingHelper, auditingManager.Current);
+        }
+        else
+        {
+            var currentUser = serviceScope.ServiceProvider.GetRequiredService<ICurrentUser>();
+            var unitOfWorkManager = serviceScope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+            await ProcessWithNewAuditingScopeAsync(
+                invocation, auditingOptions, currentUser, auditingManager, auditingHelper, unitOfWorkManager);
+        }
+    }
+}
+```
+
+`ShouldIntercept` short-circuits when:
+
+- `AbpAuditingOptions.IsEnabled` is `false`, or
+- The cross-cutting concern marker `AbpCrossCuttingConcerns.Auditing` is already applied (so manual `IAuditingManager.BeginScope` calls don't recurse), or
+- `auditingHelper.ShouldSaveAudit(invocation.Method, ignoreIntegrationServiceAttribute: options.IsEnabledForIntegrationServices)` returns `false`.
+
+The interceptor is registered by `AuditingInterceptorRegistrar.RegisterIfNeeded`, hooked from `AbpAuditingModule.PreConfigureServices`. The registrar only attaches the interceptor when the type itself looks auditable — that is, it satisfies `ShouldAuditTypeByDefaultOrNull(type, ignoreIntegrationServiceAttribute: true) == true` or has at least one `[Audited]` method.
+
+## AuditLogContributor: the Pre/Post hook
+
+Contributors are the public extension surface for enriching `AuditLogInfo`. The abstract base has two virtual hooks:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditLogContributor.cs"
+public abstract class AuditLogContributor
+{
+    public virtual void PreContribute(AuditLogContributionContext context) { }
+    public virtual void PostContribute(AuditLogContributionContext context) { }
+}
+```
+
+The context exposes the mutable `AuditLogInfo` and a scoped `IServiceProvider` so contributors can resolve whatever they need:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditLogContributionContext.cs"
+public class AuditLogContributionContext : IServiceProviderAccessor
+{
+    public IServiceProvider ServiceProvider { get; }
+    public AuditLogInfo AuditInfo { get; }
+}
+```
+
+`PreContribute` runs from `AuditingHelper.CreateAuditLogInfo`, immediately after the identity columns are stamped but before any controller code has executed. This is where the ASP.NET Core integration adds `HttpMethod`, `Url`, `ClientIpAddress`, and `BrowserInfo` — those come from `HttpContext`, which must be read on the request thread.
+
+`PostContribute` runs from `AuditingManager.BeforeSave`, after the stopwatch has been stopped but before the store is invoked. This is where the response-tail fields land — most importantly `HttpStatusCode`, which is unknown until ASP.NET Core has finished writing the response.
+
+Both calls open a fresh DI scope via `IServiceProvider.CreateScope()`, and both swallow contributor exceptions with `Logger.LogException(ex, LogLevel.Warning)` — a buggy contributor cannot break the audit log:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditingManager.cs"
+protected virtual void ExecutePostContributors(AuditLogInfo auditLogInfo)
+{
+    using (var scope = ServiceProvider.CreateScope())
+    {
+        var context = new AuditLogContributionContext(scope.ServiceProvider, auditLogInfo);
+        foreach (var contributor in Options.Contributors)
+        {
+            try { contributor.PostContribute(context); }
+            catch (Exception ex) { Logger.LogException(ex, LogLevel.Warning); }
+        }
+    }
+}
+```
+
+Register a contributor through options:
+
+```csharp
+Configure<AbpAuditingOptions>(options =>
+{
+    options.Contributors.Add(new MyTraceIdContributor());
+});
+
+public class MyTraceIdContributor : AuditLogContributor
+{
+    public override void PostContribute(AuditLogContributionContext context)
+    {
+        var activity = System.Diagnostics.Activity.Current;
+        if (activity != null)
+            context.AuditInfo.ExtraProperties["TraceId"] = activity.TraceId.ToString();
+    }
+}
+```
+
+`ExtraProperties` is the canonical place for contributor data; the audit-logging module copies it into the `AuditLog.ExtraProperties` JSON column verbatim.
+
+## AbpAuditingOptions: every flag
+
+The full option surface, with the defaults set in the constructor:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AbpAuditingOptions.cs"
+public class AbpAuditingOptions
+{
+    public bool HideErrors { get; set; }
+    public bool IsEnabled { get; set; }
+    public string? ApplicationName { get; set; }
+    public bool IsEnabledForAnonymousUsers { get; set; }
+    public bool AlwaysLogOnException { get; set; }
+    public bool IsEnabledForIntegrationServices { get; set; }
+
+    public List<Func<AuditLogInfo, Task<bool>>> AlwaysLogSelectors { get; }
+    public List<AuditLogContributor> Contributors { get; }
+    public List<Type> IgnoredTypes { get; }
+    public IEntityHistorySelectorList EntityHistorySelectors { get; }
+
+    public bool SaveEntityHistoryWhenNavigationChanges { get; set; } = true;
+    public bool IsEnabledForGetRequests { get; set; }
+    public bool DisableLogActionInfo { get; set; }
+
+    public AbpAuditingOptions()
+    {
+        IsEnabled = true;
+        IsEnabledForAnonymousUsers = true;
+        HideErrors = true;
+        AlwaysLogOnException = true;
+        AlwaysLogSelectors = new List<Func<AuditLogInfo, Task<bool>>>();
+        Contributors = new List<AuditLogContributor>();
+        IgnoredTypes = new List<Type>
+        {
+            typeof(Stream),
+            typeof(Expression),
+            typeof(CancellationToken)
+        };
+        EntityHistorySelectors = new EntityHistorySelectorList();
+    }
+}
+```
+
+### IsEnabled
+
+Master switch. When `false`, `AuditingInterceptor.ShouldIntercept` returns `false` for every call, so nothing is logged. The ambient scope can still be opened manually by `IAuditingManager.BeginScope()` — it just won't accumulate `Actions`.
+
+### IsEnabledForGetRequests
+
+The ASP.NET Core `AbpAuditingMiddleware` checks this before opening a scope. When `false` (the default), GET, OPTIONS and HEAD requests run without an ambient `IAuditLogScope`, so even intercepted services skip `AuditLogActionInfo` recording. Flip to `true` if you want full read-side auditing — expect a higher write rate.
+
+### IsEnabledForAnonymousUsers
+
+Checked by the HTTP-side store wrapper. When `false`, a scope where `CurrentUser.IsAuthenticated == false` is discarded instead of saved. Combine with `AlwaysLogOnException` to still log anonymous failures.
+
+### IsEnabledForIntegrationServices
+
+Controls how `ShouldAuditTypeByDefaultOrNull` treats `[IntegrationService]`. When `false`, integration-service app services skip auditing even though they implement `IAuditingEnabled`. When `true`, they audit like normal application services.
+
+### HideErrors
+
+Inside the audit-logging module's `AuditingStore.SaveAsync`, the persistence call is wrapped in a `try/catch` only when `HideErrors == true`. With `HideErrors == false`, a DB failure propagates and (in the HTTP path) fails the response. The framework default is `true` because audit logging is best-effort.
+
+### AlwaysLogOnException
+
+When `true`, the [exception handling middleware](/web/exception-handling) calls `saveHandle.SaveAsync()` even if the original request would have skipped auditing (e.g. a GET request with `IsEnabledForGetRequests == false`). The `AuditLogInfo.Exceptions` list will contain the thrown exception by the time `SaveAsync` runs.
+
+### DisableLogActionInfo
+
+A second-stage off switch — when `true`, the interceptor still opens the scope (so entity changes and exceptions are captured) but skips `CreateAuditLogAction`. Useful for high-volume RPC endpoints where you want entity history but not the per-call parameter JSON.
+
+### SaveEntityHistoryWhenNavigationChanges
+
+Defaults to `true`. EF Core's change tracker can detect modifications via navigation-property mutation (adding/removing related rows). When this is `false`, ABP ignores those changes and only logs scalar-property edits.
+
+### AlwaysLogSelectors
+
+A list of `Func<AuditLogInfo, Task<bool>>`. The HTTP-side store evaluates each selector with the populated `AuditLogInfo`; if any returns `true`, the log is saved even when the normal rules would skip it. Use this to force-log specific URLs or specific tenants.
+
+### Contributors
+
+The `List<AuditLogContributor>` consumed by `ExecutePreContributors`/`ExecutePostContributors`. Add custom enrichers here — see the section above.
+
+### IgnoredTypes
+
+Bag of types stripped at three stages:
+
+1. `IsEntityHistoryEnabled` returns `false` for any entity assignable to a listed type.
+2. `SerializeConvertArguments` replaces argument values whose runtime type matches with `null` before serialisation.
+3. `JsonAuditSerializer` skips properties whose declared type matches.
+
+`Stream`, `Expression`, and `CancellationToken` are always present.
+
+### EntityHistorySelectors
+
+A `NamedTypeSelector` list that drives `IsEntityHistoryEnabled`. Each selector has a `Name` and a `Predicate(Type)`:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IEntityHistorySelectorList.cs"
+public interface IEntityHistorySelectorList : IList<NamedTypeSelector>
+{
+    bool RemoveByName(string name);
+}
+```
+
+The two common idioms:
+
+```csharp
+Configure<AbpAuditingOptions>(options =>
+{
+    // Force entity history for every public entity.
+    options.EntityHistorySelectors.AddAllEntities();
+
+    // Or only specific aggregates.
+    options.EntityHistorySelectors.Add(
+        new NamedTypeSelector(
+            "Orders",
+            type => typeof(Order).IsAssignableFrom(type) || typeof(OrderLine).IsAssignableFrom(type)));
+});
+```
+
+`AddAllEntities` is an extension method that adds a selector matching any `IEntity` implementor. `RemoveByName(string)` lets you undo a selector contributed by another module.
+
+## IAuditPropertySetter: the entity stamping side
+
+The auditing engine does more than just write audit logs; it also fills in the standard audit columns on entities (`CreationTime`, `CreatorId`, `LastModificationTime`, `LastModifierId`, `DeletionTime`, `DeleterId`, `EntityVersion`). That work lives in `IAuditPropertySetter`:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditPropertySetter.cs"
+public interface IAuditPropertySetter
+{
+    void SetCreationProperties(object targetObject);
+    void SetModificationProperties(object targetObject);
+    void SetDeletionProperties(object targetObject);
+    void IncrementEntityVersionProperty(object targetObject);
+}
+```
+
+The default implementation is type-driven — it checks each `IAuditedObject` sub-interface in turn and calls `ObjectHelper.TrySetProperty` to bypass private setters:
+
+```csharp title="framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AuditPropertySetter.cs"
+public virtual void SetCreationProperties(object targetObject)
+{
+    SetCreationTime(targetObject);
+    SetCreatorId(targetObject);
+}
+
+protected virtual void SetCreationTime(object targetObject)
+{
+    if (!(targetObject is IHasCreationTime objectWithCreationTime)) return;
+    if (objectWithCreationTime.CreationTime == default)
+        ObjectHelper.TrySetProperty(objectWithCreationTime, x => x.CreationTime, () => Clock.Now);
+}
+
+protected virtual void SetCreatorId(object targetObject)
+{
+    if (!CurrentUser.Id.HasValue) return;
+
+    if (targetObject is IMultiTenant multiTenantEntity)
+    {
+        if (multiTenantEntity.TenantId != CurrentUser.TenantId) return;
+    }
+
+    if (targetObject is IMayHaveCreator mayHaveCreatorObject)
+    {
+        if (mayHaveCreatorObject.CreatorId.HasValue && mayHaveCreatorObject.CreatorId.Value != default) return;
+        ObjectHelper.TrySetProperty(mayHaveCreatorObject, x => x.CreatorId, () => CurrentUser.Id);
+    }
+    else if (targetObject is IMustHaveCreator mustHaveCreatorObject)
+    {
+        if (mustHaveCreatorObject.CreatorId != default) return;
+        ObjectHelper.TrySetProperty(mustHaveCreatorObject, x => x.CreatorId, () => CurrentUser.Id.Value);
+    }
+}
+```
+
+Two things to notice:
+
+- The tenant check on `SetCreatorId` blanks the creator id when the current user belongs to a different tenant than the entity — this prevents a host-side admin from being recorded as the creator of tenant rows.
+- `SetLastModifierId` and `SetDeleterId` write `null` when the tenant mismatches *or* when there is no current user, instead of leaving stale values.
+
+The setter is called by EF Core's `AbpDbContext` and MongoDB's equivalent during `SaveChangesAsync` — it isn't called from the audit-logging engine itself. The contracts it acts on are defined in [`Volo.Abp.Auditing.Contracts`](/auditing/auditing-contracts).
+
+## Putting the chain together
+
+A single intercepted call hits every collaborator on this page:
+
+```mermaid
+flowchart LR
+    A[AuditingInterceptor.ShouldIntercept] --> B[IAuditingHelper.ShouldSaveAudit]
+    B --> C{Current scope?}
+    C -- yes --> D[Append AuditLogActionInfo]
+    C -- no --> E[IAuditingManager.BeginScope]
+    E --> F[IAuditingHelper.CreateAuditLogInfo]
+    F --> G[PreContributors]
+    G --> H[Invoke target]
+    H --> I[ProceedAsync]
+    I --> D
+    D --> J[On dispose / SaveAsync]
+    J --> K[Stop Stopwatch]
+    K --> L[PostContributors]
+    L --> M[MergeEntityChanges]
+    M --> N[IAuditingStore.SaveAsync]
+    N --> O[SimpleLogAuditingStore or AuditingStore]
+```
+
+Every node in that flowchart is one of the files in the inventory table at the top of the page. If you understand how those eight classes interact, you understand the whole engine.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Auditing overview" icon="map" href="/auditing/overview">
+    The high-level lifecycle: `AbpAuditingModule`, `IAuditingManager`, `AuditLogInfo`, `EntityChangeInfo`.
+  </Card>
+  <Card title="Audit logging module" icon="database" href="/modules/audit-logging">
+    The persistence layer that replaces `SimpleLogAuditingStore` with a real repository-backed store.
+  </Card>
+  <Card title="Auditing contracts" icon="file-signature" href="/auditing/auditing-contracts">
+    Entity-level interfaces (`IAuditedObject`, `IFullAuditedObject`) and the `[Audited]` / `[DisableAuditing]` attributes.
+  </Card>
+  <Card title="Unit of work" icon="layer-group" href="/uow">
+    The neighbouring ambient mechanism that drives transaction scope and event flushing.
+  </Card>
+</CardGroup>

@@ -1,0 +1,372 @@
+---
+title: "Setting Management Persistence: EF Core and MongoDB"
+sidebarTitle: "Persistence"
+description: "Reference for SettingManagementDbContext, the ConfigureSettingManagement model builder, EfCoreSettingRepository, and the MongoDB equivalents."
+---
+
+The persistence layer ships in two mutually exclusive packages: `Volo.Abp.SettingManagement.EntityFrameworkCore` and `Volo.Abp.SettingManagement.MongoDB`. Each owns two tables/collections (`Settings`, `SettingDefinitions`) and provides repository implementations for the contracts declared in `Volo.Abp.SettingManagement.Domain`. This page walks the schema, the unique indexes, the `[IgnoreMultiTenancy]` decision that keeps the table outside the tenant database resolver, and the repository signatures.
+
+For the entities the schema describes, see [Domain](/modules/setting-management/domain). For the runtime callers of these repositories, see [Application](/modules/setting-management/application) and [HTTP API](/modules/setting-management/http-api).
+
+## File inventory
+
+### `Volo.Abp.SettingManagement.EntityFrameworkCore`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpSettingManagementEntityFrameworkCoreModule.cs` | module | Registers `SettingManagementDbContext` and the two repositories. |
+| `ISettingManagementDbContext.cs` | interface | Exposes the two `DbSet`s for the shared-context pattern. |
+| `SettingManagementDbContext.cs` | DbContext | Default standalone `DbContext` that owns the connection string. |
+| `SettingManagementDbContextModelBuilderExtensions.cs` | static | `ConfigureSettingManagement(this ModelBuilder)` model builder. |
+| `EfCoreSettingRepository.cs` | repo | Custom queries over the `Settings` table. |
+| `EfCoreSettingDefinitionRecordRepository.cs` | repo | Custom queries over `SettingDefinitions`. |
+
+### `Volo.Abp.SettingManagement.MongoDB`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpSettingManagementMongoDbModule.cs` | module | Registers the Mongo context and the two Mongo repositories. |
+| `ISettingManagementMongoDbContext.cs` | interface | Exposes the two collections for the shared-context pattern. |
+| `SettingManagementMongoDbContext.cs` | DbContext | Default standalone context owning the connection string. |
+| `SettingManagementMongoDbContextExtensions.cs` | static | `ConfigureSettingManagement(this IMongoModelBuilder)`. |
+| `MongoSettingRepository.cs` | repo | Custom queries over the `Settings` collection. |
+| `MongoSettingDefinitionRecordRepository.cs` | repo | Custom queries over `SettingDefinitions`. |
+
+## Shared connection-string name
+
+Both packages share the same logical connection name. The constant is in the Domain package:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Domain/Volo/Abp/SettingManagement/AbpSettingManagementDbProperties.cs
+public static class AbpSettingManagementDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpSettingManagement";
+}
+```
+
+In practice the framework's `IConnectionStringResolver` falls back to `"Default"`, so a single shared database is the typical configuration. Setting `"AbpSettingManagement"` lets you route the settings tables to a separate physical database — useful when you want them in the same store as the permission grants but on a different host than your business data.
+
+`DbTablePrefix` resolves to `"Abp"` by default, so the tables ship as `AbpSettings` and `AbpSettingDefinitions`.
+
+## EF Core: `[IgnoreMultiTenancy]` and what it means
+
+The `DbContext` carries an unusual attribute:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/SettingManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public class SettingManagementDbContext : AbpDbContext<SettingManagementDbContext>, ISettingManagementDbContext
+{
+    public DbSet<Setting> Settings { get; set; }
+    public DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.ConfigureSettingManagement();
+    }
+}
+```
+
+`[IgnoreMultiTenancy]` tells ABP's connection-string resolver to **always use the host connection** for this context — even inside a `CurrentTenant.Change(tenantId)` block. The reason is that the `Setting` entity is not `IMultiTenant`; tenant-specific values are stored as rows where `ProviderName = "T"` and `ProviderKey = tenantId`, on the host's database. Without this attribute a `tenant database` strategy would route reads to the tenant's database, which has no settings table.
+
+The matching interface also carries it so the shared-context pattern (described below) preserves the same behaviour:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/ISettingManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public interface ISettingManagementDbContext : IEfCoreDbContext
+{
+    DbSet<Setting> Settings { get; }
+    DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; }
+}
+```
+
+The MongoDB variants carry the same attributes for the same reason.
+
+The model builder declines to emit anything when the host marks itself as "tenant-only" — there is no point creating the table in a database that will never own a row:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/SettingManagementDbContextModelBuilderExtensions.cs
+public static void ConfigureSettingManagement(
+    [NotNull] this ModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    if (builder.IsTenantOnlyDatabase())
+    {
+        return;
+    }
+
+    builder.Entity<Setting>(b =>
+    {
+        b.ToTable(AbpSettingManagementDbProperties.DbTablePrefix + "Settings",
+                  AbpSettingManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.Name).HasMaxLength(SettingConsts.MaxNameLength).IsRequired();
+
+        if (builder.IsUsingOracle()) { SettingConsts.MaxValueLengthValue = 2000; }
+        b.Property(x => x.Value).HasMaxLength(SettingConsts.MaxValueLengthValue).IsRequired();
+
+        b.Property(x => x.ProviderName).HasMaxLength(SettingConsts.MaxProviderNameLength);
+        b.Property(x => x.ProviderKey).HasMaxLength(SettingConsts.MaxProviderKeyLength);
+
+        b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique(true);
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<SettingDefinitionRecord>(b =>
+    {
+        b.ToTable(AbpSettingManagementDbProperties.DbTablePrefix + "SettingDefinitions",
+                  AbpSettingManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.Name).HasMaxLength(SettingDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.DisplayName).HasMaxLength(SettingDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+        b.Property(x => x.Description).HasMaxLength(SettingDefinitionRecordConsts.MaxDescriptionLength);
+        b.Property(x => x.DefaultValue).HasMaxLength(SettingDefinitionRecordConsts.MaxDefaultValueLength);
+        b.Property(x => x.Providers).HasMaxLength(SettingDefinitionRecordConsts.MaxProvidersLength);
+
+        b.HasIndex(x => new { x.Name }).IsUnique();
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.TryConfigureObjectExtensions<SettingManagementDbContext>();
+}
+```
+
+### Table reference
+
+| Table | Columns (logical → SQL) | Unique index | Notes |
+| --- | --- | --- | --- |
+| `AbpSettings` | `Id` (guid), `Name` (nvarchar(128)), `Value` (nvarchar(2048)), `ProviderName?` (nvarchar(64)), `ProviderKey?` (nvarchar(64)) | `(Name, ProviderName, ProviderKey)` | `Value` shortens to 2000 on Oracle. Audit + concurrency columns from `ConfigureByConvention`. |
+| `AbpSettingDefinitions` | `Id`, `Name` (nvarchar(128)), `DisplayName` (nvarchar(256)), `Description?` (nvarchar(512)), `DefaultValue?` (nvarchar(2048)), `Providers?` (nvarchar(1024)), `IsVisibleToClients`, `IsInherited`, `IsEncrypted` | `(Name)` | Catalog row — written by `StaticSettingSaver`. |
+
+The `Value` column length is the constraint admins hit most often. To raise it, set `SettingConsts.MaxValueLength` (and its `MaxValueLengthValue` companion) before the model builder runs, then create a new migration:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Domain.Shared/Volo/Abp/SettingManagement/SettingConsts.cs
+public static class SettingConsts
+{
+    public static int MaxNameLength { get; set; } = 128;
+    public static int MaxValueLength { get; set; } = 2048;
+    public static int MaxValueLengthValue { get; set; } = MaxValueLength;
+    public static int MaxProviderNameLength { get; set; } = 64;
+    public static int MaxProviderKeyLength { get; set; } = 64;
+}
+```
+
+The lengths in `SettingDefinitionRecordConsts` work the same way.
+
+### Standalone DbContext
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/SettingManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public class SettingManagementDbContext : AbpDbContext<SettingManagementDbContext>, ISettingManagementDbContext
+{
+    public DbSet<Setting> Settings { get; set; }
+    public DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; set; }
+}
+```
+
+### Shared DbContext (recommended)
+
+The interface is the join point most production hosts use:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/ISettingManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public interface ISettingManagementDbContext : IEfCoreDbContext
+{
+    DbSet<Setting> Settings { get; }
+    DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; }
+}
+```
+
+Add the two `DbSet`s to your host's `DbContext`, mark it with `[ReplaceDbContext(typeof(ISettingManagementDbContext))]`, and call `modelBuilder.ConfigureSettingManagement()` from `OnModelCreating`. The module-side repositories then resolve through the shared context.
+
+### Module registration
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/AbpSettingManagementEntityFrameworkCoreModule.cs
+[DependsOn(
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpEntityFrameworkCoreModule)
+    )]
+public class AbpSettingManagementEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<SettingManagementDbContext>(options =>
+        {
+            options.AddDefaultRepositories<ISettingManagementDbContext>();
+
+            options.AddRepository<Setting, EfCoreSettingRepository>();
+            options.AddRepository<SettingDefinitionRecord, EfCoreSettingDefinitionRecordRepository>();
+        });
+    }
+}
+```
+
+`AddDefaultRepositories<ISettingManagementDbContext>()` registers the generic `IRepository<T, TKey>` surface for each entity exposed by the interface, then the explicit `AddRepository` calls override those bindings with the custom-query repositories so `ISettingRepository` resolves to the EF Core implementation.
+
+## EF Core: repository implementations
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/EfCoreSettingRepository.cs
+public class EfCoreSettingRepository : EfCoreRepository<ISettingManagementDbContext, Setting, Guid>,
+    ISettingRepository
+{
+    public virtual async Task<Setting> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(
+        string[] names, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => names.Contains(s.Name) &&
+                        s.ProviderName == providerName &&
+                        s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+All three queries hit the unique `(Name, ProviderName, ProviderKey)` index. The `IN (...)` variant is the one `SettingManagementStore.SetCacheItemsAsync` calls to warm the whole set on a single cache miss — see [Domain](/modules/setting-management/domain#isettingmanagementstore-and-settingmanagementstore).
+
+`EfCoreSettingDefinitionRecordRepository` follows the same shape with `FindByNameAsync` and `GetCountAsync`.
+
+## MongoDB: the schema
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.MongoDB/Volo/Abp/SettingManagement/MongoDB/SettingManagementMongoDbContextExtensions.cs
+public static void ConfigureSettingManagement(
+    this IMongoModelBuilder builder)
+{
+    builder.Entity<Setting>(b =>
+    {
+        b.CollectionName = AbpSettingManagementDbProperties.DbTablePrefix + "Settings";
+    });
+
+    builder.Entity<SettingDefinitionRecord>(b =>
+    {
+        b.CollectionName = AbpSettingManagementDbProperties.DbTablePrefix + "SettingDefinitions";
+    });
+}
+```
+
+The MongoDB context preserves the multi-tenancy attribute:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.MongoDB/Volo/Abp/SettingManagement/MongoDB/SettingManagementMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public class SettingManagementMongoDbContext : AbpMongoDbContext, ISettingManagementMongoDbContext
+{
+    public IMongoCollection<Setting> Settings => Collection<Setting>();
+    public IMongoCollection<SettingDefinitionRecord> SettingDefinitionRecords => Collection<SettingDefinitionRecord>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+
+        modelBuilder.ConfigureSettingManagement();
+    }
+}
+```
+
+<Warning>
+The MongoDB driver does **not** enforce the unique `(Name, ProviderName, ProviderKey)` constraint that the EF Core mapping declares. Create it manually with `db.AbpSettings.createIndex({Name: 1, ProviderName: 1, ProviderKey: 1}, {unique: true})` as part of your provisioning if you need that guarantee at the database layer.
+</Warning>
+
+## MongoDB: repository implementations
+
+`MongoSettingRepository` mirrors the EF Core class one-for-one:
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.MongoDB/Volo/Abp/SettingManagement/MongoDB/MongoSettingRepository.cs
+public class MongoSettingRepository : MongoDbRepository<ISettingManagementMongoDbContext, Setting, Guid>,
+    ISettingRepository
+{
+    public virtual async Task<List<Setting>> GetListAsync(
+        string[] names, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => names.Contains(s.Name) &&
+                        s.ProviderName == providerName &&
+                        s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+`MongoDB.Driver.Linq` translates the `Contains` call into a `$in` filter so the bulk read remains a single round trip.
+
+### Module registration
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.MongoDB/Volo/Abp/SettingManagement/MongoDB/AbpSettingManagementMongoDbModule.cs
+[DependsOn(
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpMongoDbModule)
+    )]
+public class AbpSettingManagementMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<SettingManagementMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<ISettingManagementMongoDbContext>();
+
+            options.AddRepository<Setting, MongoSettingRepository>();
+            options.AddRepository<SettingDefinitionRecord, MongoSettingDefinitionRecordRepository>();
+        });
+    }
+}
+```
+
+## Choosing a provider
+
+| Concern | EF Core | MongoDB |
+| --- | --- | --- |
+| Unique index on `(Name, ProviderName, ProviderKey)` | Enforced at DB layer | Manual — create the index yourself. |
+| Migrations | First-class via `dotnet ef migrations` | Not applicable. |
+| Object extension columns | `ApplyObjectExtensionMappings()` writes real columns | Stored as `ExtraProperties` BSON. |
+| Long values | Default 2048 chars; tuneable via `SettingConsts.MaxValueLength` | Unlimited (subject to BSON 16 MB document cap). |
+| Migration to a separate cluster | `[ConnectionStringName]` + a new connection | `[ConnectionStringName]` + a new connection |
+
+Pick whichever you already use for the rest of your solution; the [data layer overview](/data/overview) covers the trade-offs in more depth.
+
+## Object extensions
+
+Both providers honour `ObjectExtensionManager`. Tack on extra columns/fields without subclassing:
+
+```csharp
+ObjectExtensionManager.Instance
+    .AddOrUpdateProperty<Setting, string>("LastChangedBy");
+```
+
+EF Core projects the extension as a real `nvarchar` column thanks to `ApplyObjectExtensionMappings()`. MongoDB stores it inside `ExtraProperties` and round-trips it as BSON. The [data extensibility guide](/data/overview) walks through the consumption pattern.
+
+## Cross-references
+
+- The `Setting` aggregate, the cache layer that feeds these repositories, and `StaticSettingSaver` are in [Domain](/modules/setting-management/domain).
+- The permission-management parallel — `PermissionGrant`, `EfCorePermissionGrantRepository`, `MongoPermissionGrantRepository` — is in [Permission management persistence](/modules/permission-management/persistence).
+- The host-level shared DbContext pattern for the Identity module is in [Identity overview](/modules/identity/overview).

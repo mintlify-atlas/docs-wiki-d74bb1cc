@@ -1,0 +1,442 @@
+---
+title: "BLOB Storing: typed containers and pluggable providers"
+sidebarTitle: "Overview"
+description: "Tour of Volo.Abp.BlobStoring: AbpBlobStoringModule, IBlobContainer<TContainer>, BlobContainerConfiguration, AbpBlobStoringOptions, [BlobContainerName]."
+---
+
+ABP's BLOB Storing system is a thin, opinionated abstraction over object/file stores. The `Volo.Abp.BlobStoring` package gives application code a **typed**, **multi-tenant-aware** container API that resolves the right storage backend (file system, Azure, AWS S3, Aliyun OSS, MinIO, database, …) per container at runtime. Application services never reference a vendor SDK directly — every call site talks to `IBlobContainer<TContainer>` and the module pipeline takes care of provider lookup, blob/container name normalization, and tenant scoping.
+
+This page walks the core abstractions inside `framework/src/Volo.Abp.BlobStoring`: the `AbpBlobStoringModule` that wires the open generics into DI, the `IBlobContainer<TContainer>` / `IBlobContainer` pair that application code consumes, the `BlobContainerConfiguration` registry exposed through `AbpBlobStoringOptions`, and the `[BlobContainerName]` attribute that names a container independently from its CLR type. The individual provider packages — [File system](/blobs/file-system-provider), [Azure](/blobs/azure-provider), [AWS S3](/blobs/aws-provider), [Aliyun OSS](/blobs/aliyun-provider), [MinIO](/blobs/minio-provider), and [Database](/blobs/database-provider) — register concrete `IBlobProvider` implementations and add `UseXxx(...)` extensions to `BlobContainerConfiguration`.
+
+## Package layout
+
+The core package is a single namespace, a single module, and a handful of small abstractions. Each file lives under `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring`.
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpBlobStoringModule.cs` | `AbpModule` | Registers `IBlobContainer<>` and the default `IBlobContainer` binding. |
+| `AbpBlobStoringOptions.cs` | Options | Holds the `BlobContainerConfigurations` registry. |
+| `BlobContainerConfigurations.cs` | Class | Per-container `BlobContainerConfiguration` keyed by container name, with `ConfigureDefault` and `ConfigureAll`. |
+| `BlobContainerConfiguration.cs` | Class | Provider type + properties bag for a single container; supports a fallback configuration chain. |
+| `BlobContainerNameAttribute.cs` | Attribute | Names a container marker type; default is `Type.FullName`. |
+| `DefaultContainer.cs` | Marker class | Default `[BlobContainerName("default")]` marker bound to `IBlobContainer`. |
+| `IBlobContainer.cs` | Interfaces | `IBlobContainer<TContainer>` and `IBlobContainer` — the application-facing API. |
+| `BlobContainer.cs` | Class | Default implementations; normalize names and forward to the resolved provider. |
+| `IBlobContainerFactory.cs` / `BlobContainerFactory.cs` | Service | Builds an `IBlobContainer` for a given container name. |
+| `IBlobProvider.cs` / `BlobProviderBase.cs` | Provider API | The four-method storage contract: `SaveAsync`, `DeleteAsync`, `ExistsAsync`, `GetOrNullAsync`. |
+| `BlobProviderArgs.cs` and subclasses | Records | Args passed to `IBlobProvider`: `Save`, `Delete`, `Exists`, `Get`. |
+| `IBlobProviderSelector.cs` / `DefaultBlobProviderSelector.cs` | Service | Resolves `BlobContainerConfiguration.ProviderType` to an `IBlobProvider` instance. |
+| `IBlobContainerConfigurationProvider.cs` / `DefaultBlobContainerConfigurationProvider.cs` | Service | Looks up a `BlobContainerConfiguration` by name (falls back to default container). |
+| `IBlobNamingNormalizer.cs` | Interface | Per-provider naming sanitizer (`NormalizeContainerName`, `NormalizeBlobName`). |
+| `IBlobNormalizeNamingService.cs` / `BlobNormalizeNamingService.cs` | Service | Runs every registered normalizer against the container/blob names. |
+| `BlobAlreadyExistsException.cs` | Exception | Thrown by providers when `overrideExisting` is `false`. |
+| `BlobContainerExtensions.cs` / `BlobContainerFactoryExtensions.cs` | Extensions | `SaveAsync(byte[])`, `SaveAsync(string)`, `GetAllBytesAsync()`, etc. |
+
+## `AbpBlobStoringModule`
+
+The module registers the typed container as an open generic and binds the parameter-less `IBlobContainer` to the container marked with `[BlobContainerName("default")]`.
+
+```csharp Volo.Abp.BlobStoring/AbpBlobStoringModule.cs
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpThreadingModule)
+    )]
+public class AbpBlobStoringModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(
+            typeof(IBlobContainer<>),
+            typeof(BlobContainer<>)
+        );
+
+        context.Services.AddTransient(
+            typeof(IBlobContainer),
+            serviceProvider => serviceProvider
+                .GetRequiredService<IBlobContainer<DefaultContainer>>()
+        );
+    }
+}
+```
+
+Concrete services (`IBlobContainerFactory`, `IBlobProviderSelector`, `IBlobContainerConfigurationProvider`, `IBlobNormalizeNamingService`, `DefaultContainer` resolution) all light up via the convention-based dependency injection — they are decorated with `ITransientDependency` and registered automatically.
+
+## `IBlobContainer` and the typed container
+
+`IBlobContainer` is the application-facing API. Every method takes a name plus the operation-specific payload and works in terms of streams:
+
+```csharp Volo.Abp.BlobStoring/IBlobContainer.cs
+public interface IBlobContainer<TContainer> : IBlobContainer
+    where TContainer : class
+{
+}
+
+public interface IBlobContainer
+{
+    Task SaveAsync(
+        string name,
+        Stream stream,
+        bool overrideExisting = false,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> DeleteAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> ExistsAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+
+    Task<Stream> GetAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+
+    Task<Stream?> GetOrNullAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+}
+```
+
+The typed `IBlobContainer<TContainer>` exists only to encode the **container marker type** in the DI key. The default implementation, `BlobContainer<TContainer>`, asks the `IBlobContainerFactory` to build an `IBlobContainer` for the container name derived from `TContainer` and forwards every call:
+
+```csharp Volo.Abp.BlobStoring/BlobContainer.cs
+public class BlobContainer<TContainer> : IBlobContainer<TContainer>
+    where TContainer : class
+{
+    protected readonly IBlobContainer Container;
+
+    public BlobContainer(IBlobContainerFactory blobContainerFactory)
+    {
+        Container = blobContainerFactory.Create<TContainer>();
+    }
+    // …forwards Save/Delete/Exists/Get/GetOrNull to Container
+}
+```
+
+`BlobContainerFactoryExtensions.Create<TContainer>(...)` resolves the container name through `BlobContainerNameAttribute.GetContainerName<TContainer>()`. That name is the key to everything that comes next.
+
+### The default container
+
+If you want a "just throw a file somewhere" experience, you can inject the parameter-less `IBlobContainer`. The module binds it to `IBlobContainer<DefaultContainer>`:
+
+```csharp Volo.Abp.BlobStoring/DefaultContainer.cs
+[BlobContainerName(Name)]
+public class DefaultContainer
+{
+    public const string Name = "default";
+}
+```
+
+Anything injected as `IBlobContainer` reads from / writes to the `"default"` container, which is preconfigured in `BlobContainerConfigurations` (see below).
+
+## Naming containers — `[BlobContainerName]`
+
+Container marker classes are mapped to a stable name via `[BlobContainerName(...)]`. Without it, the container name is the type's `FullName`, which is brittle across refactors.
+
+```csharp Volo.Abp.BlobStoring/BlobContainerNameAttribute.cs
+public class BlobContainerNameAttribute : Attribute
+{
+    public string Name { get; }
+
+    public BlobContainerNameAttribute(string name)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        Name = name;
+    }
+
+    public virtual string GetName(Type type) => Name;
+
+    public static string GetContainerName<T>() => GetContainerName(typeof(T));
+
+    public static string GetContainerName(Type type)
+    {
+        var nameAttribute = type.GetCustomAttribute<BlobContainerNameAttribute>();
+        if (nameAttribute == null)
+        {
+            return type.FullName!;
+        }
+        return nameAttribute.GetName(type);
+    }
+}
+```
+
+Application code looks like this:
+
+```csharp
+[BlobContainerName("product-images")]
+public class ProductImageContainer { }
+
+public class ProductImageService
+{
+    private readonly IBlobContainer<ProductImageContainer> _container;
+    public ProductImageService(IBlobContainer<ProductImageContainer> container)
+        => _container = container;
+
+    public Task SaveAsync(string id, Stream content)
+        => _container.SaveAsync(id, content, overrideExisting: true);
+}
+```
+
+The string `"product-images"` is the key used everywhere — in `BlobContainerConfigurations`, in provider arguments, and in the on-disk / on-bucket path.
+
+## `BlobContainerConfiguration` and the configuration chain
+
+Every container has a `BlobContainerConfiguration`. It carries the chosen provider type, the multi-tenancy flag, and an arbitrary `string`-keyed property bag that each provider reads through strongly-typed extension methods (e.g. `GetAzureConfiguration()`).
+
+```csharp Volo.Abp.BlobStoring/BlobContainerConfiguration.cs
+public class BlobContainerConfiguration
+{
+    public Type? ProviderType { get; set; }
+    public bool IsMultiTenant { get; set; } = true;
+    public ITypeList<IBlobNamingNormalizer> NamingNormalizers { get; }
+
+    private readonly Dictionary<string, object?> _properties;
+    private readonly BlobContainerConfiguration? _fallbackConfiguration;
+
+    public BlobContainerConfiguration(BlobContainerConfiguration? fallbackConfiguration = null)
+    { /* … */ }
+
+    public T? GetConfigurationOrDefault<T>(string name, T? defaultValue = default) { /* … */ }
+    public BlobContainerConfiguration SetConfiguration(string name, object? value)  { /* … */ }
+    public BlobContainerConfiguration ClearConfiguration(string name)               { /* … */ }
+}
+```
+
+A child configuration falls back to the default container's configuration for any key it does not own — so global settings (e.g. an Azure connection string) flow through to per-container overrides automatically.
+
+## `AbpBlobStoringOptions`
+
+The options object is intentionally a one-liner — all the surface area is on `BlobContainerConfigurations`.
+
+```csharp Volo.Abp.BlobStoring/AbpBlobStoringOptions.cs
+public class AbpBlobStoringOptions
+{
+    public BlobContainerConfigurations Containers { get; }
+
+    public AbpBlobStoringOptions()
+    {
+        Containers = new BlobContainerConfigurations();
+    }
+}
+```
+
+`BlobContainerConfigurations` seeds itself with the default container and exposes four ways to mutate it:
+
+```csharp Volo.Abp.BlobStoring/BlobContainerConfigurations.cs
+public class BlobContainerConfigurations
+{
+    private BlobContainerConfiguration Default => GetConfiguration<DefaultContainer>();
+
+    public BlobContainerConfigurations Configure<TContainer>(
+        Action<BlobContainerConfiguration> configureAction);
+
+    public BlobContainerConfigurations Configure(
+        string name,
+        Action<BlobContainerConfiguration> configureAction);
+
+    public BlobContainerConfigurations ConfigureDefault(
+        Action<BlobContainerConfiguration> configureAction);
+
+    public BlobContainerConfigurations ConfigureAll(
+        Action<string, BlobContainerConfiguration> configureAction);
+
+    public BlobContainerConfiguration GetConfiguration<TContainer>();
+    public BlobContainerConfiguration GetConfiguration(string name);
+}
+```
+
+A typical module wiring picks a provider on the default container and overrides it on a named container:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseFileSystem(fs =>
+        {
+            fs.BasePath = "/var/lib/myapp/blobs";
+        });
+    });
+
+    options.Containers.Configure<ProductImageContainer>(container =>
+    {
+        container.UseAzure(azure =>
+        {
+            azure.ConnectionString  = "...";
+            azure.ContainerName     = "product-images";
+            azure.CreateContainerIfNotExists = true;
+        });
+    });
+});
+```
+
+`UseFileSystem`, `UseAzure`, etc. are extension methods on `BlobContainerConfiguration` shipped by each provider package — they set `ProviderType`, add the provider-specific `IBlobNamingNormalizer` to `NamingNormalizers`, and write keys into the property bag.
+
+## Container selection — from name to provider
+
+The end-to-end flow when application code calls `_container.SaveAsync("logo.png", stream)`:
+
+```mermaid
+flowchart TB
+    A["IBlobContainer&lt;TContainer&gt;<br/>(application code)"] --> B["BlobContainer&lt;TContainer&gt;<br/>resolves name via [BlobContainerName]"]
+    B --> C["IBlobContainerFactory.Create(name)"]
+    C --> D["IBlobContainerConfigurationProvider.Get(name)<br/>=> BlobContainerConfiguration"]
+    C --> E["IBlobProviderSelector.Get(name)"]
+    E --> F{"configuration.ProviderType"}
+    F -->|FileSystemBlobProvider| P1["FileSystemBlobProvider"]
+    F -->|AzureBlobProvider|      P2["AzureBlobProvider"]
+    F -->|AwsBlobProvider|        P3["AwsBlobProvider"]
+    F -->|AliyunBlobProvider|     P4["AliyunBlobProvider"]
+    F -->|MinioBlobProvider|      P5["MinioBlobProvider"]
+    F -->|DatabaseBlobProvider|   P6["DatabaseBlobProvider"]
+    C --> G["BlobContainer<br/>(provider + config + ICurrentTenant)"]
+    G --> H["IBlobNormalizeNamingService<br/>NormalizeContainer/Blob names"]
+    G --> I["IBlobProvider.SaveAsync(BlobProviderSaveArgs)"]
+```
+
+`DefaultBlobProviderSelector` walks every registered `IBlobProvider` and picks the first one whose un-proxied type is assignable to `configuration.ProviderType`:
+
+```csharp Volo.Abp.BlobStoring/DefaultBlobProviderSelector.cs
+public virtual IBlobProvider Get(string containerName)
+{
+    var configuration = ConfigurationProvider.Get(containerName);
+
+    if (!BlobProviders.Any())
+    {
+        throw new AbpException("No BLOB Storage provider was registered! …");
+    }
+
+    if (configuration.ProviderType == null)
+    {
+        throw new AbpException("No BLOB Storage provider was used! …");
+    }
+
+    foreach (var provider in BlobProviders)
+    {
+        if (ProxyHelper.GetUnProxiedType(provider).IsAssignableTo(configuration.ProviderType))
+        {
+            return provider;
+        }
+    }
+
+    throw new AbpException(
+        $"Could not find the BLOB Storage provider with the type ({configuration.ProviderType.AssemblyQualifiedName}) configured for the container {containerName}…");
+}
+```
+
+`DefaultBlobContainerConfigurationProvider` is equally tiny: it just reads from `AbpBlobStoringOptions.Containers`:
+
+```csharp Volo.Abp.BlobStoring/DefaultBlobContainerConfigurationProvider.cs
+public virtual BlobContainerConfiguration Get(string name)
+{
+    return Options.Containers.GetConfiguration(name);
+}
+```
+
+If the named configuration is missing, `BlobContainerConfigurations.GetConfiguration(name)` falls back to the default container's configuration — so an unconfigured marker type still resolves to a working provider.
+
+## Multi-tenancy
+
+`BlobContainerConfiguration.IsMultiTenant` defaults to `true`. When `BlobContainer.SaveAsync(...)` runs, it switches the ambient tenant before calling the provider:
+
+```csharp Volo.Abp.BlobStoring/BlobContainer.cs
+public virtual async Task SaveAsync(string name, Stream stream, bool overrideExisting, CancellationToken ct)
+{
+    using (CurrentTenant.Change(GetTenantIdOrNull()))
+    {
+        var blobNormalizeNaming = BlobNormalizeNamingService.NormalizeNaming(Configuration, ContainerName, name);
+        await Provider.SaveAsync(new BlobProviderSaveArgs(
+            blobNormalizeNaming.ContainerName!,
+            Configuration,
+            blobNormalizeNaming.BlobName!,
+            stream, overrideExisting,
+            CancellationTokenProvider.FallbackToProvider(ct)));
+    }
+}
+
+protected virtual Guid? GetTenantIdOrNull()
+{
+    if (!Configuration.IsMultiTenant) return null;
+    return CurrentTenant.Id;
+}
+```
+
+When the configuration is *not* multi-tenant, the container is shared across all tenants (typical for `"default"` and other "system-wide" containers). When it *is* multi-tenant, each `IBlobProvider` decides what to do with the tenant id — the [File system provider](/blobs/file-system-provider) drops blobs into `host/...` or `tenants/{tenantId}/...` subfolders, the [Azure provider](/blobs/azure-provider) prepends the same prefix to the blob name, and so on.
+
+## Naming normalization
+
+Every provider has different naming rules (Azure: lowercase letters/digits/dashes only, 3-63 chars; AWS S3: similar; file system: forbids `:*?"<>|` on Windows). `IBlobNamingNormalizer` is the per-provider sanitizer; `IBlobNormalizeNamingService` runs every normalizer registered on the container configuration before the provider sees the name.
+
+```csharp Volo.Abp.BlobStoring/IBlobNamingNormalizer.cs
+public interface IBlobNamingNormalizer
+{
+    string NormalizeContainerName(string containerName);
+    string NormalizeBlobName(string blobName);
+}
+```
+
+Each `UseXxx(...)` extension calls `containerConfiguration.NamingNormalizers.TryAdd<XxxBlobNamingNormalizer>()`, so application code never touches the list directly.
+
+## `IBlobProvider` — the storage contract
+
+A provider implements four async methods over the strongly-typed `BlobProviderArgs` family:
+
+```csharp Volo.Abp.BlobStoring/IBlobProvider.cs
+public interface IBlobProvider
+{
+    Task SaveAsync(BlobProviderSaveArgs args);
+    Task<bool> DeleteAsync(BlobProviderDeleteArgs args);
+    Task<bool> ExistsAsync(BlobProviderExistsArgs args);
+    Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args);
+}
+```
+
+`BlobProviderBase` is the recommended starting point — it adds the `TryCopyToMemoryStreamAsync(...)` helper that all built-in providers use to detach the response stream from the SDK client lifetime:
+
+```csharp Volo.Abp.BlobStoring/BlobProviderBase.cs
+protected virtual async Task<Stream?> TryCopyToMemoryStreamAsync(
+    Stream? stream, CancellationToken cancellationToken = default)
+{
+    if (stream == null) return null;
+    var memoryStream = new MemoryStream();
+    await stream.CopyToAsync(memoryStream, cancellationToken);
+    memoryStream.Seek(0, SeekOrigin.Begin);
+    return memoryStream;
+}
+```
+
+The full list of built-in providers:
+
+| Provider | Package | Page |
+| --- | --- | --- |
+| `FileSystemBlobProvider`   | `Volo.Abp.BlobStoring.FileSystem` | [File system](/blobs/file-system-provider) |
+| `AzureBlobProvider`        | `Volo.Abp.BlobStoring.Azure`      | [Azure Blob Storage](/blobs/azure-provider) |
+| `AwsBlobProvider`          | `Volo.Abp.BlobStoring.Aws`        | [AWS S3](/blobs/aws-provider) |
+| `AliyunBlobProvider`       | `Volo.Abp.BlobStoring.Aliyun`     | [Aliyun OSS](/blobs/aliyun-provider) |
+| `MinioBlobProvider`        | `Volo.Abp.BlobStoring.Minio`      | [MinIO](/blobs/minio-provider) |
+| `DatabaseBlobProvider`     | `Volo.Abp.BlobStoring.Database.Domain` (module) | [Database](/blobs/database-provider) |
+
+<Note>
+A given application can mix and match providers — different containers can target different backends. The selector simply matches `configuration.ProviderType` against the registered providers.
+</Note>
+
+## Extension helpers
+
+`BlobContainerExtensions` adds the byte/string convenience overloads that application code typically uses:
+
+- `SaveAsync(string name, byte[] bytes, bool overrideExisting = false, …)`
+- `SaveAsync(string name, string text, Encoding encoding, …)` (via overloads)
+- `GetAllBytesAsync(string name, …)` / `GetAllBytesOrNullAsync(...)`
+- `GetAllStringAsync(string name, …)` / `GetAllStringOrNullAsync(...)`
+
+These are pure sugar over the four base methods; they exist on `IBlobContainer`, so they work for any provider transparently.
+
+## Cross-references
+
+- [Caching overview](/caching/overview) — the [Aliyun](/blobs/aliyun-provider) and [AWS](/blobs/aws-provider) providers use `IDistributedCache<>` to cache STS / federated credentials.
+- [Background jobs](/background/jobs-overview) — most upload pipelines hand the resulting `IBlobContainer.SaveAsync` off to a background worker.
+- [Dapr integration](/dapr) — the BLOB module composes cleanly with Dapr secret stores when externalizing connection strings.
+
+## Next
+
+Each provider page documents its `UseXxx(...)` extension, the configuration class, the naming normalizer, and the on-disk / on-bucket layout produced by its blob name calculator. Start with the [File system provider](/blobs/file-system-provider) for the simplest end-to-end example.

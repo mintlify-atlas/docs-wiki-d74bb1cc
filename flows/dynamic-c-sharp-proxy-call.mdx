@@ -1,0 +1,440 @@
+---
+title: "Dynamic C# HTTP client proxy call across two ABP services"
+sidebarTitle: "Dynamic Proxy Call"
+description: "Trace a typed proxy call through DynamicHttpProxyInterceptor, ClientProxyBase, RemoteServiceConfiguration, the HttpClient send, and exception wrapping."
+---
+
+ABP turns *typed* interface calls — `await _userAppService.GetAsync(id)` — into HTTP requests against a remote endpoint, without you ever writing a controller-by-controller HTTP client. This is the **dynamic C# client proxy**: at startup, `AddHttpClientProxy<T>` registers a Castle DynamicProxy that implements the service interface using `DynamicHttpProxyInterceptor<TService>` (which delegates to a `ClientProxyBase<TService>` per remote action). At call time the interceptor looks up the action descriptor through `IApiDescriptionFinder`, resolves the remote base URL through `IRemoteServiceConfigurationProvider`, builds the `HttpRequestMessage`, sends it via `IProxyHttpClientFactory`, and unwraps the JSON body — or maps an `X-Abp-Error-Format` response into an `AbpRemoteCallException`.
+
+This page traces a single client-proxy call end-to-end: from the typed interface call on the caller side, across the wire, into the [request lifecycle](/flows/request-lifecycle-mvc) on the server side, through the [application service invocation](/flows/application-service-invocation), and back. Use it when you need to understand multi-tenant URL resolution, authentication header injection, exception translation, or what makes the [static client proxy](/http/dynamic-c-sharp-proxies) more efficient than the dynamic one.
+
+## Source map
+
+| File | Role |
+| ---- | ---- |
+| `framework/src/Volo.Abp.Http.Client/Microsoft/Extensions/DependencyInjection/ServiceCollectionHttpClientProxyExtensions.cs` | `AddHttpClientProxy<T>` and `AddHttpClientProxies(...)` — installs the proxy and the interceptor adapters. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/DynamicProxying/DynamicHttpProxyInterceptor.cs` | The `AbpInterceptor` that fires on every interface method call. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/DynamicProxying/DynamicHttpProxyInterceptorClientProxy.cs` | Adapter that exposes `ClientProxyBase.RequestAsync` to the interceptor. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/DynamicProxying/ApiDescriptionFinder.cs` | Fetches the server's `/api/abp/api-definition` JSON and caches it. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs` | The HTTP-building heart of the proxy: URL, payload, headers, send, exception translation. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyUrlBuilder.cs` | Renders the action template (`{id}`, query strings) from arguments. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyRequestPayloadBuilder.cs` | Builds the JSON / multipart body. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Authentication/IRemoteServiceHttpClientAuthenticator.cs` | Pluggable bearer-token / cookie injector. |
+| `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Proxying/DefaultProxyHttpClientFactory.cs` | Thin wrapper over `IHttpClientFactory`. |
+| `framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationProvider.cs` | Resolves the `BaseUrl` for the configured remote-service name, with multi-tenant URL rewriting. |
+| `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/ExceptionHandling/AbpExceptionHandlingMiddleware.cs` | Server-side: wraps thrown exceptions into `RemoteServiceErrorResponse` with the `X-Abp-Error-Format` header. |
+
+## The flow at a glance
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as Caller
+    participant Proxy as Castle proxy (interface)
+    participant DHPI as DynamicHttpProxyInterceptor&lt;T&gt;
+    participant Finder as ApiDescriptionFinder
+    participant CPB as ClientProxyBase&lt;T&gt;
+    participant RSCP as RemoteServiceConfigurationProvider
+    participant HC as HttpClient (via IProxyHttpClientFactory)
+    participant Server as Remote ABP server
+    participant Exh as AbpExceptionHandlingMiddleware
+
+    Caller->>Proxy: _service.GetAsync(id)
+    Proxy->>DHPI: InterceptAsync(invocation)
+    DHPI->>Finder: FindActionAsync(client, baseUrl, T, method)
+    Finder-->>DHPI: ActionApiDescriptionModel
+    DHPI->>CPB: CallRequestAsync<T>(context)
+    CPB->>RSCP: GetConfigurationOrDefaultAsync(serviceName)
+    RSCP-->>CPB: RemoteServiceConfiguration (BaseUrl, Version)
+    CPB->>CPB: BuildUrl + BuildContent + AddHeaders
+    CPB->>CPB: ClientAuthenticator.Authenticate(request)
+    CPB->>HC: SendAsync(requestMessage, ResponseHeadersRead)
+    HC->>Server: HTTP request (with X-Correlation-Id, tenant, culture)
+    Server->>Server: middleware + filters + action body (see [Request lifecycle](/flows/request-lifecycle-mvc))
+    alt body throws
+      Server->>Exh: exception
+      Exh-->>HC: 4xx/5xx + X-Abp-Error-Format
+      HC-->>CPB: HttpResponseMessage (not success)
+      CPB->>CPB: ThrowExceptionForResponseAsync → AbpRemoteCallException
+      CPB-->>DHPI: throws
+      DHPI-->>Proxy: throws
+      Proxy-->>Caller: throws AbpRemoteCallException
+    else success
+      Server-->>HC: 2xx + JSON body
+      HC-->>CPB: HttpResponseMessage success
+      CPB->>CPB: JsonSerializer.Deserialize&lt;T&gt;(body)
+      CPB-->>DHPI: T result
+      DHPI-->>Proxy: invocation.ReturnValue = result
+      Proxy-->>Caller: T
+    end
+```
+
+## Stage 1 — Registration
+
+A consumer wires up a dynamic client proxy with:
+
+```csharp
+context.Services.AddHttpClientProxies(
+    typeof(MyServiceApplicationModule).Assembly,
+    remoteServiceConfigurationName: "Default");
+```
+
+For each interface that extends `IRemoteService`, the registration extension builds two layered interceptors and installs a Castle proxy that has no target object (because there is no local implementation):
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Microsoft/Extensions/DependencyInjection/ServiceCollectionHttpClientProxyExtensions.cs"
+var interceptorType = typeof(DynamicHttpProxyInterceptor<>).MakeGenericType(type);
+services.AddTransient(interceptorType);
+
+var interceptorAdapterType = typeof(AbpAsyncDeterminationInterceptor<>).MakeGenericType(interceptorType);
+var validationInterceptorAdapterType =
+    typeof(AbpAsyncDeterminationInterceptor<>).MakeGenericType(typeof(ValidationInterceptor));
+
+if (asDefaultService)
+{
+    services.AddTransient(
+        type,
+        serviceProvider => ProxyGeneratorInstance
+            .CreateInterfaceProxyWithoutTarget(
+                type,
+                (IInterceptor)serviceProvider.GetRequiredService(validationInterceptorAdapterType),
+                (IInterceptor)serviceProvider.GetRequiredService(interceptorAdapterType)
+            )
+    );
+}
+```
+
+Two interceptors are attached, in this order:
+
+1. **`ValidationInterceptor`** — runs the same `IMethodInvocationValidator` checks as the server-side [application-service chain](/flows/application-service-invocation). Catching invalid input on the client saves a round trip.
+2. **`DynamicHttpProxyInterceptor<TService>`** — the HTTP-shaped interceptor.
+
+The `AbpHttpClientOptions.HttpClientProxies` dictionary records the mapping from the service interface to the configured `remoteServiceConfigurationName`. `AddHttpClientFactory` registers a named typed client so `IHttpClientFactory.CreateClient(name)` returns a properly-configured `HttpClient`.
+
+There is also `AddStaticHttpClientProxies` for source-generated [static client proxies](/http/dynamic-c-sharp-proxies); they short-circuit the API description fetch and inherit directly from `ClientProxyBase<TService>` instead of going through `DynamicHttpProxyInterceptor`. The remainder of this page focuses on the dynamic path because it is the path that takes the longest hop on its first call.
+
+## Stage 2 — The interception
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/DynamicProxying/DynamicHttpProxyInterceptor.cs"
+public override async Task InterceptAsync(IAbpMethodInvocation invocation)
+{
+    var context = new ClientProxyRequestContext(
+        await GetActionApiDescriptionModel(invocation),
+        invocation.ArgumentsDictionary,
+        typeof(TService));
+
+    if (invocation.Method.ReturnType.GenericTypeArguments.IsNullOrEmpty())
+    {
+        await InterceptorClientProxy.CallRequestAsync(context);
+    }
+    else
+    {
+        var returnType = invocation.Method.ReturnType.GenericTypeArguments[0];
+        var result = (Task)CallRequestAsyncMethod
+            .MakeGenericMethod(returnType)
+            .Invoke(this, new object[] { context })!;
+
+        invocation.ReturnValue = await GetResultAsync(result, returnType);
+    }
+}
+```
+
+`GetActionApiDescriptionModel` calls `IApiDescriptionFinder.FindActionAsync`:
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/DynamicProxying/DynamicHttpProxyInterceptor.cs"
+protected virtual async Task<ActionApiDescriptionModel> GetActionApiDescriptionModel(IAbpMethodInvocation invocation)
+{
+    var clientConfig = ClientOptions.HttpClientProxies.GetOrDefault(typeof(TService)) ??
+                       throw new AbpException($"Could not get DynamicHttpClientProxyConfig for {typeof(TService).FullName}.");
+    var remoteServiceConfig = await RemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync(clientConfig.RemoteServiceName);
+    var client = HttpClientFactory.Create(clientConfig.RemoteServiceName);
+
+    return await ApiDescriptionFinder.FindActionAsync(
+        client,
+        remoteServiceConfig.BaseUrl,
+        typeof(TService),
+        invocation.Method
+    );
+}
+```
+
+`ApiDescriptionFinder` performs **one GET** against `{baseUrl}/api/abp/api-definition` (cached by `ApiDescriptionCache`) and parses the JSON into a tree of `ApplicationApiDescriptionModel`. From that tree it locates the `ActionApiDescriptionModel` matching the interface method by name + parameter type-name signature. The cache is keyed by `BaseUrl` so each remote endpoint pays the cost only once per app domain.
+
+Once the action model is in hand, the interceptor unwraps the generic return type (so `Task<UserDto>` → `UserDto`) and uses reflection to invoke `CallRequestAsync<T>` on the `DynamicHttpProxyInterceptorClientProxy<TService>` — which simply forwards into `ClientProxyBase<TService>`.
+
+## Stage 3 — `ClientProxyBase`: building the HTTP request
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs"
+protected virtual async Task<HttpContent> RequestAsync(ClientProxyRequestContext requestContext)
+{
+    var clientConfig = ClientOptions.Value.HttpClientProxies.GetOrDefault(requestContext.ServiceType)
+        ?? throw new AbpException($"Could not get HttpClientProxyConfig for {requestContext.ServiceType.FullName}.");
+    var remoteServiceConfig = await RemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync(clientConfig.RemoteServiceName);
+
+    var client = HttpClientFactory.Create(clientConfig.RemoteServiceName);
+
+    var apiVersion = await GetApiVersionInfoAsync(requestContext);
+    var url = remoteServiceConfig.BaseUrl.EnsureEndsWith('/') + await GetUrlWithParametersAsync(requestContext, apiVersion);
+
+    var requestMessage = new HttpRequestMessage(requestContext.Action.GetHttpMethod(), url)
+    {
+        Content = await ClientProxyRequestPayloadBuilder.BuildContentAsync(
+            requestContext.Action, requestContext.Arguments, JsonSerializer, apiVersion)
+    };
+
+    AddHeaders(requestContext.Arguments, requestContext.Action, requestMessage, apiVersion);
+
+    if (requestContext.Action.AllowAnonymous != true)
+    {
+        await ClientAuthenticator.Authenticate(
+            new RemoteServiceHttpClientAuthenticateContext(client, requestMessage, remoteServiceConfig, clientConfig.RemoteServiceName));
+    }
+
+    HttpResponseMessage response;
+    try
+    {
+        response = await client.SendAsync(
+            requestMessage,
+            HttpCompletionOption.ResponseHeadersRead,
+            GetCancellationToken(requestContext.Arguments));
+    }
+    catch (Exception ex)
+    {
+        throw new AbpRemoteCallException(
+            $"An error occurred during the ABP remote HTTP request. ({ex.Message}) See the inner exception for details.", ex);
+    }
+
+    if (!response.IsSuccessStatusCode)
+    {
+        await ThrowExceptionForResponseAsync(response);
+    }
+
+    return response.Content;
+}
+```
+
+Four sub-steps deserve a closer look:
+
+<Steps>
+<Step title="Resolve the remote service configuration">
+`IRemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync(name)` reads `AbpRemoteServiceOptions` and applies any `IMultiTenantUrlProvider` rewriting (e.g. replacing `{0}` with the current tenant's hostname):
+
+```csharp title="framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationProvider.cs"
+protected virtual async Task<RemoteServiceConfiguration?> GetMultiTenantConfigurationAsync(RemoteServiceConfiguration? configuration)
+{
+    if (configuration == null) return configuration;
+
+    var baseUrl = await MultiTenantUrlProvider.GetUrlAsync(configuration.BaseUrl);
+    if (baseUrl == configuration.BaseUrl) return configuration;
+
+    return new RemoteServiceConfiguration(configuration) { BaseUrl = baseUrl };
+}
+```
+
+This is how the same client interface points to `https://tenant-a.api.example.com` and `https://tenant-b.api.example.com` based on the ambient `ICurrentTenant`. See [Multi-tenancy resolution](/multitenancy/overview).
+</Step>
+
+<Step title="Build URL and content">
+`ClientProxyUrlBuilder.GenerateUrlWithParametersAsync` walks `action.Parameters` and binds:
+
+- `BindingSource.Path` → `{id}` placeholders.
+- `BindingSource.Query` → query string (with multi-value handling).
+- `BindingSource.Body` → goes to the payload builder instead.
+
+`ClientProxyRequestPayloadBuilder.BuildContentAsync` serializes `Body` parameters with `IJsonSerializer`, switches to `MultipartFormDataContent` when any parameter is `IRemoteStreamContent`, and skips `CancellationToken` arguments entirely.
+</Step>
+
+<Step title="Add headers">
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs"
+protected virtual void AddHeaders(/* ... */)
+{
+    if (!apiVersion.Version.IsNullOrEmpty())
+    {
+        requestMessage.Headers.Add("accept", $"{MimeTypes.Text.Plain}; v={apiVersion.Version}");
+        requestMessage.Headers.Add("accept", $"{MimeTypes.Application.Json}; v={apiVersion.Version}");
+        requestMessage.Headers.Add("api-version", apiVersion.Version);
+    }
+
+    var headers = action.Parameters.Where(p => p.BindingSourceId == ParameterBindingSources.Header).ToArray();
+    foreach (var headerParameter in headers)
+    {
+        var value = HttpActionParameterHelper.FindParameterValue(argumentsDictionary, headerParameter);
+        if (value != null) requestMessage.Headers.Add(headerParameter.Name, value.ToString());
+    }
+
+    requestMessage.Headers.Add(AbpCorrelationIdOptions.Value.HttpHeaderName, CorrelationIdProvider.Get());
+
+    if (CurrentTenant.Id.HasValue)
+    {
+        requestMessage.Headers.Add(TenantResolverConsts.DefaultTenantKey, CurrentTenant.Id.Value.ToString());
+    }
+
+    var currentCulture = CultureInfo.CurrentUICulture.Name ?? CultureInfo.CurrentCulture.Name;
+    if (!currentCulture.IsNullOrEmpty())
+    {
+        requestMessage.Headers.AcceptLanguage.Add(new StringWithQualityHeaderValue(currentCulture));
+    }
+
+    requestMessage.Headers.Add("X-Requested-With", "XMLHttpRequest");
+}
+```
+
+Notable side effects:
+
+- **Correlation propagation** — the client copies the ambient `ICorrelationIdProvider.Get()` into the request. The remote server's [`AbpCorrelationIdMiddleware`](/flows/request-lifecycle-mvc#correlation-id) reads it back, so the two sides log under the same id.
+- **Tenant propagation** — when the caller has an ambient `ICurrentTenant.Id`, the proxy sets the standard `__tenant` header so the remote `ITenantResolveContributor` re-resolves to the same tenant.
+- **Culture propagation** — `Accept-Language` is set from `CultureInfo.CurrentUICulture`, so the remote `AbpRequestLocalizationMiddleware` picks the same culture.
+</Step>
+
+<Step title="Authenticate">
+For non-anonymous actions, `IRemoteServiceHttpClientAuthenticator` injects credentials. The default implementation no-ops; the `Volo.Abp.Http.Client.IdentityModel` package replaces it with a bearer-token authenticator that asks an `IIdentityModelAuthenticationService` for an access token. See [Calling remote services from a client](/http/remote-services).
+</Step>
+</Steps>
+
+The send itself uses `HttpCompletionOption.ResponseHeadersRead` so big payloads stream rather than buffer.
+
+## Stage 4 — Server-side: the request hits the wire
+
+On the server side, the request lands on the standard ABP middleware pipeline. The full trace is [Request lifecycle (MVC)](/flows/request-lifecycle-mvc); a compressed version for proxy calls:
+
+1. `AbpCorrelationIdMiddleware` reads the inbound `X-Correlation-Id`.
+2. The configured tenant resolvers (`HeaderTenantResolveContributor`) read `__tenant` and set `ICurrentTenant`.
+3. `AbpRequestLocalizationMiddleware` reads `Accept-Language`.
+4. `UseAuthentication` validates the bearer token.
+5. `AbpUnitOfWorkMiddleware` reserves a UoW.
+6. `AbpAuditingMiddleware` opens an audit scope.
+7. The endpoint routes to the auto-generated REST controller for the application service (see [Auto API controllers](/web/auto-api-controllers)).
+8. The MVC action invoker runs the standard ABP filter chain.
+9. The action calls `_appService.GetAsync(id)` — kicking off the [application-service invocation flow](/flows/application-service-invocation).
+10. The application service returns a DTO, which is serialized to JSON via `System.Text.Json`.
+11. The middleware unwinds: audit log is saved, UoW is completed, response is sent.
+
+If anything throws, `AbpExceptionFilter` or `AbpExceptionHandlingMiddleware` catches it and produces a `RemoteServiceErrorResponse`:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/ExceptionHandling/AbpExceptionHandlingMiddleware.cs"
+httpContext.Response.Clear();
+httpContext.Response.StatusCode = (int)statusCodeFinder.GetStatusCode(httpContext, exception);
+httpContext.Response.OnStarting(_clearCacheHeadersDelegate, httpContext.Response);
+httpContext.Response.Headers.Add(AbpHttpConsts.AbpErrorFormat, "true");
+httpContext.Response.Headers.Add("Content-Type", "application/json");
+
+await httpContext.Response.WriteAsync(
+    jsonSerializer.Serialize(
+        new RemoteServiceErrorResponse(
+            errorInfoConverter.Convert(exception, options =>
+            {
+                options.SendExceptionsDetailsToClients = exceptionHandlingOptions.SendExceptionsDetailsToClients;
+                options.SendStackTraceToClients = exceptionHandlingOptions.SendStackTraceToClients;
+            })
+        )
+    )
+);
+```
+
+The two facts that matter for the client are:
+
+- The HTTP status code is computed by `IHttpExceptionStatusCodeFinder` (401 for `AbpAuthorizationException`, 400 for `AbpValidationException`, etc.).
+- The `X-Abp-Error-Format: true` header signals "this body is structured `RemoteServiceErrorResponse` JSON".
+
+## Stage 5 — Back on the client: success or `AbpRemoteCallException`
+
+On success, the client deserializes:
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs"
+var stringContent = await responseContent.ReadAsStringAsync();
+if (typeof(T) == typeof(string)) return (T)(object)stringContent;
+
+if (stringContent.IsNullOrWhiteSpace()) return default!;
+
+return JsonSerializer.Deserialize<T>(stringContent);
+```
+
+For `IRemoteStreamContent` return types, the client wraps the response stream without buffering so file downloads stay efficient.
+
+On failure, `ThrowExceptionForResponseAsync` is the translation layer:
+
+```csharp title="framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs"
+protected virtual async Task ThrowExceptionForResponseAsync(HttpResponseMessage response)
+{
+    await LocalEventBus.PublishAsync(new ClientProxyExceptionEventData()
+    {
+        StatusCode = (int?)response.StatusCode,
+        ReasonPhrase = response.ReasonPhrase
+    });
+
+    if (response.Headers.Contains(AbpHttpConsts.AbpErrorFormat))
+    {
+        RemoteServiceErrorResponse errorResponse;
+        try
+        {
+            errorResponse = JsonSerializer.Deserialize<RemoteServiceErrorResponse>(
+                await response.Content.ReadAsStringAsync()
+            );
+        }
+        catch (Exception ex)
+        {
+            throw new AbpRemoteCallException(
+                new RemoteServiceErrorInfo { Message = response.ReasonPhrase, Code = response.StatusCode.ToString() },
+                ex)
+            { HttpStatusCode = (int)response.StatusCode };
+        }
+
+        throw new AbpRemoteCallException(errorResponse.Error)
+        { HttpStatusCode = (int)response.StatusCode };
+    }
+    else
+    {
+        throw new AbpRemoteCallException(
+            new RemoteServiceErrorInfo { Message = response.ReasonPhrase, Code = response.StatusCode.ToString() })
+        { HttpStatusCode = (int)response.StatusCode };
+    }
+}
+```
+
+The thrown `AbpRemoteCallException` preserves the structured `RemoteServiceErrorInfo` payload — including the localized message, the validation errors, and any details — so a caller in another ABP app can re-throw the same logical exception (e.g. an `AbpValidationException`) using the standard `IExceptionToErrorInfoConverter` round-trip. See [Exception handling](/web/exception-handling).
+
+The `ClientProxyExceptionEventData` published via `ILocalEventBus` is the hook for cross-cutting client-side error handling — UI components subscribe to it to show notifications, retries, or 401 → re-login flows. See [Local event bus](/events/local-event-bus).
+
+## Stage 6 — Caller resumes
+
+The Castle proxy writes `invocation.ReturnValue` and returns. The caller — whether it is a controller on a Blazor server, another application service, or a console worker — sees the deserialized DTO or the thrown exception just as if the call had been local. No knowledge of HTTP leaks out.
+
+## Static vs dynamic proxies — what differs
+
+Static client proxies (generated by `abp generate-proxy`) replace stages 2–3 with a hand-rolled subclass of `ClientProxyBase<TService>`:
+
+```csharp
+public partial class ProductsClientProxy : ClientProxyBase<IProductAppService>, IProductAppService
+{
+    public virtual Task<ProductDto> GetAsync(Guid id)
+        => RequestAsync<ProductDto>(nameof(GetAsync),
+            new ClientProxyRequestTypeValue
+            {
+                { typeof(Guid), id }
+            });
+}
+```
+
+This avoids the `/api/abp/api-definition` round trip and the Castle proxy hop — calls are just regular virtual method invocations. Stages 1, 4, 5, and 6 still apply unchanged because they live inside `ClientProxyBase`. The decision matrix is documented in [Static client proxies](/http/dynamic-c-sharp-proxies).
+
+## Multi-tenant, version, and culture round-trip
+
+A practical matrix of what flows automatically when you call a dynamic proxy from a multi-tenant Blazor server:
+
+| Caller state | Header sent | Server effect |
+| ------------ | ----------- | ------------- |
+| `ICurrentTenant.Id == tenantA` | `__tenant: <tenantA>` | `HeaderTenantResolveContributor` sets the same tenant on the server. |
+| `CultureInfo.CurrentUICulture == "tr"` | `Accept-Language: tr` | `AbpRequestLocalizationMiddleware` picks `tr`. |
+| Configured `ApiVersion = "2.0"` | `api-version: 2.0` and `Accept: application/json; v=2.0` | API versioning middleware routes to the v2 controller. |
+| `ICorrelationIdProvider.Get() == "abc"` | `X-Correlation-Id: abc` | `AbpCorrelationIdMiddleware` reuses it; the server logs under the same id. |
+
+This is why two ABP apps composed over dynamic proxies behave like one logical app: every cross-cutting context is propagated by `ClientProxyBase.AddHeaders` and re-hydrated by the server-side middleware.
+
+## Where to go next
+
+- **[Static client proxies](/http/dynamic-c-sharp-proxies)** — when to prefer the source-generated variant.
+- **[Remote services](/http/remote-services)** — what `AbpRemoteServiceOptions` actually contains and how to configure multiple named endpoints.
+- **[Auto API controllers](/web/auto-api-controllers)** — how the server side exposes the interfaces the client proxy targets.
+- **[Application-service invocation](/flows/application-service-invocation)** — the rest of stage 4: what runs inside the remote application service.
+- **[Request lifecycle (MVC)](/flows/request-lifecycle-mvc)** — the full server-side middleware/filter trace.
+- **[Multi-tenancy resolution](/multitenancy/overview)** — how `__tenant` is resolved on both sides.
+- **[Exception handling](/web/exception-handling)** — the full taxonomy of `AbpRemoteCallException` and `RemoteServiceErrorInfo`.

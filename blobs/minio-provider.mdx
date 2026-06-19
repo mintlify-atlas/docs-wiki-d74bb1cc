@@ -1,0 +1,334 @@
+---
+title: "MinIO BLOB provider: S3-compatible storage backend"
+sidebarTitle: "MinIO"
+description: "Volo.Abp.BlobStoring.Minio walkthrough: MinioBlobProvider, MinioBlobProviderConfiguration, the IMinioClient pipeline, and S3-compatible bucket layout."
+---
+
+The MinIO provider stores blobs in any S3-compatible object store via the official `Minio` .NET client. It is shipped by `Volo.Abp.BlobStoring.Minio` and is the natural choice for self-hosted, on-prem, or local-development S3 backends — MinIO, Ceph RGW, SeaweedFS, Backblaze B2 in S3 mode, etc. Application code keeps using `IBlobContainer<TContainer>` from the [BLOB Storing overview](/blobs/overview); only the `UseMinio(...)` extension changes.
+
+This page walks the package: `AbpBlobStoringMinioModule`, the `MinioBlobProvider` implementation against `IMinioClient`, the `MinioBlobContainerConfigurationExtensions.UseMinio(...)` extension, the `MinioBlobProviderConfiguration` strongly-typed view, the `DefaultMinioBlobNameCalculator`, and the `MinioBlobNamingNormalizer`.
+
+## Package layout
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpBlobStoringMinioModule.cs` | `AbpModule` | Depends on `AbpBlobStoringModule`. |
+| `MinioBlobProvider.cs` | `BlobProviderBase` | Implements `Save/Delete/Exists/GetOrNull` over `IMinioClient`. |
+| `MinioBlobContainerConfigurationExtensions.cs` | Static class | `UseMinio(...)` + `GetMinioConfiguration()`. |
+| `MinioBlobProviderConfiguration.cs` | Strongly typed view | `EndPoint`, `AccessKey`, `SecretKey`, `WithSSL`, `BucketName`, `CreateBucketIfNotExists`. |
+| `MinioBlobProviderConfigurationNames.cs` | Constants | String keys used in the property bag. |
+| `IMinioBlobNameCalculator.cs` / `DefaultMinioBlobNameCalculator.cs` | Service | Prefixes `host/` or `tenants/{tenantId}/` to the blob key. |
+| `MinioBlobNamingNormalizer.cs` | `IBlobNamingNormalizer` | Enforces MinIO bucket-name rules. |
+
+## Wiring — `UseMinio(...)`
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobContainerConfigurationExtensions.cs
+public static class MinioBlobContainerConfigurationExtensions
+{
+    public static MinioBlobProviderConfiguration GetMinioConfiguration(
+        this BlobContainerConfiguration containerConfiguration)
+    {
+        return new MinioBlobProviderConfiguration(containerConfiguration);
+    }
+
+    public static BlobContainerConfiguration UseMinio(
+        this BlobContainerConfiguration containerConfiguration,
+        Action<MinioBlobProviderConfiguration> minioConfigureAction)
+    {
+        containerConfiguration.ProviderType = typeof(MinioBlobProvider);
+        containerConfiguration.NamingNormalizers.TryAdd<MinioBlobNamingNormalizer>();
+
+        minioConfigureAction(new MinioBlobProviderConfiguration(containerConfiguration));
+
+        return containerConfiguration;
+    }
+}
+```
+
+Typical module wiring against a local MinIO instance:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseMinio(minio =>
+        {
+            minio.EndPoint   = "localhost:9000";
+            minio.AccessKey  = "minioadmin";
+            minio.SecretKey  = "minioadmin";
+            minio.WithSSL    = false;
+            minio.BucketName = "myapp-default";
+            minio.CreateBucketIfNotExists = true;
+        });
+    });
+});
+```
+
+## `MinioBlobProviderConfiguration`
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProviderConfigurationNames.cs
+public static class MinioBlobProviderConfigurationNames
+{
+    public const string BucketName = "Minio.BucketName";
+    public const string EndPoint = "Minio.EndPoint";
+    public const string AccessKey = "Minio.AccessKey";
+    public const string SecretKey = "Minio.SecretKey";
+    public const string WithSSL = "Minio.WithSSL";
+    public const string CreateBucketIfNotExists = "Minio.CreateBucketIfNotExists";
+}
+```
+
+The strongly-typed wrapper validates required values via `Check.NotNullOrWhiteSpace`:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProviderConfiguration.cs
+public class MinioBlobProviderConfiguration
+{
+    public string? BucketName  { /* … */ }
+    public string  EndPoint    { /* required */ }
+    public string  AccessKey   { /* required */ }
+    public string  SecretKey   { /* required */ }
+    public bool    WithSSL                  { /* default false */ }
+    public bool    CreateBucketIfNotExists  { /* default false */ }
+}
+```
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `EndPoint` | required | URL, domain, IPv4 or IPv6 address with port (e.g. `s3.example.com` or `localhost:9000`). |
+| `AccessKey` | required | Access key for the MinIO user. |
+| `SecretKey` | required | Secret key for the MinIO user. |
+| `WithSSL` | `false` | Enable HTTPS by calling `MinioClient.WithSSL()`. |
+| `BucketName` | `null` | Overrides the bucket name; falls back to the ABP container name when null. |
+| `CreateBucketIfNotExists` | `false` | If `true`, the provider creates the bucket on demand. |
+
+## `MinioBlobProvider`
+
+The provider builds an `IMinioClient` per call via the `MinioClient` fluent builder, runs the standard "already exists?" guard, optionally creates the bucket, and forwards to `PutObjectAsync` / `GetObjectAsync` / `RemoveObjectAsync`:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProvider.cs
+public async override Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var blobName     = MinioBlobNameCalculator.Calculate(args);
+    var configuration = args.Configuration.GetMinioConfiguration();
+    var client        = GetMinioClient(args);
+    var containerName = GetContainerName(args);
+
+    if (!args.OverrideExisting && await BlobExistsAsync(client, containerName, blobName))
+    {
+        throw new BlobAlreadyExistsException(
+            $"Saving BLOB '{args.BlobName}' does already exists in the container '{containerName}'!" +
+            $" Set {nameof(args.OverrideExisting)} if it should be overwritten.");
+    }
+
+    if (configuration.CreateBucketIfNotExists)
+    {
+        await CreateBucketIfNotExists(client, containerName);
+    }
+
+    await client.PutObjectAsync(new PutObjectArgs()
+        .WithBucket(containerName)
+        .WithObject(blobName)
+        .WithStreamData(args.BlobStream)
+        .WithObjectSize(args.BlobStream.Length));
+}
+```
+
+Client construction reads the configuration and wires SSL only when requested:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProvider.cs
+protected virtual IMinioClient GetMinioClient(BlobProviderArgs args)
+{
+    var configuration = args.Configuration.GetMinioConfiguration();
+
+    var client = new MinioClient()
+        .WithEndpoint(configuration.EndPoint)
+        .WithCredentials(configuration.AccessKey, configuration.SecretKey);
+
+    if (configuration.WithSSL)
+    {
+        client.WithSSL();
+    }
+
+    return client.Build();
+}
+```
+
+The read path uses `GetObjectAsync` with a `WithCallbackStream` callback that streams into a `MemoryStream`. The MinIO SDK invokes the callback with `null` if the object is missing, which the provider maps back to a `null` return:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProvider.cs
+public async override Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args)
+{
+    var blobName     = MinioBlobNameCalculator.Calculate(args);
+    var client       = GetMinioClient(args);
+    var containerName = GetContainerName(args);
+
+    if (!await BlobExistsAsync(client, containerName, blobName)) return null;
+
+    var memoryStream = new MemoryStream();
+    await client.GetObjectAsync(new GetObjectArgs()
+        .WithBucket(containerName)
+        .WithObject(blobName)
+        .WithCallbackStream(stream =>
+        {
+            if (stream != null)
+            {
+                stream.CopyTo(memoryStream);
+                memoryStream.Seek(0, SeekOrigin.Begin);
+            }
+            else
+            {
+                memoryStream = null;
+            }
+        }));
+
+    return memoryStream;
+}
+```
+
+Existence checking uses `BucketExistsAsync` + `StatObjectAsync`, converting `ObjectNotFoundException` into `false`:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProvider.cs
+protected virtual async Task<bool> BlobExistsAsync(IMinioClient client, string containerName, string blobName)
+{
+    if (await client.BucketExistsAsync(new BucketExistsArgs().WithBucket(containerName)))
+    {
+        try
+        {
+            await client.StatObjectAsync(new StatObjectArgs().WithBucket(containerName).WithObject(blobName));
+        }
+        catch (Exception e)
+        {
+            if (e is ObjectNotFoundException) return false;
+            throw;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+protected virtual async Task CreateBucketIfNotExists(IMinioClient client, string containerName)
+{
+    if (!await client.BucketExistsAsync(new BucketExistsArgs().WithBucket(containerName)))
+    {
+        await client.MakeBucketAsync(new MakeBucketArgs().WithBucket(containerName));
+    }
+}
+```
+
+Bucket name resolution falls back to the ABP container name (after running it through the normalizer) when `BucketName` is not set:
+
+```csharp Volo.Abp.BlobStoring.Minio/MinioBlobProvider.cs
+protected virtual string GetContainerName(BlobProviderArgs args)
+{
+    var configuration = args.Configuration.GetMinioConfiguration();
+
+    return configuration.BucketName.IsNullOrWhiteSpace()
+        ? args.ContainerName
+        : BlobNormalizeNamingService.NormalizeContainerName(args.Configuration, configuration.BucketName!);
+}
+```
+
+## `DefaultMinioBlobNameCalculator`
+
+The calculator scopes blob keys by tenant the same way as the AWS and Azure providers:
+
+```text
+{bucket}/
+├── host/{blob}
+└── tenants/{tenantId}/{blob}
+```
+
+This makes it trivial to set up per-tenant bucket policies through path prefixes without having to allocate a bucket per tenant.
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    participant App  as Application code
+    participant Cont as IBlobContainer&lt;TContainer&gt;
+    participant Prov as MinioBlobProvider
+    participant Calc as DefaultMinioBlobNameCalculator
+    participant Mio  as IMinioClient
+
+    App->>Cont: SaveAsync("logo.png", stream)
+    Cont->>Cont: NormalizeNaming (lowercase, dash-only)
+    Cont->>Prov: SaveAsync(BlobProviderSaveArgs)
+    Prov->>Calc: Calculate(args)
+    Calc-->>Prov: tenants/{tid}/logo.png
+    Prov->>Mio:  new MinioClient().WithEndpoint(...).WithCredentials(...).Build()
+    Prov->>Mio:  BucketExistsAsync + MakeBucketAsync (if configured)
+    Prov->>Mio:  PutObjectAsync(bucket, key, stream)
+    Prov-->>Cont: done
+    Cont-->>App: done
+```
+
+## Operational notes
+
+- **Endpoint format** — pass `host:port` (e.g. `minio.example.com:9000`). The MinIO client builds the URL scheme itself based on `WithSSL`. Do not prepend `http://` or `https://`.
+- **HTTPS** — set `WithSSL = true` when the endpoint listens on TLS. Self-signed dev certs work because the underlying `HttpClient` is the .NET default; override the factory if you need custom certificate handling.
+- **Client lifecycle** — `MinioBlobProvider` creates a new `IMinioClient` per call. For high-throughput services, derive a custom provider that caches the client per `(EndPoint, AccessKey)`.
+- **Compatibility** — the provider works against any S3-compatible service that the `Minio` client supports. Verify your target service accepts the v4 signing protocol used by the SDK.
+
+## Customizing the MinIO client
+
+If you need MinIO SDK features not exposed by `MinioBlobProviderConfiguration` (custom `HttpClient`, retry policies, signed URLs, region overrides), derive `MinioBlobProvider` and override `GetMinioClient`:
+
+```csharp
+public class CustomMinioBlobProvider : MinioBlobProvider
+{
+    private static readonly IMinioClient SharedClient = BuildClient();
+
+    public CustomMinioBlobProvider(
+        IMinioBlobNameCalculator nameCalculator,
+        IBlobNormalizeNamingService normalizeNamingService)
+        : base(nameCalculator, normalizeNamingService) { }
+
+    protected override IMinioClient GetMinioClient(BlobProviderArgs args)
+        => SharedClient;
+
+    private static IMinioClient BuildClient()
+    {
+        return new MinioClient()
+            .WithEndpoint("s3.example.com")
+            .WithCredentials("accessKey", "secretKey")
+            .WithSSL()
+            .WithRegion("us-east-1")
+            .Build();
+    }
+}
+```
+
+Then register the override with `[Dependency(ReplaceServices = true)]`. A long-lived client avoids the per-call `MinioClient` construction cost and lets you tune `HttpClient` timeouts globally.
+
+## Customizing the bucket name calculator
+
+`DefaultMinioBlobNameCalculator` follows the same `host/...` and `tenants/{tenantId}/...` convention as the other providers. For per-tenant buckets (where each tenant should own a dedicated S3 bucket), supply a custom `IMinioBlobNameCalculator` *and* a custom `GetContainerName` override. The blob name calculator alone is not enough — it only shapes the **key** path inside a single bucket.
+
+## Bucket policies and lifecycle
+
+When you let `CreateBucketIfNotExists = true`, MinIO creates the bucket with default policies (no public access, no lifecycle rules). For production:
+
+- Pre-create buckets via the MinIO Admin API / `mc` CLI.
+- Apply lifecycle rules to expire `tenants/{tenantId}/...` prefixes for offboarded tenants.
+- Set per-tenant policies that only allow access by the tenant's IAM user (when you front your application through the MinIO Identity provider).
+
+Leaving `CreateBucketIfNotExists = false` makes the runtime path read-only on the bucket management plane and surfaces missing-bucket errors clearly during the first request.
+
+## Operational notes
+
+- **Endpoint format** — pass `host:port` (e.g. `minio.example.com:9000`). The MinIO client builds the URL scheme itself based on `WithSSL`. Do not prepend `http://` or `https://`.
+- **HTTPS** — set `WithSSL = true` when the endpoint listens on TLS. Self-signed dev certs work because the underlying `HttpClient` is the .NET default; override the factory if you need custom certificate handling.
+- **Client lifecycle** — `MinioBlobProvider` creates a new `IMinioClient` per call. For high-throughput services, derive a custom provider that caches the client per `(EndPoint, AccessKey)`.
+- **Compatibility** — the provider works against any S3-compatible service that the `Minio` client supports. Verify your target service accepts the v4 signing protocol used by the SDK.
+- **Multipart uploads** — the `PutObjectAsync` call relies on `args.BlobStream.Length` for the `WithObjectSize(...)` argument. If your stream is non-seekable, buffer it first or derive the provider to use the MinIO SDK's chunked upload APIs.
+- **Region** — vanilla MinIO does not enforce regions, but other S3-compatible vendors (Cloudflare R2, Backblaze B2, Wasabi) do. Add `WithRegion(...)` in a custom provider when targeting them.
+
+## Cross-references
+
+- [BLOB Storing overview](/blobs/overview) — container resolution, naming normalization service.
+- [AWS S3 provider](/blobs/aws-provider) — sibling provider against AWS-native S3.
+- [Azure provider](/blobs/azure-provider) — sibling provider with the same tenant-prefix layout.
+- [Background jobs](/background/jobs-overview) — handy for offloading large uploads to a worker.

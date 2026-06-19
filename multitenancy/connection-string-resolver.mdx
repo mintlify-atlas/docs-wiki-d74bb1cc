@@ -1,0 +1,696 @@
+---
+title: "Per-Tenant Connection Strings and MultiTenantUrlProvider"
+sidebarTitle: "Connection strings"
+description: "How ABP routes per-tenant connection strings through IConnectionStringResolver, MultiTenantConnectionStringResolver, ITenantStore and the URL provider."
+---
+
+The multi-tenancy stack does not stop at filtering rows — it also lets each
+tenant point at *its own database* (or its own connection string for a
+specific module's database). The mechanism is a chain of three services
+working together: `IConnectionStringResolver` is the public contract from
+`Volo.Abp.Data`; `MultiTenantConnectionStringResolver` in
+`framework/src/Volo.Abp.MultiTenancy/` overrides the default implementation
+to consult the current tenant; and an `ITenantStore` implementation supplies
+the `TenantConfiguration` (with its `ConnectionStrings` dictionary) the
+resolver inspects. This page walks the resolution algorithm end to end and
+documents the in-memory and module-specific stores that back it. The Tenant
+Management module's persistent store is described separately on
+[/multitenancy/tenant-management-module](/multitenancy/tenant-management-module).
+
+## File inventory
+
+| Path (relative to repo root) | Role |
+| --- | --- |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringResolver.cs` | Public contract used by every ABP data provider |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/DefaultConnectionStringResolver.cs` | Reads from `AbpDbConnectionOptions` only |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConnectionOptions.cs` | `ConnectionStrings` + `Databases` configuration |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStrings.cs` | `Dictionary<string, string?>` with a `Default` slot |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringResolverExtensions.cs` | `ResolveAsync<T>()` helper |
+| `framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringNameAttribute.cs` | Maps a DbContext type to a logical name |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs` | Overrides `DefaultConnectionStringResolver` to consult the current tenant |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/TenantConfigurationProvider.cs` | Runs the resolver, loads + validates the tenant |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/ConfigurationStore/DefaultTenantStore.cs` | In-memory `ITenantStore` over `AbpDefaultTenantStoreOptions` |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantStore.cs` | `FindAsync(id)` / `FindAsync(name)` |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConfiguration.cs` | The shape returned by the store |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ConfigurationStore/AbpDefaultTenantStoreOptions.cs` | `TenantConfiguration[] Tenants` |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantUrlProvider.cs` | Substitutes `{{tenantId}}` / `{{tenantName}}` in template URLs |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IMultiTenantUrlProvider.cs` | Contract for `MultiTenantUrlProvider` |
+| `modules/tenant-management/src/Volo.Abp.TenantManagement.Domain/Volo/Abp/TenantManagement/TenantStore.cs` | Module-specific store backed by `ITenantRepository` |
+
+## The base contract
+
+```csharp framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringResolver.cs
+public interface IConnectionStringResolver
+{
+    [NotNull]
+    [Obsolete("Use ResolveAsync method.")]
+    string Resolve(string? connectionStringName = null);
+
+    [NotNull]
+    Task<string> ResolveAsync(string? connectionStringName = null);
+}
+```
+
+Every ABP data provider — `AbpDbContext`, `MongoDbContext`,
+`AbpDbConnectionStringChecker`, the freeRedis cache options builder — depends
+on this interface, not on `IConfiguration` directly. That single layer of
+indirection is what makes per-tenant routing possible without rewriting any
+of the persistence code.
+
+A `null` `connectionStringName` means **"the default"**; non-null names are
+treated as logical labels. The convention is that each module declares a
+constant — e.g. `AbpIdentityDbProperties.ConnectionStringName = "AbpIdentity"`
+— and decorates its DbContext with
+`[ConnectionStringName("AbpIdentity")]`. The generic helper resolves that
+label from the type:
+
+```csharp framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringResolverExtensions.cs (excerpt)
+public static Task<string> ResolveAsync<T>(this IConnectionStringResolver resolver)
+{
+    return resolver.ResolveAsync(typeof(T));
+}
+
+public static Task<string> ResolveAsync(this IConnectionStringResolver resolver, Type type)
+{
+    return resolver.ResolveAsync(ConnectionStringNameAttribute.GetConnStringName(type));
+}
+```
+
+## The default (non-tenant) implementation
+
+```csharp framework/src/Volo.Abp.Data/Volo/Abp/Data/DefaultConnectionStringResolver.cs (excerpt)
+public class DefaultConnectionStringResolver : IConnectionStringResolver, ITransientDependency
+{
+    protected AbpDbConnectionOptions Options { get; }
+
+    public DefaultConnectionStringResolver(IOptionsMonitor<AbpDbConnectionOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public virtual Task<string> ResolveAsync(string? connectionStringName = null)
+    {
+        return Task.FromResult(ResolveInternal(connectionStringName))!;
+    }
+
+    private string? ResolveInternal(string? connectionStringName)
+    {
+        if (connectionStringName == null)
+        {
+            return Options.ConnectionStrings.Default;
+        }
+
+        var connectionString = Options.GetConnectionStringOrNull(connectionStringName);
+
+        if (!connectionString.IsNullOrEmpty())
+        {
+            return connectionString;
+        }
+
+        return null;
+    }
+}
+```
+
+The host-side algorithm is simple:
+
+1. No name → return `ConnectionStrings.Default`.
+2. With a name → call
+   `Options.GetConnectionStringOrNull(name, fallbackToDatabaseMappings: true, fallbackToDefault: true)`.
+
+That second helper is where the **database mapping** layer kicks in:
+
+```csharp framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConnectionOptions.cs (excerpt)
+public string? GetConnectionStringOrNull(
+    string connectionStringName,
+    bool fallbackToDatabaseMappings = true,
+    bool fallbackToDefault = true)
+{
+    var connectionString = ConnectionStrings.GetOrDefault(connectionStringName);
+    if (!connectionString.IsNullOrEmpty())
+    {
+        return connectionString;
+    }
+
+    if (fallbackToDatabaseMappings)
+    {
+        var database = Databases.GetMappedDatabaseOrNull(connectionStringName);
+        if (database != null)
+        {
+            connectionString = ConnectionStrings.GetOrDefault(database.DatabaseName);
+            if (!connectionString.IsNullOrEmpty())
+            {
+                return connectionString;
+            }
+        }
+    }
+
+    if (fallbackToDefault)
+    {
+        connectionString = ConnectionStrings.Default;
+        if (!connectionString.IsNullOrWhiteSpace())
+        {
+            return connectionString;
+        }
+    }
+
+    return null;
+}
+```
+
+`Databases` is the `AbpDatabaseInfoDictionary` you configure when several
+modules need to share a physical database — see [/data](/data) for the full
+description.
+
+## The multi-tenant override
+
+`MultiTenantConnectionStringResolver` lives in the multi-tenancy package and
+uses `[Dependency(ReplaceServices = true)]` to **replace**
+`DefaultConnectionStringResolver` whenever `AbpMultiTenancyModule` is
+loaded:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs (excerpt)
+[Dependency(ReplaceServices = true)]
+public class MultiTenantConnectionStringResolver : DefaultConnectionStringResolver
+{
+    public override async Task<string> ResolveAsync(string? connectionStringName = null)
+    {
+        if (_currentTenant.Id == null)
+        {
+            return await base.ResolveAsync(connectionStringName); // host
+        }
+
+        var tenant = await FindTenantConfigurationAsync(_currentTenant.Id.Value);
+        if (tenant == null || tenant.ConnectionStrings.IsNullOrEmpty())
+        {
+            return await base.ResolveAsync(connectionStringName);
+        }
+
+        var tenantDefault = tenant.ConnectionStrings?.Default;
+
+        if (connectionStringName == null ||
+            connectionStringName == ConnectionStrings.DefaultConnectionStringName)
+        {
+            return !tenantDefault.IsNullOrWhiteSpace()
+                ? tenantDefault!
+                : Options.ConnectionStrings.Default!;
+        }
+
+        var connString = tenant.ConnectionStrings?.GetOrDefault(connectionStringName);
+        if (!connString.IsNullOrWhiteSpace())
+        {
+            return connString!;
+        }
+
+        var database = Options.Databases.GetMappedDatabaseOrNull(connectionStringName);
+        if (database != null && database.IsUsedByTenants)
+        {
+            connString = tenant.ConnectionStrings?.GetOrDefault(database.DatabaseName);
+            if (!connString.IsNullOrWhiteSpace())
+            {
+                return connString!;
+            }
+        }
+
+        if (!tenantDefault.IsNullOrWhiteSpace())
+        {
+            return tenantDefault!;
+        }
+
+        return await base.ResolveAsync(connectionStringName);
+    }
+}
+```
+
+### Resolution order
+
+For a request inside `ICurrentTenant.Change(tenantId, ...)`, the resolver
+walks **six** steps before giving up:
+
+```mermaid
+flowchart TD
+    A[ResolveAsync(name)] --> B{CurrentTenant.Id?}
+    B -- null --> Z[DefaultConnectionStringResolver]
+    B -- value --> C[ITenantStore.FindAsync(id)]
+    C --> D{tenant.ConnectionStrings empty?}
+    D -- yes --> Z
+    D -- no --> E{name == null or 'Default'?}
+    E -- yes --> F[tenant.Default ?? Options.Default]
+    E -- no --> G{tenant.ConnectionStrings[name]?}
+    G -- found --> R1[return]
+    G -- missing --> H{Databases mapping IsUsedByTenants?}
+    H -- yes --> I{tenant[database.DatabaseName]?}
+    I -- found --> R2[return]
+    H -- no --> J{tenant.Default?}
+    I -- missing --> J
+    J -- yes --> K[return tenant.Default]
+    J -- no --> Z
+```
+
+The two important facts to remember:
+
+- **The host's `appsettings.json` is still consulted.** A tenant that defines
+  a default but doesn't override `"AbpIdentity"` will fall back to the
+  host-level mapped database (step `H`/`I`) before finally falling back to
+  the host's plain default. That makes the *shared* and *hybrid* deployment
+  styles work without any per-tenant configuration.
+- **The lookup runs in a fresh scope.** `FindTenantConfigurationAsync`
+  creates a new `IServiceScope` so it can resolve `ITenantStore` without
+  fighting for the request's current `IServiceProvider`. The
+  Tenant Management module's `TenantStore` is **transient**, so this is
+  safe.
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs (excerpt)
+protected virtual async Task<TenantConfiguration?> FindTenantConfigurationAsync(Guid tenantId)
+{
+    using (var serviceScope = _serviceProvider.CreateScope())
+    {
+        var tenantStore = serviceScope
+            .ServiceProvider
+            .GetRequiredService<ITenantStore>();
+
+        return await tenantStore.FindAsync(tenantId);
+    }
+}
+```
+
+## `TenantConfiguration` and its connection strings
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConfiguration.cs
+[Serializable]
+public class TenantConfiguration
+{
+    public Guid Id { get; set; }
+
+    public string Name { get; set; } = default!;
+
+    public ConnectionStrings? ConnectionStrings { get; set; }
+
+    public bool IsActive { get; set; }
+
+    public TenantConfiguration()
+    {
+        IsActive = true;
+    }
+
+    public TenantConfiguration(Guid id, [NotNull] string name)
+        : this()
+    {
+        Check.NotNull(name, nameof(name));
+
+        Id = id;
+        Name = name;
+
+        ConnectionStrings = new ConnectionStrings();
+    }
+}
+```
+
+`ConnectionStrings` is the same dictionary type as the host's:
+
+```csharp framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStrings.cs
+[Serializable]
+public class ConnectionStrings : Dictionary<string, string?>
+{
+    public const string DefaultConnectionStringName = "Default";
+
+    public string? Default {
+        get => this.GetOrDefault(DefaultConnectionStringName);
+        set => this[DefaultConnectionStringName] = value;
+    }
+}
+```
+
+So a tenant can carry an arbitrary set of named entries — `"Default"`,
+`"AbpIdentity"`, `"AbpAuditLogging"`, etc. — exactly mirroring the keys you
+would find in the host's `ConnectionStrings` section.
+
+## How `TenantConfigurationProvider` fits in
+
+`MultiTenantConnectionStringResolver` is called *after* the tenant has
+already been selected. The selection itself is the job of
+`TenantConfigurationProvider`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/TenantConfigurationProvider.cs (excerpt)
+public class TenantConfigurationProvider : ITenantConfigurationProvider, ITransientDependency
+{
+    public virtual async Task<TenantConfiguration?> GetAsync(bool saveResolveResult = false)
+    {
+        var resolveResult = await TenantResolver.ResolveTenantIdOrNameAsync();
+
+        if (saveResolveResult)
+        {
+            TenantResolveResultAccessor.Result = resolveResult;
+        }
+
+        TenantConfiguration? tenant = null;
+        if (resolveResult.TenantIdOrName != null)
+        {
+            tenant = await FindTenantAsync(resolveResult.TenantIdOrName);
+
+            if (tenant == null)
+            {
+                throw new BusinessException(
+                    code: "Volo.AbpIo.MultiTenancy:010001",
+                    message: StringLocalizer["TenantNotFoundMessage"],
+                    details: StringLocalizer["TenantNotFoundDetails", resolveResult.TenantIdOrName]
+                );
+            }
+
+            if (!tenant.IsActive)
+            {
+                throw new BusinessException(
+                    code: "Volo.AbpIo.MultiTenancy:010002",
+                    message: StringLocalizer["TenantNotActiveMessage"],
+                    details: StringLocalizer["TenantNotActiveDetails", resolveResult.TenantIdOrName]
+                );
+            }
+        }
+
+        return tenant;
+    }
+
+    protected virtual async Task<TenantConfiguration?> FindTenantAsync(string tenantIdOrName)
+    {
+        if (Guid.TryParse(tenantIdOrName, out var parsedTenantId))
+        {
+            return await TenantStore.FindAsync(parsedTenantId);
+        }
+        else
+        {
+            return await TenantStore.FindAsync(tenantIdOrName);
+        }
+    }
+}
+```
+
+Two things are nailed down here:
+
+- The store is queried **by id when the resolver produced a Guid string** and
+  **by name otherwise**. That is why `HeaderTenantResolveContributor` and
+  friends can carry either a Guid or a tenant name in the same string slot.
+- The two `BusinessException` codes — `Volo.AbpIo.MultiTenancy:010001` and
+  `010002` — are exactly the exceptions the ASP.NET Core middleware catches
+  and turns into a 404 with an `Abp-Tenant-Resolve-Error` header, documented
+  on [/multitenancy/aspnet-core-resolvers](/multitenancy/aspnet-core-resolvers).
+
+## The default in-memory store
+
+The default `ITenantStore` is configuration-backed:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/ConfigurationStore/DefaultTenantStore.cs
+[Dependency(TryRegister = true)]
+public class DefaultTenantStore : ITenantStore, ITransientDependency
+{
+    private readonly AbpDefaultTenantStoreOptions _options;
+
+    public DefaultTenantStore(IOptionsMonitor<AbpDefaultTenantStoreOptions> options)
+    {
+        _options = options.CurrentValue;
+    }
+
+    public Task<TenantConfiguration?> FindAsync(string name)
+    {
+        return Task.FromResult(Find(name));
+    }
+
+    public Task<TenantConfiguration?> FindAsync(Guid id)
+    {
+        return Task.FromResult(Find(id));
+    }
+
+    public TenantConfiguration? Find(string name)
+    {
+        return _options.Tenants?.FirstOrDefault(t => t.Name == name);
+    }
+
+    public TenantConfiguration? Find(Guid id)
+    {
+        return _options.Tenants?.FirstOrDefault(t => t.Id == id);
+    }
+}
+```
+
+Its source is `AbpDefaultTenantStoreOptions`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ConfigurationStore/AbpDefaultTenantStoreOptions.cs
+public class AbpDefaultTenantStoreOptions
+{
+    public TenantConfiguration[] Tenants { get; set; }
+
+    public AbpDefaultTenantStoreOptions()
+    {
+        Tenants = Array.Empty<TenantConfiguration>();
+    }
+}
+```
+
+…and `AbpMultiTenancyModule` binds the options from
+`IConfiguration` on startup:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AbpMultiTenancyModule.cs (excerpt)
+var configuration = context.Services.GetConfiguration();
+Configure<AbpDefaultTenantStoreOptions>(configuration);
+```
+
+So the tiniest possible multi-tenant configuration is a stanza in
+`appsettings.json`:
+
+```json appsettings.json
+{
+  "Tenants": [
+    {
+      "Id": "446a5211-3d72-4339-9adc-845151f8ada0",
+      "Name": "acme",
+      "IsActive": true,
+      "ConnectionStrings": {
+        "Default": "Server=db-acme;Database=Acme;..."
+      }
+    },
+    {
+      "Id": "06ce3ec6-3a8e-4d12-a4ba-1ed3b5f5a3da",
+      "Name": "globex",
+      "IsActive": true,
+      "ConnectionStrings": {
+        "Default": "Server=db-globex;Database=Globex;...",
+        "AbpAuditLogging": "Server=audit-shared;Database=Audit;..."
+      }
+    }
+  ]
+}
+```
+
+<Note>
+`DefaultTenantStore` carries `[Dependency(TryRegister = true)]`. Any
+implementation registered *before* the multi-tenancy module — including the
+Tenant Management module's `TenantStore` — wins. That is how you graduate
+from in-memory to database-backed tenants without changing application code.
+</Note>
+
+## Module-specific stores
+
+The Tenant Management module replaces the default store with a
+`TenantRepository`-backed cache:
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Domain/Volo/Abp/TenantManagement/TenantStore.cs (excerpt)
+public class TenantStore : ITenantStore, ITransientDependency
+{
+    protected ITenantRepository TenantRepository { get; }
+    protected IObjectMapper<AbpTenantManagementDomainModule> ObjectMapper { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+    protected IDistributedCache<TenantCacheItem> Cache { get; }
+
+    public virtual async Task<TenantConfiguration> FindAsync(string name)
+    {
+        return (await GetCacheItemAsync(null, name)).Value;
+    }
+
+    public virtual async Task<TenantConfiguration> FindAsync(Guid id)
+    {
+        return (await GetCacheItemAsync(id, null)).Value;
+    }
+
+    protected virtual async Task<TenantCacheItem> GetCacheItemAsync(Guid? id, string name)
+    {
+        var cacheKey = CalculateCacheKey(id, name);
+
+        var cacheItem = await Cache.GetAsync(cacheKey, considerUow: true);
+        if (cacheItem != null)
+        {
+            return cacheItem;
+        }
+
+        if (id.HasValue)
+        {
+            using (CurrentTenant.Change(null))
+            {
+                var tenant = await TenantRepository.FindAsync(id.Value);
+                return await SetCacheAsync(cacheKey, tenant);
+            }
+        }
+
+        if (!name.IsNullOrWhiteSpace())
+        {
+            using (CurrentTenant.Change(null))
+            {
+                var tenant = await TenantRepository.FindByNameAsync(name);
+                return await SetCacheAsync(cacheKey, tenant);
+            }
+        }
+
+        throw new AbpException("Both id and name can't be invalid.");
+    }
+}
+```
+
+Notable details:
+
+- The repository call is wrapped in `CurrentTenant.Change(null)` so that the
+  query runs on the **host** database — without that, looking up tenant
+  `Acme` would attempt to query Acme's database for the row that *describes*
+  Acme.
+- The cache is `IDistributedCache<TenantCacheItem>` with `considerUow: true`,
+  which means changes committed in the current unit of work are visible
+  immediately and rolled back together with it.
+- `TenantCacheItemInvalidator` (a sibling class) listens to
+  `EntityChangedEventData<Tenant>` and evicts both the id-keyed and
+  name-keyed cache items.
+
+See [/multitenancy/tenant-management-module](/multitenancy/tenant-management-module)
+for the full description.
+
+## Calling the resolver in your code
+
+Inject `IConnectionStringResolver` directly when you need a raw connection
+string (typically for ad-hoc Dapper queries):
+
+```csharp
+public class ReportingService : ITransientDependency
+{
+    private readonly IConnectionStringResolver _resolver;
+
+    public ReportingService(IConnectionStringResolver resolver)
+    {
+        _resolver = resolver;
+    }
+
+    public async Task<int> CountAsync()
+    {
+        var connectionString = await _resolver.ResolveAsync("Reporting");
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        return await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Reports");
+    }
+}
+```
+
+EF Core and MongoDB DbContexts already call the resolver under the hood —
+you do not need to inject it for normal repository operations.
+
+## Switching tenants programmatically
+
+The resolver re-reads `ICurrentTenant.Id` on every call, so the standard
+`Change(...)` scope from
+[/multitenancy/current-tenant](/multitenancy/current-tenant) is how you
+switch databases inside a background job, a queue consumer, or a unit test:
+
+```csharp
+public class TenantImportJob : IAsyncBackgroundJob<TenantImportJobArgs>, ITransientDependency
+{
+    private readonly ICurrentTenant _currentTenant;
+    private readonly IReportRepository _reports;
+
+    public async Task ExecuteAsync(TenantImportJobArgs args)
+    {
+        using (_currentTenant.Change(args.TenantId))
+        {
+            // every IConnectionStringResolver call inside this scope
+            // is routed through args.TenantId's connection strings
+            await _reports.InsertManyAsync(args.Rows);
+        }
+    }
+}
+```
+
+## `MultiTenantUrlProvider`
+
+The same `TenantConfiguration` is also used to **rewrite URLs** that need a
+per-tenant host name — for OpenIddict authority URLs, OAuth callback URLs,
+external links in emails, and so on. The contract:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IMultiTenantUrlProvider.cs
+public interface IMultiTenantUrlProvider
+{
+    Task<string> GetUrlAsync(string templateUrl);
+}
+```
+
+The default implementation walks three placeholders, hydrating each one
+from `ICurrentTenant` (or falling back to `ITenantStore` when only the id is
+known):
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantUrlProvider.cs (excerpt)
+public class MultiTenantUrlProvider : IMultiTenantUrlProvider, ITransientDependency
+{
+    public const string TenantPlaceHolder = "{0}";
+    public const string TenantIdPlaceHolder = "{{tenantId}}";
+    public const string TenantNamePlaceHolder = "{{tenantName}}";
+
+    public virtual async Task<string> GetUrlAsync(string templateUrl)
+        => await ReplacePlaceHoldersAsync(templateUrl);
+
+    protected virtual async Task<string> ReplacePlaceHolderAsync(string templateUrl, string placeHolder)
+    {
+        if (!templateUrl.Contains(placeHolder)) return templateUrl;
+
+        var placeHolderValue = string.Empty;
+        if (CurrentTenant.IsAvailable)
+        {
+            placeHolderValue = (placeHolder == TenantIdPlaceHolder
+                ? CurrentTenant.Id!.Value.ToString()
+                : await GetCurrentTenantNameAsync()) + ".";
+        }
+
+        if (templateUrl.Contains(placeHolder + '.'))
+        {
+            placeHolder += '.';
+        }
+
+        return templateUrl.Replace(placeHolder, placeHolderValue);
+    }
+}
+```
+
+Three placeholders are recognised:
+
+| Placeholder | Replacement on tenant side | Replacement on host side |
+| --- | --- | --- |
+| `{{tenantId}}` | `<guid>.` | empty |
+| `{{tenantName}}` | `<name>.` | empty |
+| `{0}` | `<name>.` | empty |
+
+Given a template `"https://{{tenantName}}.myapp.com/oidc/callback"`:
+
+- For tenant `acme` → `https://acme.myapp.com/oidc/callback`
+- For the host → `https://myapp.com/oidc/callback`
+
+The `placeHolder + '.'` trick collapses the dot left over after host-side
+substitution — that is what keeps the URL valid in both modes.
+
+## Reading list
+
+- [/multitenancy/overview](/multitenancy/overview) — the abstractions that
+  underpin `TenantConfiguration` and `ITenantStore`.
+- [/multitenancy/tenant-resolvers](/multitenancy/tenant-resolvers) — how
+  `TenantConfigurationProvider` decides which tenant to load.
+- [/multitenancy/aspnet-core-resolvers](/multitenancy/aspnet-core-resolvers) —
+  the HTTP-side contributors and the middleware that calls the provider.
+- [/multitenancy/current-tenant](/multitenancy/current-tenant) —
+  `ICurrentTenant.Change(...)` for switching databases programmatically.
+- [/multitenancy/tenant-management-module](/multitenancy/tenant-management-module) —
+  the persistent store that supplies `TenantConfiguration` in production
+  applications.
+- [/data](/data) — `AbpDbConnectionOptions`, the `Databases` mapping, and
+  the connection-string checker.
+- [/modules/tenant-management](/modules/tenant-management/overview) — the
+  full Tenant Management module surface.

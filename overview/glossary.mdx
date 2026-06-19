@@ -1,0 +1,539 @@
+---
+title: "Glossary of ABP Framework terms and source-file pointers"
+sidebarTitle: "Glossary"
+description: "Definitions for every term in ABP Framework — Module, AppService, Aggregate, UnitOfWork, EventBus, Permission, Feature, Setting — each tied to source."
+---
+
+Working in the ABP Framework codebase means crossing many subsystems quickly: a single `IBookAppService.CreateAsync` call traverses DI conventions, unit-of-work boundaries, validation, authorization, the multi-tenancy filter, the local event bus and a distributed event bus before it returns. This glossary gives you the precise meaning of every term you will encounter, paired with the file that *defines* it in source. Use it as a jump table — every term links the concept to a real path under `framework/src/`.
+
+<Note>
+  Where a concept has both an abstractions package and an implementation package (the standard ABP pattern), the table points to the abstractions location. Implementation details live in [`/overview/architecture`](/overview/architecture) and the per-subsystem pages.
+</Note>
+
+## Core kernel
+
+### Application
+
+A live ABP runtime — the object materialised by `AbpApplicationFactory.Create(...)` or `CreateAsync(...)`. It holds the `IServiceCollection`, `IServiceProvider`, the ordered `IReadOnlyList<IAbpModuleDescriptor>`, the `StartupModuleType`, the `ApplicationName`, and the `InstanceId` (a fresh Guid per process). The contract is `IAbpApplication` and the base implementation is `AbpApplicationBase`.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/IAbpApplication.cs`
+- **Implemented in:** `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs`
+- **Factory:** `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationFactory.cs`
+
+See [/modularity/abp-application](/modularity/abp-application).
+
+### Module
+
+A class that derives from `AbpModule` (or implements `IAbpModule`) and contributes services + lifecycle hooks to an application. Every NuGet package under `framework/src/Volo.Abp.*` and every business module under `modules/*` exposes exactly one `AbpModule` subclass at its root. Modules declare dependencies with `[DependsOn(typeof(OtherModule))]`.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs`
+- **Base class:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs`
+- **Dependency attribute:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs`
+
+See [/modularity/abp-module](/modularity/abp-module).
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs
+public interface IAbpModule
+{
+    Task ConfigureServicesAsync(ServiceConfigurationContext context);
+
+    void ConfigureServices(ServiceConfigurationContext context);
+}
+```
+
+### Module descriptor
+
+The runtime metadata for a loaded module: its `Type`, instantiated `Instance`, the assembly set it contributes, and the resolved dependency list. Produced by `IModuleLoader.LoadModules(...)`.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModuleDescriptor.cs`
+- **Loader contract:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleLoader.cs`
+
+See [/modularity/module-descriptor-loader](/modularity/module-descriptor-loader).
+
+### Service configuration context
+
+The single object passed to every `PreConfigureServices` / `ConfigureServices` / `PostConfigureServices` hook. Holds the shared `IServiceCollection` plus an `Items` dictionary that modules can use to pass intermediate state to peers in the same phase.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ServiceConfigurationContext.cs`
+
+### Application initialization context
+
+Equivalent to the configuration context, but for the post-build lifecycle — passed to `OnPreApplicationInitialization`, `OnApplicationInitialization`, `OnPostApplicationInitialization`. Exposes a scoped `IServiceProvider`.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ApplicationInitializationContext.cs`
+
+### Application shutdown context
+
+The shutdown counterpart passed to `OnApplicationShutdown`. Modules dispose resources, close transports, and stop background workers here.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ApplicationShutdownContext.cs`
+
+## Dependency injection conventions
+
+### `ITransientDependency` / `IScopedDependency` / `ISingletonDependency`
+
+Marker interfaces that opt a class into ABP's conventional registration. The `DefaultConventionalRegistrar` inspects every assembly added via `services.AddAssembly(...)` for these interfaces and registers the implementing types with the corresponding `ServiceLifetime`.
+
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs`
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IScopedDependency.cs`
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ISingletonDependency.cs`
+
+### `[Dependency]` / `[ExposeServices]` / `[DisableConventionalRegistration]`
+
+Attribute overrides for the conventional registrar — set lifetime, replace prior registrations, control which interfaces are exposed, or opt the type out entirely.
+
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DependencyAttribute.cs`
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs`
+- `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisableConventionalRegistrationAttribute.cs`
+
+See [/di/exposed-services](/di/exposed-services).
+
+### `IAbpLazyServiceProvider`
+
+A property-injectable, cached lookup of services. Base classes (`ApplicationService`, `DomainService`, `AbpController`) expose this so subclasses can pull rarely-used dependencies on demand instead of bloating constructors.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IAbpLazyServiceProvider.cs`
+- **Cached base:** `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/CachedServiceProviderBase.cs`
+
+See [/di/lazy-service-provider](/di/lazy-service-provider).
+
+### `ObjectAccessor<T>`
+
+A simple wrapper used by `AbpApplicationBase` to thread the `IServiceProvider` (and other late-bound singletons) into DI before the container is built. See `services.TryAddObjectAccessor<IServiceProvider>()` in `AbpApplicationBase`.
+
+- **Defined in:** `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ObjectAccessor.cs`
+
+## Domain layer
+
+### Entity
+
+A persistent object with identity. ABP supplies `Entity` (non-generic) and `Entity<TKey>` plus `BasicAggregateRoot` / `AggregateRoot` for the aggregate case. Implements `IEntity` to participate in repository APIs.
+
+- **Defined in:** `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/Entity.cs`
+
+### Aggregate root
+
+An `Entity` that owns a consistency boundary. ABP's `AggregateRoot` adds an `ExtraProperties` extensibility dictionary and a `ConcurrencyStamp`:
+
+```csharp framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/AggregateRoot.cs
+[Serializable]
+public abstract class AggregateRoot : BasicAggregateRoot,
+    IHasExtraProperties,
+    IHasConcurrencyStamp
+{
+    public virtual ExtraPropertyDictionary ExtraProperties { get; protected set; }
+
+    [DisableAuditing]
+    public virtual string ConcurrencyStamp { get; set; }
+    // ...
+}
+```
+
+See [/ddd/entities-and-aggregates](/ddd/entities-and-aggregates).
+
+### Value object
+
+An immutable bag of atomic values compared by structural equality. ABP's `ValueObject` requires subclasses to expose their components via `GetAtomicValues()`:
+
+```csharp framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Values/ValueObject.cs
+public abstract class ValueObject
+{
+    protected abstract IEnumerable<object> GetAtomicValues();
+    // ValueEquals(...) implementation walks the values pairwise
+}
+```
+
+### Repository
+
+A collection-like persistence facade for a single aggregate type. `IRepository` is the marker; `IRepository<TEntity>` and `IRepository<TEntity, TKey>` add the typed query/persist APIs.
+
+- **Defined in:** `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/IRepository.cs`
+- **EF Core impl:** `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Domain/Repositories/EntityFrameworkCore/EfCoreRepository.cs`
+- **MongoDB impl:** `framework/src/Volo.Abp.MongoDB/Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepository.cs`
+
+### Domain service
+
+A behaviour-bearing service that lives in the Domain layer. Identified by `IDomainService`; the base class `DomainService` exposes `IClock`, `IGuidGenerator`, `ICurrentTenant`, `IAsyncQueryableExecuter` and a `ILogger` via `LazyServiceProvider`.
+
+- **Marker:** `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/IDomainService.cs`
+- **Base:** `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/DomainService.cs`
+
+### Specification
+
+Reusable, composable query predicates. ABP exposes `Specification<T>` and helper combinators.
+
+- **Defined in:** `framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs`
+
+## Application layer
+
+### Application service
+
+The orchestration unit that exposes use-cases. The marker `IApplicationService` derives from `IRemoteService`, which is what causes ASP.NET Core MVC to auto-generate controllers and the dynamic client to auto-generate proxies.
+
+- **Marker:** `framework/src/Volo.Abp.Ddd.Application.Contracts/Volo/Abp/Application/Services/IApplicationService.cs`
+- **Base:** `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ApplicationService.cs`
+
+### CRUD application service
+
+The opinionated base for the standard create/read/update/delete pattern: `CrudAppService<TEntity, TEntityDto, TKey>` and overloads with separate input / get-list DTOs.
+
+- **Defined in:** `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/CrudAppService.cs`
+
+### DTO
+
+A serialisable data shape exchanged across boundaries. ABP supplies `EntityDto<TKey>`, `FullAuditedEntityDto<TKey>`, `PagedAndSortedResultRequestDto`, `PagedResultDto<T>`, `ListResultDto<T>`.
+
+- **Definitions in:** `framework/src/Volo.Abp.Ddd.Application.Contracts/Volo/Abp/Application/Dtos/`
+
+## Persistence & unit of work
+
+### Unit of work
+
+A transactional scope around one or more persistence operations. ABP's `IUnitOfWork` exposes the failed/disposed events, the parent (outer) UoW, and an `Items` bag for cross-cutting state. The `[UnitOfWork]` attribute opts a method into an explicit UoW boundary; the interceptor opens one automatically for every `IApplicationService` method.
+
+```csharp framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWork.cs
+public interface IUnitOfWork : IDatabaseApiContainer, ITransactionApiContainer, IDisposable
+{
+    Guid Id { get; }
+
+    Dictionary<string, object> Items { get; }
+
+    event EventHandler<UnitOfWorkFailedEventArgs> Failed;
+
+    event EventHandler<UnitOfWorkEventArgs> Disposed;
+
+    IAbpUnitOfWorkOptions Options { get; }
+
+    IUnitOfWork? Outer { get; }
+
+    bool IsReserved { get; }
+    // ...
+}
+```
+
+- **Defined in:** `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWork.cs`
+
+### Data filter
+
+A scoped filter (e.g. `ISoftDelete`, `IMultiTenant`) applied automatically by the persistence layer. Disable temporarily with `IDataFilter<T>.Disable(...)`.
+
+- **Defined in:** `framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataFilter.cs`
+
+### Connection string resolver
+
+Looks up the connection string for a logical name (e.g. per tenant). The multi-tenant resolver lives in `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs`.
+
+## Eventing
+
+### Local event bus
+
+In-process event dispatch — same `IServiceProvider`, same transaction. Use for domain events that should not cross the network.
+
+```csharp framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Local/ILocalEventBus.cs
+public interface ILocalEventBus : IEventBus
+{
+```
+
+- **Defined in:** `framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Local/ILocalEventBus.cs`
+- **Implementation:** `framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Local/LocalEventBus.cs`
+
+### Distributed event bus
+
+Cross-process / cross-service event dispatch. The abstractions package defines `IDistributedEventBus`; transports live in sibling packages.
+
+- **Defined in:** `framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IDistributedEventBus.cs`
+- **Transports:** `framework/src/Volo.Abp.EventBus.RabbitMQ`, `Volo.Abp.EventBus.Kafka`, `Volo.Abp.EventBus.Azure`, `Volo.Abp.EventBus.Dapr`, `Volo.Abp.EventBus.Rebus`
+
+### `IEventBus`
+
+The shared root interface. Both `ILocalEventBus` and `IDistributedEventBus` extend it. Exposes `PublishAsync<TEvent>(...)` with an `onUnitOfWorkComplete` flag so events are deferred to UoW completion by default.
+
+```csharp framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/IEventBus.cs
+Task PublishAsync<TEvent>(TEvent eventData, bool onUnitOfWorkComplete = true)
+    where TEvent : class;
+```
+
+- **Defined in:** `framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/IEventBus.cs`
+
+## Authorization, features, settings
+
+### Permission
+
+A named authorization grant. Defined statically by a `PermissionDefinitionProvider`, checked at runtime via `IPermissionChecker`.
+
+```csharp framework/src/Volo.Abp.Authorization.Abstractions/Volo/Abp/Authorization/Permissions/IPermissionChecker.cs
+public interface IPermissionChecker
+{
+    Task<bool> IsGrantedAsync([NotNull] string name);
+
+    Task<bool> IsGrantedAsync(ClaimsPrincipal? claimsPrincipal, [NotNull] string name);
+
+    Task<MultiplePermissionGrantResult> IsGrantedAsync([NotNull] string[] names);
+    // ...
+}
+```
+
+- **Definition:** `framework/src/Volo.Abp.Authorization.Abstractions/Volo/Abp/Authorization/Permissions/PermissionDefinition.cs`
+- **Checker:** `framework/src/Volo.Abp.Authorization.Abstractions/Volo/Abp/Authorization/Permissions/IPermissionChecker.cs`
+
+See [/authorization/permissions](/authz/permission-system).
+
+### Feature
+
+A tenant / edition-scoped switch (boolean, integer, or selection). Defined by `FeatureDefinitionProvider`, checked at runtime by `IFeatureChecker`.
+
+- **Definition:** `framework/src/Volo.Abp.Features/Volo/Abp/Features/FeatureDefinition.cs`
+- **Checker:** `framework/src/Volo.Abp.Features/Volo/Abp/Features/IFeatureChecker.cs`
+
+```csharp framework/src/Volo.Abp.Features/Volo/Abp/Features/IFeatureChecker.cs
+public interface IFeatureChecker
+{
+    Task<string?> GetOrNullAsync([NotNull] string name);
+
+    Task<bool> IsEnabledAsync(string name);
+}
+```
+
+### Global feature
+
+A *compile-time* feature — opting in/out adds or removes types from the active runtime. Defined in `Volo.Abp.GlobalFeatures`.
+
+- **Defined in:** `framework/src/Volo.Abp.GlobalFeatures/Volo/Abp/GlobalFeatures/`
+
+### Setting
+
+A typed, named string value with scoped overrides (global → tenant → user). Defined by `SettingDefinitionProvider`, read via `ISettingProvider`.
+
+```csharp framework/src/Volo.Abp.Settings/Volo/Abp/Settings/ISettingProvider.cs
+public interface ISettingProvider
+{
+    Task<string?> GetOrNullAsync([NotNull] string name);
+
+    Task<List<SettingValue>> GetAllAsync([NotNull] string[] names);
+
+    Task<List<SettingValue>> GetAllAsync();
+}
+```
+
+- **Definition:** `framework/src/Volo.Abp.Settings/Volo/Abp/Settings/SettingDefinition.cs`
+- **Provider:** `framework/src/Volo.Abp.Settings/Volo/Abp/Settings/ISettingProvider.cs`
+
+## Multi-tenancy
+
+### Tenant
+
+A logical isolation boundary for SaaS applications. Identified by a `Guid`. Tenant management — CRUD, connection string mapping — lives in `modules/tenant-management/`.
+
+### `ICurrentTenant`
+
+The ambient accessor for "which tenant is this code running for?". Implemented by `CurrentTenant`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs
+public class CurrentTenant : ICurrentTenant, ITransientDependency
+{
+    public virtual bool IsAvailable => Id.HasValue;
+    public virtual Guid? Id => _currentTenantAccessor.Current?.TenantId;
+    public string? Name => _currentTenantAccessor.Current?.Name;
+    // ...
+    public IDisposable Change(Guid? id, string? name = null)
+    {
+        return SetCurrent(id, name);
+    }
+}
+```
+
+- **Implementation:** `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs`
+
+### Tenant resolver / contributor
+
+A pluggable pipeline that figures out the active tenant from the current request (claim, header, subdomain, route, etc.). The base class `TenantResolveContributorBase` plus built-ins like `ActionTenantResolveContributor` and `CurrentUserTenantResolveContributor` live in `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/`. ASP.NET Core-specific contributors live in `framework/src/Volo.Abp.AspNetCore.MultiTenancy/`.
+
+## Background work
+
+### Background job
+
+A persistent, retried, fire-and-forget work item. Enqueued through `IBackgroundJobManager`, executed by `IBackgroundJobWorker`, persisted through `IBackgroundJobStore`.
+
+- **Manager:** `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJobManager.cs`
+- **Worker:** `framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/IBackgroundJobWorker.cs`
+- **Store:** `framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/IBackgroundJobStore.cs`
+- **Base classes:** `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/BackgroundJob.cs`, `AsyncBackgroundJob.cs`
+- **Alternate stores:** `framework/src/Volo.Abp.BackgroundJobs.HangFire`, `Volo.Abp.BackgroundJobs.Quartz`, `Volo.Abp.BackgroundJobs.RabbitMQ`
+
+### Background worker
+
+A long-lived process loop (singleton lifetime) started on `OnApplicationInitialization` and stopped on `OnApplicationShutdown`. Use the `PeriodicBackgroundWorkerBase` base for a timer-driven loop:
+
+```csharp framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/IBackgroundWorker.cs
+public interface IBackgroundWorker : IRunnable, ISingletonDependency
+{
+
+}
+```
+
+- **Marker:** `framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/IBackgroundWorker.cs`
+- **Bases:** `BackgroundWorkerBase.cs`, `PeriodicBackgroundWorkerBase.cs`, `AsyncPeriodicBackgroundWorkerBase.cs`
+- **Manager:** `framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/IBackgroundWorkerManager.cs`
+- **Hosts:** `framework/src/Volo.Abp.BackgroundWorkers.Hangfire`, `Volo.Abp.BackgroundWorkers.Quartz`
+
+## Storage & file system
+
+### Virtual file system
+
+An overlay file system that lets modules embed Razor views, JS, CSS, templates and migrations as embedded resources and have them resolved at runtime under a virtual path. The abstraction extends `Microsoft.Extensions.FileProviders.IFileProvider`:
+
+```csharp framework/src/Volo.Abp.VirtualFileSystem/Volo/Abp/VirtualFileSystem/IVirtualFileProvider.cs
+using Microsoft.Extensions.FileProviders;
+
+namespace Volo.Abp.VirtualFileSystem;
+
+public interface IVirtualFileProvider : IFileProvider
+{
+
+}
+```
+
+- **Defined in:** `framework/src/Volo.Abp.VirtualFileSystem/Volo/Abp/VirtualFileSystem/IVirtualFileProvider.cs`
+
+### BLOB container
+
+A logical, named bucket for binary objects. Provider-agnostic at call sites (`IBlobContainer<TContainer>`), backed by Azure / AWS / Minio / FileSystem / Aliyun / database providers.
+
+- **Defined in:** `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/IBlobContainer.cs`
+- **Providers:** `framework/src/Volo.Abp.BlobStoring.Azure`, `Volo.Abp.BlobStoring.Aws`, `Volo.Abp.BlobStoring.Minio`, `Volo.Abp.BlobStoring.FileSystem`, `Volo.Abp.BlobStoring.Aliyun`, plus the database-backed default in `modules/blob-storing-database/`
+
+## Remote services
+
+### Service proxy
+
+A *client-side* implementation of an `IApplicationService` interface that talks to the remote server over HTTP. The dynamic C# proxy infrastructure lives in `framework/src/Volo.Abp.Http.Client/`. Build-time generators (in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ServiceProxying/`) emit typed Angular, JavaScript and C# proxies from the API description.
+
+- **Dynamic proxy entry:** `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/`
+- **Generators:**
+  - `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ServiceProxying/CSharp/CSharpServiceProxyGenerator.cs`
+  - `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ServiceProxying/Angular/AngularServiceProxyGenerator.cs`
+  - `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ServiceProxying/JavaScript/JavaScriptServiceProxyGenerator.cs`
+- **Server-side script controller:** `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/ProxyScripting/AbpServiceProxyScriptController.cs`
+
+### API description model
+
+The serialisable description of an application's HTTP API used by proxy generators and Swagger. Owned by `Volo.Abp.Http`.
+
+- **Defined in:** `framework/src/Volo.Abp.Http/Volo/Abp/Http/Modeling/ApplicationApiDescriptionModel.cs`
+- **Provider interface:** `framework/src/Volo.Abp.Http/Volo/Abp/Http/Modeling/IApiDescriptionModelProvider.cs`
+
+### Remote service
+
+The umbrella marker (`IRemoteService` is the parent of `IApplicationService`) that signals "this contract is exposed over a remote boundary".
+
+- **Defined in:** `framework/src/Volo.Abp.RemoteServices/Volo/Abp/RemoteServices/`
+
+## Cross-cutting helpers
+
+### Object mapper
+
+Transport-agnostic mapping between two types (`IObjectMapper.Map<TSource, TDestination>(...)`). The default backend is AutoMapper through `framework/src/Volo.Abp.AutoMapper/`.
+
+- **Defined in:** `framework/src/Volo.Abp.ObjectMapping/Volo/Abp/ObjectMapping/IObjectMapper.cs`
+
+### Object extension manager
+
+Runtime extra-property metadata (validation rules, default values, mapping configuration) for any type that implements `IHasExtraProperties` — primarily entities and DTOs. Drives the `ExtraProperties` dictionary on `AggregateRoot`.
+
+- **Defined in:** `framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionManager.cs`
+
+### Localization resource
+
+A unit of localization keys + translation files. Defined as a class, registered via `Configure<AbpLocalizationOptions>`.
+
+- **Defined in:** `framework/src/Volo.Abp.Localization.Abstractions/Volo/Abp/Localization/LocalizationResource.cs`
+
+### Clock / `IClock`
+
+The injectable time source. Replaces direct `DateTime.UtcNow` usage and supports `DateTimeKind.Utc` enforcement.
+
+- **Defined in:** `framework/src/Volo.Abp.Timing/Volo/Abp/Timing/IClock.cs`
+
+### Guid generator / `IGuidGenerator`
+
+Pluggable Guid generation strategy. The default is the sequential generator from `framework/src/Volo.Abp.Guids/`.
+
+- **Defined in:** `framework/src/Volo.Abp.Guids/Volo/Abp/Guids/IGuidGenerator.cs`
+
+### Current user / `ICurrentUser`
+
+The ambient accessor for the authenticated identity (id, tenant id, roles, claims). Backed by `ClaimsPrincipal`.
+
+- **Defined in:** `framework/src/Volo.Abp.Security/Volo/Abp/Security/Claims/ICurrentUser.cs`
+
+### Distributed lock / `IAbpDistributedLock`
+
+Cross-process mutex used to serialise background workers, migrations, and cache rebuilds across multiple hosts.
+
+- **Defined in:** `framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/IAbpDistributedLock.cs`
+
+### Cache / typed `IDistributedCache<T>`
+
+ABP's typed wrapper around `Microsoft.Extensions.Caching.Distributed.IDistributedCache`. Stores POCOs through `IDistributedCache<TCacheItem>` (and `IDistributedCache<TCacheItem, TKey>`).
+
+- **Defined in:** `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCache.cs`
+- **Redis backend:** `framework/src/Volo.Abp.Caching.StackExchangeRedis/`
+
+### Audit log / `IAuditingStore`
+
+Persistent record of executed actions and entity changes. Application services and controllers are audited automatically by an interceptor.
+
+- **Store:** `framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/IAuditingStore.cs`
+- **Contracts:** `framework/src/Volo.Abp.Auditing.Contracts/`
+
+### Email / SMS sender
+
+Transport-agnostic outbound messaging interfaces.
+
+- `framework/src/Volo.Abp.Emailing/Volo/Abp/Emailing/IEmailSender.cs`
+- `framework/src/Volo.Abp.Sms/Volo/Abp/Sms/ISmsSender.cs`
+- MailKit backend: `framework/src/Volo.Abp.MailKit/`
+
+### Text template renderer
+
+Scriban / Razor-backed template rendering with localization integration.
+
+- `framework/src/Volo.Abp.TextTemplating.Core/`
+- `framework/src/Volo.Abp.TextTemplating.Scriban/`
+- `framework/src/Volo.Abp.TextTemplating.Razor/`
+
+## Application module concepts (under `modules/`)
+
+| Term | Meaning | Source |
+| --- | --- | --- |
+| Identity | Users, roles, claims, organisation units, sessions on top of `Microsoft.AspNetCore.Identity`. | `modules/identity/` |
+| OpenIddict | OpenID Connect server (current). | `modules/openiddict/` |
+| Account | Login / register / external-auth UI on top of Identity. | `modules/account/` |
+| Tenant management | Tenant CRUD + per-tenant connection strings. | `modules/tenant-management/` |
+| Permission management | Persistent store for permission grants. | `modules/permission-management/` |
+| Feature management | Persistent store for `FeatureDefinition` values per tenant/edition. | `modules/feature-management/` |
+| Setting management | Persistent store for `SettingDefinition` values + admin UI. | `modules/setting-management/` |
+| Audit logging | Persistent `IAuditingStore` (EF Core / Mongo). | `modules/audit-logging/` |
+| Background jobs (persistent) | EF Core / Mongo `IBackgroundJobStore`. | `modules/background-jobs/` |
+| BLOB storing database | Database-backed `IBlobContainer`. | `modules/blob-storing-database/` |
+| CMS kit | Pages, menus, blogs, comments, tags, reactions. | `modules/cms-kit/` |
+| Docs | Markdown-driven documentation module. | `modules/docs/` |
+| Virtual file explorer | Dev-time UI for the virtual file system. | `modules/virtual-file-explorer/` |
+| Basic theme | Default Bootstrap theme. | `modules/basic-theme/` |
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="layer-group" href="/overview/architecture">
+    See how the terms above compose into layers and the startup sequence.
+  </Card>
+  <Card title="Design principles" icon="compass" href="/overview/design-principles">
+    Why these terms exist with these contracts in the first place.
+  </Card>
+  <Card title="Repository layout" icon="folder-tree" href="/overview/repository-layout">
+    Where each subsystem lives on disk.
+  </Card>
+  <Card title="Modularity overview" icon="cubes" href="/modularity/overview">
+    Deep dive on Module, Application, descriptors and the loader.
+  </Card>
+</CardGroup>

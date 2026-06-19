@@ -1,0 +1,513 @@
+---
+title: "Module Descriptors, Loader, and Container Internals"
+sidebarTitle: "Loader & Descriptors"
+description: "How the ABP Framework discovers, instantiates and topologically sorts modules into IAbpModuleDescriptor entries via ModuleLoader and IModuleContainer."
+---
+
+The ABP Framework's `IModuleLoader` is the component that turns a single startup
+module type and a `PlugInSourceList` into a fully sorted array of
+`IAbpModuleDescriptor`. This page reads the loader, the descriptor record, the
+helper static class, and the descriptor extensions that downstream code uses to
+walk module-owned assemblies. Every path below is rooted at the repository.
+
+## The pipeline at a glance
+
+`AbpApplicationBase` calls `LoadModules` exactly once during its constructor,
+which delegates to the registered `IModuleLoader`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs
+protected virtual IReadOnlyList<IAbpModuleDescriptor> LoadModules(IServiceCollection services, AbpApplicationCreationOptions options)
+{
+    return services
+        .GetSingletonInstance<IModuleLoader>()
+        .LoadModules(
+            services,
+            StartupModuleType,
+            options.PlugInSources
+        );
+}
+```
+
+The loader contract is a single method:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleLoader.cs
+public interface IModuleLoader
+{
+    [NotNull]
+    IAbpModuleDescriptor[] LoadModules(
+        [NotNull] IServiceCollection services,
+        [NotNull] Type startupModuleType,
+        [NotNull] PlugInSourceList plugInSources
+    );
+}
+```
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleLoader.cs` | Loader contract |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs` | Default implementation |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs` | Type-walking helpers used by the loader |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModuleDescriptor.cs` | Descriptor contract |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptor.cs` | Descriptor implementation |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptorExtensions.cs` | `GetAdditionalAssemblies` helper |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleContainer.cs` | Read-only list of descriptors |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleManager.cs` | Runtime consumer of the descriptor list |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IDependedTypesProvider.cs` | Extensible "I depend on these modules" interface |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAdditionalModuleAssemblyProvider.cs` | Extensible "I also own these assemblies" interface |
+| `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AdditionalAssemblyAttribute.cs` | Default `IAdditionalModuleAssemblyProvider` |
+
+## `IAbpModuleDescriptor`
+
+A descriptor is the loader's output unit:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModuleDescriptor.cs
+public interface IAbpModuleDescriptor
+{
+    Type Type { get; }
+
+    Assembly Assembly { get; }
+
+    Assembly[] AllAssemblies { get; }
+
+    IAbpModule Instance { get; }
+
+    bool IsLoadedAsPlugIn { get; }
+
+    IReadOnlyList<IAbpModuleDescriptor> Dependencies { get; }
+}
+```
+
+- `Type` is the module class itself.
+- `Assembly` is just `Type.Assembly`.
+- `AllAssemblies` is the deduplicated union of the main assembly plus everything
+  contributed by `[AdditionalAssembly]` attributes.
+- `Instance` is the singleton module instance the loader instantiated via
+  `Activator.CreateInstance(...)`.
+- `IsLoadedAsPlugIn` distinguishes modules pulled in by `PlugInSources` from
+  those discovered through `[DependsOn]` from the startup module.
+- `Dependencies` is the list of *direct* descriptor dependencies (one hop).
+
+The implementation in `AbpModuleDescriptor.cs` enforces invariants in its
+constructor:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptor.cs
+public AbpModuleDescriptor(
+    [NotNull] Type type,
+    [NotNull] IAbpModule instance,
+    bool isLoadedAsPlugIn)
+{
+    Check.NotNull(type, nameof(type));
+    Check.NotNull(instance, nameof(instance));
+    AbpModule.CheckAbpModuleType(type);
+
+    if (!type.GetTypeInfo().IsAssignableFrom(instance.GetType()))
+    {
+        throw new ArgumentException($"Given module instance ({instance.GetType().AssemblyQualifiedName}) is not an instance of given module type: {type.AssemblyQualifiedName}");
+    }
+
+    Type = type;
+    Assembly = type.Assembly;
+    AllAssemblies = AbpModuleHelper.GetAllAssemblies(type);
+    Instance = instance;
+    IsLoadedAsPlugIn = isLoadedAsPlugIn;
+
+    _dependencies = new List<IAbpModuleDescriptor>();
+}
+```
+
+`_dependencies` is private and mutated only by the loader through
+`AddDependency` — which uses `AddIfNotContains` to de-dup.
+
+## `AbpModuleDescriptorExtensions`: extracting plug-in assemblies
+
+The framework needs to know which assemblies of a module are "extra" (declared
+via `[AdditionalAssembly]`) versus the natural one. The extension takes that
+list off the descriptor:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptorExtensions.cs
+public static class AbpModuleDescriptorExtensions
+{
+    public static Assembly[] GetAdditionalAssemblies(this IAbpModuleDescriptor module)
+    {
+        return module.AllAssemblies.Length <= 1
+            ? Array.Empty<Assembly>()
+            : module.AllAssemblies.Where(x => x != module.Assembly).ToArray();
+    }
+}
+```
+
+## `IModuleContainer`
+
+The descriptor list is exposed application-wide through `IModuleContainer`,
+which `AbpApplicationBase` itself implements:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleContainer.cs
+public interface IModuleContainer
+{
+    [NotNull]
+    IReadOnlyList<IAbpModuleDescriptor> Modules { get; }
+}
+```
+
+`AbpApplicationBase` registers itself as a singleton `IModuleContainer` in its
+constructor (`services.AddSingleton<IModuleContainer>(this);` in
+`AbpApplicationBase.cs`), so anything in DI can resolve and walk the module
+graph.
+
+`ModuleManager` (`ModuleManager.cs`) is the prime consumer:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs
+public ModuleManager(
+    IModuleContainer moduleContainer,
+    ILogger<ModuleManager> logger,
+    IOptions<AbpModuleLifecycleOptions> options,
+    IServiceProvider serviceProvider)
+{
+    _moduleContainer = moduleContainer;
+    _logger = logger;
+    ...
+}
+```
+
+## `ModuleLoader` step by step
+
+`ModuleLoader` is plain and procedural. The top-level `LoadModules` does three
+things — gather descriptors, sort by dependency, and return as an array:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+public IAbpModuleDescriptor[] LoadModules(
+    IServiceCollection services,
+    Type startupModuleType,
+    PlugInSourceList plugInSources)
+{
+    Check.NotNull(services, nameof(services));
+    Check.NotNull(startupModuleType, nameof(startupModuleType));
+    Check.NotNull(plugInSources, nameof(plugInSources));
+
+    var modules = GetDescriptors(services, startupModuleType, plugInSources);
+
+    modules = SortByDependency(modules, startupModuleType);
+
+    return modules.ToArray();
+}
+```
+
+### Step 1: `FillModules`
+
+`FillModules` walks the dependency graph from the startup module, then layers
+the plug-in modules on top:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual void FillModules(
+    List<AbpModuleDescriptor> modules,
+    IServiceCollection services,
+    Type startupModuleType,
+    PlugInSourceList plugInSources)
+{
+    var logger = services.GetInitLogger<AbpApplicationBase>();
+
+    //All modules starting from the startup module
+    foreach (var moduleType in AbpModuleHelper.FindAllModuleTypes(startupModuleType, logger))
+    {
+        modules.Add(CreateModuleDescriptor(services, moduleType));
+    }
+
+    //Plugin modules
+    foreach (var moduleType in plugInSources.GetAllModules(logger))
+    {
+        if (modules.Any(m => m.Type == moduleType))
+        {
+            continue;
+        }
+
+        modules.Add(CreateModuleDescriptor(services, moduleType, isLoadedAsPlugIn: true));
+    }
+}
+```
+
+A module discovered through `[DependsOn]` always wins over the same module
+discovered via a plug-in source: the plug-in loop explicitly skips types already
+present (so `IsLoadedAsPlugIn` reflects only "I was not reachable from
+startup").
+
+### Step 2: `CreateAndRegisterModule`
+
+For each module type, the loader instantiates and registers it as a singleton
+against its concrete type — this is how `ModuleLoader` later resolves your
+module instance from DI:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual AbpModuleDescriptor CreateModuleDescriptor(IServiceCollection services, Type moduleType, bool isLoadedAsPlugIn = false)
+{
+    return new AbpModuleDescriptor(moduleType, CreateAndRegisterModule(services, moduleType), isLoadedAsPlugIn);
+}
+
+protected virtual IAbpModule CreateAndRegisterModule(IServiceCollection services, Type moduleType)
+{
+    var module = (IAbpModule)Activator.CreateInstance(moduleType)!;
+    services.AddSingleton(moduleType, module);
+    return module;
+}
+```
+
+### Step 3: `SetDependencies`
+
+After every descriptor is created, the loader resolves dependency edges:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual void SetDependencies(List<AbpModuleDescriptor> modules, AbpModuleDescriptor module)
+{
+    foreach (var dependedModuleType in AbpModuleHelper.FindDependedModuleTypes(module.Type))
+    {
+        var dependedModule = modules.FirstOrDefault(m => m.Type == dependedModuleType);
+        if (dependedModule == null)
+        {
+            throw new AbpException("Could not find a depended module " + dependedModuleType.AssemblyQualifiedName + " for " + module.Type.AssemblyQualifiedName);
+        }
+
+        module.AddDependency(dependedModule);
+    }
+}
+```
+
+If a `[DependsOn]` references a type that was *not* reachable from the startup
+module **and** not present in any `PlugInSource`, this throws — the framework
+will not silently drop dependencies.
+
+### Step 4: `SortByDependency`
+
+Finally the descriptors are topologically sorted and the startup module is
+forced to the end of the list:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual List<IAbpModuleDescriptor> SortByDependency(List<IAbpModuleDescriptor> modules, Type startupModuleType)
+{
+    var sortedModules = modules.SortByDependencies(m => m.Dependencies);
+    sortedModules.MoveItem(m => m.Type == startupModuleType, modules.Count - 1);
+    return sortedModules;
+}
+```
+
+`SortByDependencies` is ABP's stable topological sort extension method (defined
+in `Volo.Abp.Collections`). `MoveItem` is the placement guarantee: the startup
+module's `ConfigureServices` runs after every other module so the application
+layer can freely override anything its dependencies registered.
+
+## `AbpModuleHelper`: graph walks
+
+The two static methods drive both `[DependsOn]` traversal and assembly
+discovery.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs
+public static List<Type> FindAllModuleTypes(Type startupModuleType, ILogger logger)
+{
+    var moduleTypes = new List<Type>();
+    logger.Log(LogLevel.Information, "Loaded ABP modules:");
+    AddModuleAndDependenciesRecursively(moduleTypes, startupModuleType, logger);
+    return moduleTypes;
+}
+```
+
+The recursive helper writes one indented log line per visited module type — this
+is the *"Loaded ABP modules:"* banner you see in the boot logs.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs
+private static void AddModuleAndDependenciesRecursively(
+    List<Type> moduleTypes,
+    Type moduleType,
+    ILogger logger,
+    int depth = 0)
+{
+    AbpModule.CheckAbpModuleType(moduleType);
+
+    if (moduleTypes.Contains(moduleType))
+    {
+        return;
+    }
+
+    moduleTypes.Add(moduleType);
+    logger.Log(LogLevel.Information, $"{new string(' ', depth * 2)}- {moduleType.FullName}");
+
+    foreach (var dependedModuleType in FindDependedModuleTypes(moduleType))
+    {
+        AddModuleAndDependenciesRecursively(moduleTypes, dependedModuleType, logger, depth + 1);
+    }
+}
+```
+
+`FindDependedModuleTypes` is the seam for `IDependedTypesProvider`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs
+public static List<Type> FindDependedModuleTypes(Type moduleType)
+{
+    AbpModule.CheckAbpModuleType(moduleType);
+
+    var dependencies = new List<Type>();
+
+    var dependencyDescriptors = moduleType
+        .GetCustomAttributes()
+        .OfType<IDependedTypesProvider>();
+
+    foreach (var descriptor in dependencyDescriptors)
+    {
+        foreach (var dependedModuleType in descriptor.GetDependedTypes())
+        {
+            dependencies.AddIfNotContains(dependedModuleType);
+        }
+    }
+
+    return dependencies;
+}
+```
+
+`DependsOnAttribute` implements `IDependedTypesProvider`, but any custom
+attribute may too — useful for, say, declaring conditional dependencies inside
+a feature module attribute.
+
+### Assembly discovery: `GetAllAssemblies`
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs
+public static Assembly[] GetAllAssemblies(Type moduleType)
+{
+    var assemblies = new List<Assembly>();
+
+    var additionalAssemblyDescriptors = moduleType
+        .GetCustomAttributes()
+        .OfType<IAdditionalModuleAssemblyProvider>();
+
+    foreach (var descriptor in additionalAssemblyDescriptors)
+    {
+        foreach (var assembly in descriptor.GetAssemblies())
+        {
+            assemblies.AddIfNotContains(assembly);
+        }
+    }
+
+    assemblies.Add(moduleType.Assembly);
+
+    return assemblies.ToArray();
+}
+```
+
+The same pattern repeats: any attribute that implements
+`IAdditionalModuleAssemblyProvider` contributes assemblies. The shipped
+`AdditionalAssemblyAttribute` (in `AdditionalAssemblyAttribute.cs`) provides the
+default implementation by taking a `params Type[]` and projecting them to their
+`Assembly`.
+
+The two interfaces are tiny and worth pinning here:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IDependedTypesProvider.cs
+public interface IDependedTypesProvider
+{
+    [NotNull]
+    Type[] GetDependedTypes();
+}
+```
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAdditionalModuleAssemblyProvider.cs
+public interface IAdditionalModuleAssemblyProvider
+{
+    Assembly[] GetAssemblies();
+}
+```
+
+## Loader pipeline diagram
+
+```mermaid
+flowchart TD
+    Start[ModuleLoader.LoadModules] --> Fill[FillModules]
+    Fill --> Walk[AbpModuleHelper.FindAllModuleTypes from startup]
+    Walk --> Reg1[CreateAndRegisterModule -> Activator + AddSingleton]
+    Reg1 --> Plug[plugInSources.GetAllModules]
+    Plug --> Reg2[CreateAndRegisterModule isLoadedAsPlugIn = true]
+    Reg2 --> SetDeps[SetDependencies via FindDependedModuleTypes]
+    SetDeps --> Validate{All deps resolved?}
+    Validate -- "no" --> Throw[throw AbpException]
+    Validate -- "yes" --> Sort[SortByDependencies]
+    Sort --> Move[MoveItem startup last]
+    Move --> Out[(IAbpModuleDescriptor[])]
+```
+
+## `IModuleManager` consumes the result
+
+The descriptor list is what `IModuleManager` walks at runtime:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleManager.cs
+public interface IModuleManager
+{
+    Task InitializeModulesAsync([NotNull] ApplicationInitializationContext context);
+
+    void InitializeModules([NotNull] ApplicationInitializationContext context);
+
+    Task ShutdownModulesAsync([NotNull] ApplicationShutdownContext context);
+
+    void ShutdownModules([NotNull] ApplicationShutdownContext context);
+}
+```
+
+Its default implementation captures the container in its constructor:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs
+public class ModuleManager : IModuleManager, ISingletonDependency
+{
+    private readonly IModuleContainer _moduleContainer;
+    private readonly IEnumerable<IModuleLifecycleContributor> _lifecycleContributors;
+    private readonly ILogger<ModuleManager> _logger;
+
+    public ModuleManager(
+        IModuleContainer moduleContainer,
+        ILogger<ModuleManager> logger,
+        IOptions<AbpModuleLifecycleOptions> options,
+        IServiceProvider serviceProvider)
+    {
+        _moduleContainer = moduleContainer;
+        _logger = logger;
+        ...
+    }
+```
+
+See [Module Lifecycle](/modularity/module-lifecycle) for the full contributor
+loop.
+
+## Gotchas
+
+<Warning>
+  Modules are instantiated via `Activator.CreateInstance(moduleType)!` — a
+  module class **must** have a public parameterless constructor or the loader
+  throws a `MissingMethodException`. There is no DI on module classes at
+  construction time.
+</Warning>
+
+<Warning>
+  The loader registers every module as a singleton against its concrete type
+  (`services.AddSingleton(moduleType, module)`). If you accidentally inherit
+  from another module type without a fresh class declaration you'll end up with
+  two registrations clobbering each other.
+</Warning>
+
+<Note>
+  `IModuleLoader` is registered as a singleton **instance** (not a type) by
+  `AddCoreAbpServices` — `services.TryAddSingleton<IModuleLoader>(moduleLoader);`
+  using a `new ModuleLoader()` created in the same method. Replacing it requires
+  swapping the registration *before* the `AbpApplicationBase` constructor calls
+  `LoadModules`.
+</Note>
+
+<Tip>
+  `AbpModuleDescriptor.AllAssemblies` is what `AbpApplicationBase.ConfigureServices`
+  feeds into `Services.AddAssembly(assembly)` for conventional service
+  registration. Adding extra assemblies with `[AdditionalAssembly]` is the
+  supported way to let one module own services that live in a separate DLL.
+</Tip>
+
+## See also
+
+- [DependsOn & Plug-Ins](/modularity/depends-on-and-plug-ins) — what feeds the
+  loader.
+- [Module Lifecycle](/modularity/module-lifecycle) — what consumes the
+  descriptor list.
+- [ABP Application](/modularity/abp-application) — where `LoadModules` is
+  invoked.

@@ -1,0 +1,419 @@
+---
+title: "CMS Kit Menus: Self-Referential Menu Item Tree Aggregate"
+sidebarTitle: "Menus"
+description: "MenuItem aggregate with parent links, IMenuItemRepository contract, MenuItemManager tree ops, Page-linked URLs, IMenuItemAdminAppService and IMenuItemPublicAppService surfaces, and cache invalidation."
+---
+
+The CMS Kit Menus feature exposes a single self‑referential aggregate — `MenuItem` — that drives the application's primary navigation. Each row is a node in a tree (`ParentId == null` means root), and the manager re‑normalises sibling order on every move so children of the same parent always carry a contiguous `Order` sequence. Items can be free URLs or *page‑linked*: when `PageId` is set, the menu item picks up the page's slug as its URL and a local event handler keeps the URL in sync when the page's slug changes. This page maps the source under `Volo.CmsKit.Domain/Volo/CmsKit/Menus/`, walks every type and signature, and shows the admin CRUD plus the cached public listing.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus). See [Pages](/modules/cms-kit/pages) for the page aggregate that menu items can link to.
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/"
+MenuItem.cs
+MenuItemManager.cs
+IMenuItemRepository.cs
+PageChangedHandler.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `MenuItem.cs` | `AuditedAggregateRoot<Guid>` | Tree node with parent, URL, display name, icon, target, ordering |
+| `MenuItemManager.cs` | `CmsKitDomainServiceBase` | Move within tree, set page URL, normalize sibling order |
+| `IMenuItemRepository.cs` | interface | Empty marker — only inherits `IBasicRepository<MenuItem, Guid>` |
+| `PageChangedHandler.cs` | `ILocalEventHandler<EntityUpdatedEventData<Page>>` | Re‑syncs menu item URLs when a linked `Page` is updated |
+
+## Domain model
+
+```mermaid
+erDiagram
+    MENUITEM ||--o{ MENUITEM : "ParentId → Id"
+    PAGE ||--o{ MENUITEM : "PageId → Id (optional)"
+
+    MENUITEM {
+        Guid Id PK
+        Guid? ParentId FK
+        Guid? PageId FK
+        string DisplayName
+        bool IsActive
+        string Url
+        string Icon
+        int Order
+        string Target
+        string ElementId
+        string CssClass
+        Guid? TenantId
+    }
+```
+
+There is no separate `Menu` aggregate — the application is assumed to have a single primary menu, and roots are simply rows with `ParentId == null`. If you need multiple menus (header, footer, sidebar), use a tag, a property extension, or split by root.
+
+### `MenuItem`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/MenuItem.cs"
+public class MenuItem : AuditedAggregateRoot<Guid>, IMultiTenant
+{
+    /// <summary>
+    /// Presents another <see cref="MenuItem"/> Id.
+    /// If it's <see langword="null"/>, then it's a root menu item.
+    /// </summary>
+    public Guid? ParentId { get; set; }
+
+    [NotNull] public string DisplayName { get; protected set; }
+
+    public bool IsActive { get; set; }
+
+    [NotNull] public string Url { get; protected set; }
+
+    public string Icon       { get; set; }
+    public int    Order      { get; set; }
+    public string Target     { get; set; }
+    public string ElementId  { get; set; }
+    public string CssClass   { get; set; }
+
+    public Guid?  PageId    { get; protected set; }
+    public Guid?  TenantId  { get; protected set; }
+
+    public MenuItem(Guid id,
+                    [NotNull] string displayName,
+                    [NotNull] string url,
+                    bool isActive = true,
+                    [CanBeNull] Guid? parentId = null,
+                    [CanBeNull] string icon = null,
+                    int order = 0,
+                    [CanBeNull] string target = null,
+                    [CanBeNull] string elementId = null,
+                    [CanBeNull] string cssClass = null,
+                    [CanBeNull] Guid? tenantId = null)
+        : base(id)
+    {
+        SetDisplayName(displayName);
+        IsActive = isActive;
+        ParentId = parentId;
+        SetUrl(url);
+        Icon = icon;
+        Order = order;
+        Target = target;
+        ElementId = elementId;
+        CssClass = cssClass;
+        TenantId = tenantId;
+    }
+
+    public void SetDisplayName([NotNull] string displayName) =>
+        DisplayName = Check.NotNullOrEmpty(displayName, nameof(displayName), MenuItemConsts.MaxDisplayNameLength);
+
+    public void SetUrl([NotNull] string url) =>
+        Url = Check.NotNullOrEmpty(url, nameof(url), MenuItemConsts.MaxUrlLength);
+
+    internal void SetPageId(Guid pageId) => PageId = pageId;
+}
+```
+
+Notable choices:
+
+- `ParentId` is a *plain setter*, not a `protected set` — the manager (and the admin service's `MoveMenuItemAsync`) need to flip it without an extra method. The tree invariant (no cycles, parent exists) is enforced at the manager level, not by the aggregate.
+- `Order` is a sibling‑local integer, not a tree‑wide sort key. The manager re‑normalises it on every move.
+- `Target`, `ElementId`, and `CssClass` map directly onto the rendered `<a target="..." id="..." class="...">` for advanced theming.
+- `SetPageId` is `internal` — `MenuItemManager.SetPageUrl` is the only legitimate caller.
+
+### `MenuItemManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/MenuItemManager.cs"
+public class MenuItemManager : CmsKitDomainServiceBase
+{
+    protected IMenuItemRepository MenuItemRepository { get; }
+
+    public virtual void SetPageUrl(MenuItem menuItem, Page page)
+    {
+        menuItem.SetPageId(page.Id);
+        menuItem.SetUrl(page.Slug.EnsureStartsWith('/'));
+    }
+
+    [UnitOfWork]
+    public virtual async Task MoveAsync(Guid menuItemId, Guid? newParentMenuItemId, int position = 0)
+    {
+        var menuItems = await MenuItemRepository.GetListAsync();
+
+        var movedMenuItem = menuItems.FirstOrDefault(x => x.Id == menuItemId)
+                       ?? throw new EntityNotFoundException(typeof(MenuItem), menuItemId);
+
+        if (newParentMenuItemId.HasValue && !menuItems.Any(a => a.Id == newParentMenuItemId.Value))
+        {
+            throw new EntityNotFoundException(typeof(MenuItem), newParentMenuItemId);
+        }
+
+        movedMenuItem.ParentId = newParentMenuItemId;
+        movedMenuItem.Order = position;
+
+        OrganizeTreeOrderForMenuItem(menuItems, movedMenuItem);
+
+        await MenuItemRepository.UpdateManyAsync(menuItems);
+    }
+
+    public virtual void OrganizeTreeOrderForMenuItem(List<MenuItem> items, MenuItem menuItem)
+    {
+        var sameTree = items.Where(x => x.ParentId == menuItem.ParentId).OrderBy(x => x.Order).ToList();
+
+        sameTree.Remove(menuItem); // Remove if exists to prevent misordering with same order number
+
+        sameTree.Insert(menuItem.Order, menuItem);
+
+        for (int i = 0; i < sameTree.Count; i++)
+        {
+            sameTree[i].Order = i;
+        }
+    }
+}
+```
+
+Two operations:
+
+1. **`SetPageUrl(menuItem, page)`** — links a menu item to a page. The URL is `"/" + page.Slug` (via `EnsureStartsWith('/')` so callers do not need to remember the prefix). After this, any future change to `page.Slug` will trigger the local event handler below and re‑run this method.
+2. **`MoveAsync(menuItemId, newParentMenuItemId, position)`** — the workhorse. It loads the *entire* menu, validates the new parent exists, flips `ParentId` and `Order` on the moved node, normalises sibling order so siblings keep a contiguous `0..n-1` sequence, and updates the whole list in one unit of work.
+
+Loading the full list is acceptable because menus are typically tens of rows, not thousands. The `TODO` comment in `PageChangedHandler` ("Write a repository query") acknowledges this — there is no indexed lookup by `PageId` because such a query has never been needed in practice.
+
+### `PageChangedHandler`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/PageChangedHandler.cs"
+public class PageChangedHandler :
+    ILocalEventHandler<EntityUpdatedEventData<Page>>,
+    ITransientDependency
+{
+    protected IMenuItemRepository MenuRepository { get; }
+    protected MenuItemManager MenuManager { get; }
+
+    public async Task HandleEventAsync(EntityUpdatedEventData<Page> eventData)
+    {
+        var allMenuItems = await MenuRepository.GetListAsync();
+
+        var affectedMenuItems = allMenuItems
+            .Where(x => x.PageId == eventData.Entity.Id)
+            .ToArray();
+
+        if (affectedMenuItems.IsNullOrEmpty())
+        {
+            return;
+        }
+
+        foreach (var menuItem in affectedMenuItems)
+        {
+            MenuManager.SetPageUrl(menuItem, eventData.Entity);
+        }
+
+        await MenuRepository.UpdateManyAsync(affectedMenuItems);
+    }
+}
+```
+
+The handler runs *in the same unit of work* as the page update because it is a local (in‑process) event handler. When an admin renames `/about` to `/about-us`, every menu item with `PageId = the-about-page-id` immediately picks up the new URL. The handler is also what gives page‑linked menu items their "self‑healing" quality: the admin UI never needs to ask the user to refresh menu URLs after a slug change.
+
+## `IMenuItemRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/IMenuItemRepository.cs"
+public interface IMenuItemRepository : IBasicRepository<MenuItem, Guid>
+{
+}
+```
+
+That is the entire interface. `IBasicRepository<MenuItem, Guid>` provides `InsertAsync`, `UpdateAsync`, `DeleteAsync`, `GetAsync`, `GetListAsync`, and the bulk variants `UpdateManyAsync` / `DeleteManyAsync`. EF Core and MongoDB ship the same surface — there are no extra repository methods because the manager always loads the whole menu.
+
+## Admin app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Menus/IMenuItemAdminAppService.cs"
+public interface IMenuItemAdminAppService : IApplicationService
+{
+    Task<ListResultDto<MenuItemDto>> GetListAsync();
+
+    Task<MenuItemDto> GetAsync(Guid id);
+
+    Task<MenuItemDto> CreateAsync(MenuItemCreateInput input);
+
+    Task<MenuItemDto> UpdateAsync(Guid id, MenuItemUpdateInput input);
+
+    Task DeleteAsync(Guid id);
+
+    Task MoveMenuItemAsync(Guid id, MenuItemMoveInput input);
+
+    Task<PagedResultDto<PageLookupDto>> GetPageLookupAsync(PageLookupInputDto input);
+}
+```
+
+The `MenuItemCreateInput` matches the aggregate fields one‑for‑one, plus an optional `PageId`:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Menus/MenuItemCreateInput.cs"
+public class MenuItemCreateInput : ExtensibleObject
+{
+    public Guid? ParentId { get; set; }
+    [Required] public string DisplayName { get; set; }
+    public bool IsActive { get; set; }
+    public string Url { get; set; }
+    public string Icon { get; set; }
+    public int Order { get; set; }
+    public string Target { get; set; }
+    public string ElementId { get; set; }
+    public string CssClass { get; set; }
+    public Guid? PageId { get; set; }
+}
+```
+
+`PageId` and `Url` are mutually exclusive in practice: when `PageId` is set, `MenuItemAdminAppService` calls `MenuManager.SetPageUrl(menuItem, page)` and overwrites `Url`. When `PageId` is null, the literal `Url` is taken as is — empty `Url` is replaced with `"#"`.
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/Menus/MenuItemAdminAppService.cs"
+[RequiresFeature(CmsKitFeatures.MenuEnable)]
+[RequiresGlobalFeature(typeof(MenuFeature))]
+[Authorize(CmsKitAdminPermissions.Menus.Default)]
+public class MenuItemAdminAppService : CmsKitAdminAppServiceBase, IMenuItemAdminAppService
+{
+    protected MenuItemManager MenuManager { get; }
+    protected IMenuItemRepository MenuItemRepository { get; }
+    protected IPageRepository PageRepository { get; }
+
+    [Authorize(CmsKitAdminPermissions.Menus.Create)]
+    public virtual async Task<MenuItemDto> CreateAsync(MenuItemCreateInput input)
+    {
+        var menuItem = new MenuItem(
+            GuidGenerator.Create(),
+            input.DisplayName,
+            input.Url.IsNullOrEmpty() ? "#" : input.Url,
+            input.IsActive,
+            input.ParentId,
+            input.Icon,
+            input.Order,
+            input.Target,
+            input.ElementId,
+            input.CssClass,
+            CurrentTenant.Id);
+
+        if (input.PageId.HasValue)
+        {
+            MenuManager.SetPageUrl(menuItem, await PageRepository.GetAsync(input.PageId.Value));
+        }
+        input.MapExtraPropertiesTo(menuItem);
+        await MenuItemRepository.InsertAsync(menuItem);
+
+        return ObjectMapper.Map<MenuItem, MenuItemDto>(menuItem);
+    }
+    // ...
+}
+```
+
+`GetPageLookupAsync` is a paged lookup over the [Pages](/modules/cms-kit/pages) aggregate so the admin UI can present a "link to existing page" dropdown.
+
+`MoveMenuItemAsync` is the drag‑and‑drop endpoint:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Menus/MenuItemMoveInput.cs"
+public class MenuItemMoveInput
+{
+    public Guid? NewParentId { get; set; }
+    public int Position { get; set; }
+}
+```
+
+It delegates to `MenuItemManager.MoveAsync(id, NewParentId, Position)`.
+
+### Permissions
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Permissions/CmsKitAdminPermissions.cs"
+public static class Menus
+{
+    public const string Default = GroupName + ".Menus";
+    public const string Create  = Default + ".Create";
+    public const string Update  = Default + ".Update";
+    public const string Delete  = Default + ".Delete";
+}
+```
+
+`MoveMenuItemAsync` is governed by `Menus.Update` — it does not have its own permission.
+
+## Public app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Menus/IMenuItemPublicAppService.cs"
+public interface IMenuItemPublicAppService : IApplicationService
+{
+    Task<List<MenuItemDto>> GetListAsync();
+}
+```
+
+The public surface is intentionally tiny — a single read of the entire menu, with aggressive caching:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Menus/MenuItemPublicAppService.cs"
+[RequiresFeature(CmsKitFeatures.MenuEnable)]
+[RequiresGlobalFeature(typeof(MenuFeature))]
+public class MenuItemPublicAppService : CmsKitPublicAppServiceBase, IMenuItemPublicAppService
+{
+    protected IMenuItemRepository MenuItemRepository { get; }
+    protected IDistributedCache<List<MenuItemDto>> DistributedCache { get; }
+
+    public virtual async Task<List<MenuItemDto>> GetListAsync()
+    {
+        var cachedMenu = await DistributedCache.GetOrAddAsync(
+            MenuApplicationConsts.MainMenuCacheKey,
+            async () =>
+            {
+                var menuItems = await MenuItemRepository.GetListAsync();
+                if (menuItems == null)
+                {
+                    return new();
+                }
+                return ObjectMapper.Map<List<MenuItem>, List<MenuItemDto>>(menuItems);
+            });
+        return cachedMenu;
+    }
+}
+```
+
+The cache key is the static `MenuApplicationConsts.MainMenuCacheKey`. A `MenuChangedHandler` in `Volo.CmsKit.Common.Application/Volo/CmsKit/Menus/` invalidates that entry whenever a menu item is inserted, updated, or deleted, so the public renderer always observes the latest tree within one cycle.
+
+The DTO returned to clients is flat — clients build their own tree from the `ParentId` field:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Common.Application.Contracts/Volo/CmsKit/Menus/MenuItemDto.cs"
+public class MenuItemDto : ExtensibleAuditedEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public Guid?  ParentId    { get; set; }
+    public string DisplayName { get; set; }
+    public bool   IsActive    { get; set; }
+    public string Url         { get; set; }
+    public string Icon        { get; set; }
+    public int    Order       { get; set; }
+    public string Target      { get; set; }
+    public string ElementId   { get; set; }
+    public string CssClass    { get; set; }
+    public Guid?  PageId      { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+## Feature flags
+
+- **Global feature** [`MenuFeature`](https://github.com/abpframework/abp/blob/dev/modules/cms-kit/src/Volo.CmsKit.Domain.Shared/Volo/CmsKit/GlobalFeatures/MenuFeature.cs) — name `CmsKit.Menu`.
+- **Per‑tenant feature** `CmsKitFeatures.MenuEnable`.
+
+`CmsKitFeatureDefinitionProvider` only registers `MenuEnable` if `MenuFeature` is globally enabled.
+
+## EF Core configuration
+
+The repository is registered alongside the others:
+
+```csharp
+options.AddRepository<MenuItem, EfCoreMenuItemRepository>();
+```
+
+The EF model adds indexes on `ParentId` and on `PageId` so the in‑process tree traversal stays fast even for larger menus.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Menus sits in the package matrix.
+  </Card>
+  <Card title="Pages" icon="file" href="/modules/cms-kit/pages">
+    The aggregate menu items link to via `PageId`.
+  </Card>
+  <Card title="Admin / Public split" icon="layer-group" href="/modules/cms-kit/admin-public-split">
+    Why the public surface only exposes a cached read.
+  </Card>
+</CardGroup>

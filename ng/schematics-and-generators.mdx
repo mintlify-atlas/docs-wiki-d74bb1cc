@@ -1,0 +1,496 @@
+---
+title: "ABP Angular Schematics and Nx Generators Reference"
+sidebarTitle: "Schematics & Generators"
+description: "Reference for @abp/ng.schematics and @abp/nx.generators: proxy-add, proxy-index, proxy-refresh, proxy-remove, api, create-lib, change-theme, update-version"
+---
+
+ABP ships two sibling packages that automate code generation in an Angular host application: `@abp/ng.schematics` (Angular CLI schematics, invoked through `ng generate`) and `@abp/nx.generators` (Nx generators, invoked through `nx generate`). Together they own three workflows: generating client-side proxies from an ABP backend's API definition, scaffolding new ABP-style libraries, and swapping themes / bumping all `@abp/ng.*` versions in lock-step.
+
+If you generated your Angular project from the ABP template, both packages are already installed as `devDependencies` and the schematic collection / generator collection are pre-registered in your workspace.
+
+## Package layout
+
+```text npm/ng-packs/packages/
+schematics/
+├── package.json              "@abp/ng.schematics", schematics: "./collection.json"
+├── src/
+│   ├── collection.json       Schematic registry (see below)
+│   ├── commands/             One folder per schematic — each ships an index.ts + schema.json
+│   │   ├── proxy-add/
+│   │   ├── proxy-index/
+│   │   ├── proxy-refresh/
+│   │   ├── proxy-remove/
+│   │   ├── api/
+│   │   ├── create-lib/
+│   │   └── change-theme/
+│   ├── constants/
+│   ├── enums/                eServiceType (application / integration / all), exception codes
+│   ├── models/               GenerateProxySchema, GenerateLibSchema, ApiDefinition, ...
+│   └── utils/                Tree helpers, file builders, AST helpers, naming, workspace I/O
+└── tsconfig.json
+
+generators/
+├── package.json              "@abp/nx.generators", generators: "./generators.json"
+├── generators.json
+├── src/
+│   ├── index.ts              Re-exports
+│   └── generators/
+│       ├── generate-proxy/   Thin Nx adapter for @abp/ng.schematics:proxy-add
+│       ├── update-version/   Standalone Nx generator
+│       └── change-theme/     Standalone Nx generator
+```
+
+## `@abp/ng.schematics` collection
+
+The collection is the single source of truth for the Angular CLI command surface:
+
+```json npm/ng-packs/packages/schematics/src/collection.json
+{
+  "schematics": {
+    "proxy-add":     { "factory": "./commands/proxy-add",     "schema": "./commands/proxy-add/schema.json" },
+    "proxy-index":   { "factory": "./commands/proxy-index",   "schema": "./commands/proxy-index/schema.json" },
+    "proxy-refresh": { "factory": "./commands/proxy-refresh", "schema": "./commands/proxy-refresh/schema.json" },
+    "proxy-remove":  { "factory": "./commands/proxy-remove",  "schema": "./commands/proxy-remove/schema.json" },
+    "api":           { "factory": "./commands/api",           "schema": "./commands/api/schema.json" },
+    "create-lib":    { "factory": "./commands/create-lib",    "schema": "./commands/create-lib/schema.json" },
+    "change-theme":  { "factory": "./commands/change-theme",  "schema": "./commands/change-theme/schema.json" }
+  }
+}
+```
+
+| Schematic | Invocation | What it does |
+| --- | --- | --- |
+| `proxy-add` | `ng generate @abp/ng.schematics:proxy-add` | Fetches the ABP API definition and emits TypeScript proxies for a single backend module. Re-runs are idempotent. |
+| `proxy-index` | `ng generate @abp/ng.schematics:proxy-index` | Rebuilds the `index.ts` barrel for an existing proxy directory. |
+| `proxy-refresh` | `ng generate @abp/ng.schematics:proxy-refresh` | Regenerates *every* module already listed in `generated[]` against a fresh API definition. |
+| `proxy-remove` | `ng generate @abp/ng.schematics:proxy-remove` | Removes a single backend module from the generated proxies and rewrites the index. |
+| `api` | `ng generate @abp/ng.schematics:api` | Emits typed proxies *without* writing a `proxy.json` config — useful for one-off generation. |
+| `create-lib` | `ng generate @abp/ng.schematics:create-lib` | Scaffolds an ABP-style Angular library or a secondary entry point under an existing library. |
+| `change-theme` | `ng generate @abp/ng.schematics:change-theme` | Swaps the theme in `angular.json` styles, `app.module.ts` imports, and lazy-loaded modules. |
+
+The packaged debug script in the workspace root illustrates a typical invocation:
+
+```json npm/ng-packs/package.json (excerpt)
+"debug:schematics": "./node_modules/.bin/nx g ./packages/schematics/src/collection.json:proxy-add --module identity --apiName __default --source __default --target __default --url https://localhost:44305 --serviceType application --entryPoint  __default "
+```
+
+### `proxy-add`
+
+The flagship schematic. It walks the API definition, generates models (DTOs and enums), services (one per controller), and updates `proxy.json` so subsequent `proxy-refresh` runs are aware of the module. The `GenerateProxySchema` interface — backed by `schema.json` — is the canonical input shape:
+
+```ts npm/ng-packs/packages/schematics/src/models/generate-proxy-schema.ts
+import { eServiceType } from '../enums';
+
+export interface GenerateProxySchema {
+  /** Backend module name */
+  module?: string;
+  /** Backend api name, a.k.a. remoteServiceName */
+  apiName?: string;
+  /** Source Angular project for API definition URL & root namespace resolution */
+  source?: string;
+  /** Target Angular project to place the generated code */
+  target?: string;
+  /** Url to API definition */
+  url?: string;
+  /** Secondary entrypoint for proxy generation */
+  entryPoint?: string;
+  serviceType?: eServiceType;
+}
+```
+
+`schema.json` declares the prompts that drive the interactive `ng generate` UI:
+
+```json npm/ng-packs/packages/schematics/src/commands/proxy-add/schema.json (excerpt)
+"serviceType": {
+  "description": "Service type to the generated code",
+  "type": "string",
+  "$default": { "$source": "argv", "index": 5 },
+  "enum": ["application", "integration", "all"],
+  "x-prompt": {
+    "message": "Specifies the service type to generate. `application`, `integration` and `all`, Default value: `application`",
+    "type": "list",
+    "items": [
+      { "value": "all", "label": "All" },
+      { "value": "application", "label": "Application" },
+      { "value": "integration", "label": "Integration" }
+    ]
+  }
+}
+```
+
+The factory function reads, mutates, and writes the proxy config:
+
+```ts npm/ng-packs/packages/schematics/src/commands/proxy-add/index.ts (excerpt)
+export default function (schema: GenerateProxySchema) {
+  const params = removeDefaultPlaceholders(schema);
+  const moduleName = params.module || 'app';
+
+  return chain([
+    async (host: Tree) => {
+      const target = await resolveProject(host, params.target!);
+      const targetPath = buildTargetPath(target.definition, params.entryPoint);
+      const readProxyConfig = createProxyConfigReader(targetPath);
+      let generated: string[] = [];
+
+      try {
+        generated = readProxyConfig(host).generated;
+        const index = generated.findIndex(m => m === moduleName);
+        if (index < 0) generated.push(moduleName);
+      } catch (_) { generated.push(moduleName); }
+
+      const getApiDefinition = createApiDefinitionGetter(params);
+      const data = { generated, ...(await getApiDefinition(host)) };
+      data.generated = [];
+
+      const clearProxy = createProxyClearer(targetPath);
+      /* ... */
+    },
+  ]);
+}
+```
+
+<Tip>
+The default `module = 'app'` and `apiName = 'default'` are what you want when you point the schematic at a freshly-scaffolded ABP backend whose application services live in your own module. Use the real module name (e.g. `--module identity`) when generating proxies for the [Identity module](/modules/identity) or any other pre-built ABP module.
+</Tip>
+
+### `proxy-refresh`
+
+`proxy-refresh` accepts the same `module`, `apiName`, `source`, `target`, `url`, and `entryPoint` parameters as `proxy-add`. Rather than appending to `generated[]` it walks the existing list and regenerates each entry — what you run after a backend deployment.
+
+```json npm/ng-packs/packages/schematics/src/commands/proxy-refresh/schema.json (excerpt)
+"module":    { "type": "string", "x-prompt": "Please enter backend module name. (default: \"app\")",       "$default": { "$source": "argv", "index": 0 } },
+"apiName":   { "type": "string", "x-prompt": "Please enter backend api name, a.k.a. remoteServiceName. ...", "$default": { "$source": "argv", "index": 1 } },
+"source":    { "type": "string", "$default": { "$source": "argv", "index": 2 } },
+"target":    { "type": "string", "$default": { "$source": "argv", "index": 3 } },
+"url":       { "type": "string", "$default": { "$source": "argv", "index": 4 } },
+"entryPoint":{ "type": "string", "$default": { "$source": "argv", "index": 5 } }
+```
+
+### `proxy-remove`
+
+The inverse of `proxy-add`. The factory looks up the module in `generated[]`, removes it, and rewrites the index:
+
+```ts npm/ng-packs/packages/schematics/src/commands/proxy-remove/index.ts (excerpt)
+export default function (schema: GenerateProxySchema) {
+  const params = removeDefaultPlaceholders(schema);
+  const moduleName = params.module || 'app';
+
+  return async (host: Tree) => {
+    const target = await resolveProject(host, params.target!);
+    const targetPath = buildTargetPath(target.definition, params.entryPoint);
+    const readProxyConfig = createProxyConfigReader(targetPath);
+    const { generated } = readProxyConfig(host);
+
+    const index = generated.findIndex(m => m === moduleName);
+    if (index < 0) return host;
+    generated.splice(index, 1);
+
+    /* re-generate APIs + index ... */
+  };
+}
+```
+
+### `proxy-index`
+
+`proxy-index` rebuilds *only* the barrel file at `<targetPath>/index.ts`. Use it after manually editing a generated file to make sure the export list still lines up.
+
+```json npm/ng-packs/packages/schematics/src/commands/proxy-index/schema.json
+"target":     { "type": "string", "$default": { "$source": "argv", "index": 0 } },
+"entryPoint": { "type": "string", "$default": { "$source": "argv", "index": 5 } }
+```
+
+### `api`
+
+`api` is `proxy-add` minus the bookkeeping. It emits typed services and models but does not touch `proxy.json` — meant for one-off generations where you do not want subsequent `proxy-refresh` runs to re-emit the files.
+
+The schema is identical to `proxy-add` minus the placeholder fields. The factory shares the same generators (`controller → service`, `import → model`, `import → enum`) from `src/utils`.
+
+### `create-lib`
+
+`create-lib` scaffolds an ABP-style Angular library following the conventions used by `@abp/ng.identity`, `@abp/ng.feature-management`, etc. It can also create a *secondary entry point* under an existing library (the `chart.js`, `extensible`, `page`, `tree` entry points of `@abp/ng.components` were generated this way).
+
+```ts npm/ng-packs/packages/schematics/src/commands/create-lib/models/generate-lib-schema.ts
+export interface GenerateLibSchema {
+  /** Angular package name will create */
+  packageName: string;
+  /** İs the package a library or a library module */
+  isSecondaryEntrypoint: boolean;
+  isModuleTemplate: boolean;
+  override: boolean;
+  target: string;
+}
+```
+
+The prompts match the interface:
+
+```json npm/ng-packs/packages/schematics/src/commands/create-lib/schema.json
+"packageName":          { "$default": { "$source": "argv", "index": 0 }, "x-prompt": "Please enter the package name will create" },
+"isSecondaryEntrypoint":{ "$default": { "$source": "argv", "index": 1 }, "x-prompt": "Is secondary entrypoint?" },
+"isModuleTemplate":     { "$default": { "$source": "argv", "index": 2 }, "x-prompt": "Is module template?" },
+"override":             { "$default": { "$source": "argv", "index": 3 }, "x-prompt": "Override existing files?" }
+```
+
+The factory checks for an existing entrypoint and either short-circuits or calls `createLibrary`:
+
+```ts npm/ng-packs/packages/schematics/src/commands/create-lib/index.ts (excerpt)
+export default function (schema: GenerateLibSchema) {
+  return async (tree: Tree) => {
+    if (schema.override || !(await checkLibExist(schema, tree))) {
+      return chain([createLibrary(schema)]);
+    }
+  };
+}
+```
+
+### `change-theme`
+
+`change-theme` swaps the theme references inside `angular.json` styles, `app.module.ts` imports, and lazy-loaded modules. The four-theme enum mirrors the choices used by the ABP CLI:
+
+```json npm/ng-packs/packages/schematics/src/commands/change-theme/schema.json
+"name": {
+  "description": "The name of theme will change.",
+  "type": "number",
+  "$default": { "$source": "argv", "index": 0 },
+  "enum": [1, 2, 3, 4],
+  "x-prompt": {
+    "message": "Which theme would you like to use?",
+    "type": "list",
+    "items": [
+      { "value": 1, "label": "Basic" },
+      { "value": 2, "label": "Lepton" },
+      { "value": 3, "label": "LeptonXLite" },
+      { "value": 4, "label": "LeptonX" }
+    ]
+  }
+},
+"targetProject": {
+  "type": "string",
+  "x-prompt": "Please enter the project name",
+  "$default": { "$source": "argv", "index": 1 }
+}
+```
+
+The factory chains an `updateWorkspace` mutation to fix styles in `angular.json` and an AST rewrite that swaps the theme import in `app.module.ts`:
+
+```ts npm/ng-packs/packages/schematics/src/commands/change-theme/index.ts (excerpt)
+export default function (_options: ChangeThemeOptions): Rule {
+  return async () => {
+    const targetThemeName = _options.name;
+    const selectedProject = _options.targetProject;
+    if (!targetThemeName) {
+      throw new SchematicsException('The theme name does not selected');
+    }
+
+    return chain([
+      updateWorkspace(storedWorkspace => {
+        updateProjectStyle(selectedProject, storedWorkspace, targetThemeName);
+      }),
+      updateAppModule(selectedProject, targetThemeName),
+    ]);
+  };
+}
+```
+
+<Note>
+`Basic = 1` maps to [`@abp/ng.theme.basic`](/ng/theme-basic). The remaining values (Lepton, LeptonXLite, LeptonX) map to commercial themes that live outside this monorepo.
+</Note>
+
+## `@abp/nx.generators` collection
+
+The generators package piggy-backs on Nx and ships three generators:
+
+```json npm/ng-packs/packages/generators/generators.json
+{
+  "generators": {
+    "generate-proxy":  { "factory": "./src/generators/generate-proxy/generator",  "schema": "./src/generators/generate-proxy/schema.json", "description": "generate-proxy generator" },
+    "update-version": { "factory": "./src/generators/update-version/generator", "schema": "./src/generators/update-version/schema.json", "description": "update-version generator" },
+    "change-theme":   { "factory": "./src/generators/change-theme/generator",   "schema": "./src/generators/change-theme/schema.json",   "description": "change-theme generator" }
+  }
+}
+```
+
+| Generator | Invocation | What it does |
+| --- | --- | --- |
+| `generate-proxy` | `nx generate @abp/nx.generators:generate-proxy` | Thin adapter that delegates to the `proxy-add` Angular schematic so Nx users get the same behavior. |
+| `update-version` | `nx generate @abp/nx.generators:update-version` | Updates every `@abp/*` and `@volo/*` package version in every `package.json` of the workspace. |
+| `change-theme` | `nx generate @abp/nx.generators:change-theme` | Same theme swap as the Angular schematic, but Nx-flavored. |
+
+### `generate-proxy`
+
+The Nx wrapper imports `wrapAngularDevkitSchematic` to reuse the existing Angular schematic. This is why the two collections do not drift — the Nx generator just *replays* `proxy-add`:
+
+```ts npm/ng-packs/packages/generators/src/generators/generate-proxy/generator.ts
+export default async function (host: Tree, schema: GenerateProxyGeneratorSchema) {
+  const runAngularLibrarySchematic = wrapAngularDevkitSchematic('@abp/ng.schematics', 'proxy-add');
+
+  await runAngularLibrarySchematic(host, { ...schema });
+
+  return () => {
+    console.log(`proxy added '${schema.target}`);
+  };
+}
+```
+
+The schema is identical to the Angular version:
+
+```ts npm/ng-packs/packages/generators/src/generators/generate-proxy/schema.d.ts
+export interface GenerateProxyGeneratorSchema {
+  module: string;
+  apiName: string;
+  source: string;
+  target: string;
+  url: string;
+  serviceType: string;
+  entryPoint: string;
+}
+```
+
+### `update-version`
+
+The version bumper is the most important automation in this package — it keeps every `@abp/ng.*` peer pin (`~8.0.2`, etc.) consistent across the workspace. It walks `package.json` files and rewrites `version`, `dependencies`, `peerDependencies`, and `devDependencies`:
+
+```ts npm/ng-packs/packages/generators/src/generators/update-version/generator.ts
+export function updateVersionGenerator(tree: Tree, schema: UpdateVersionGeneratorSchema) {
+  const packageJsonList = getPackageJsonList(tree, schema.packages || []);
+  const getVersionNumberByPackageName = getVersionByPackageNameFactory(
+    schema.abpVersion,
+    schema.leptonXVersion,
+  );
+  packageJsonList.forEach(path => {
+    updateJson(tree, path, pkgJson => {
+      pkgJson.version = getVersionNumberByPackageName(pkgJson.name) || pkgJson.version;
+
+      Object.keys(pkgJson.dependencies || {}).forEach(key => {
+        const v = getVersionNumberByPackageName(key);
+        if (!v) return;
+        pkgJson.dependencies[key] = pkgJson.dependencies[key].replace(semverRegex, v);
+      });
+
+      Object.keys(pkgJson.peerDependencies || {}).forEach(key => {
+        const v = getVersionNumberByPackageName(key);
+        if (!v) return;
+        pkgJson.peerDependencies[key] = pkgJson.peerDependencies[key].replace(semverRegex, v);
+      });
+
+      Object.keys(pkgJson.devDependencies || {}).forEach(key => {
+        const v = getVersionNumberByPackageName(key);
+        if (!v) return;
+        pkgJson.devDependencies[key] = pkgJson.devDependencies[key].replace(semverRegex, v);
+      });
+
+      return pkgJson;
+    });
+  });
+  return () => {};
+}
+```
+
+The schema is small:
+
+```ts npm/ng-packs/packages/generators/src/generators/update-version/schema.d.ts
+export interface UpdateVersionGeneratorSchema {
+  abpVersion: string;
+  leptonXVersion: string;
+  packages?: string[];
+}
+```
+
+```json npm/ng-packs/packages/generators/src/generators/update-version/schema.json (excerpt)
+"abpVersion":     { "type": "string", "x-prompt": "What ABP version would you like to use?",
+                    "$default": { "$source": "argv", "index": 0 } },
+"leptonXVersion": { "type": "string" }
+```
+
+The root `package.json` exposes a convenience script:
+
+```json npm/ng-packs/package.json (excerpt)
+"update-version": "nx generate @abp/nx.generators:update-version"
+```
+
+<Tip>
+This is the generator the ABP team runs internally to publish a synchronized release: every `@abp/ng.*` package in the monorepo gets the same `version` field, and every dependency pin is rewritten to point at the new version.
+</Tip>
+
+### `change-theme` (Nx)
+
+The Nx-flavored variant mirrors the Angular schematic schema and adds a `localPath` parameter for working with locally-linked themes during development:
+
+```ts npm/ng-packs/packages/generators/src/generators/change-theme/schema.d.ts
+export interface ChangeThemeGeneratorSchema {
+  name: number;
+  targetOption: string;
+  localPath?: string;
+}
+```
+
+The theme enum is shared with the Angular schematic:
+
+```ts npm/ng-packs/packages/generators/src/generators/change-theme/theme-options.enum.ts
+// this enum create by https://raw.githubusercontent.com/abpframework/abp/rel-7.4/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/Building/Theme.cs
+
+export enum ThemeOptionsEnum {
+  Basic = 1,
+  Lepton = 2,
+  LeptonXLite = 3,
+  LeptonX = 4,
+}
+```
+
+## How proxy generation fits the runtime
+
+The proxies emitted by `proxy-add` / `proxy-refresh` are plain Angular `@Injectable` services that wrap [`RestService`](/ng/core#restservice). Every generated method maps to a controller action: it picks an `apiName`, builds a URL, types the response, and lets the OAuth-aware [`OAuthApiInterceptor`](/ng/oauth#oauthapiinterceptor) attach the `Authorization`, tenant, and `Accept-Language` headers automatically.
+
+```mermaid
+sequenceDiagram
+  participant Dev as ng generate proxy-add
+  participant API as ABP backend
+  participant Tree as Angular Tree (Schematic)
+  participant FS as src/app/proxy/...
+  participant Comp as Feature module
+  participant Rest as RestService
+
+  Dev->>API: GET /api/abp/api-definition
+  API-->>Dev: JSON definition (controllers, models)
+  Dev->>Tree: createApiDefinitionGetter
+  Tree->>Tree: clearProxy(); generateApis(); generateIndex();
+  Tree->>FS: write models/, services/, index.ts, proxy.json
+  Comp->>FS: import { IdentityUserService } from './proxy/...';
+  Comp->>Rest: call service method
+  Rest->>API: HTTP request with Bearer + tenant headers
+```
+
+## Common workflows
+
+| Task | Command |
+| --- | --- |
+| First-time proxy generation for a module | `ng generate @abp/ng.schematics:proxy-add --module=app --apiName=default --target=app` |
+| Refresh after a backend change | `ng generate @abp/ng.schematics:proxy-refresh --module=app` |
+| Drop a module from the generated set | `ng generate @abp/ng.schematics:proxy-remove --module=identity` |
+| Rebuild the barrel index | `ng generate @abp/ng.schematics:proxy-index --target=app` |
+| Scaffold a new feature library | `ng generate @abp/ng.schematics:create-lib --packageName=my-feature` |
+| Add a secondary entry point | `ng generate @abp/ng.schematics:create-lib --packageName=admin --isSecondaryEntrypoint=true --target=my-feature` |
+| Change theme to LeptonX | `ng generate @abp/ng.schematics:change-theme 4 my-app` |
+| Bump every `@abp/*` pin | `nx generate @abp/nx.generators:update-version --abpVersion=8.0.2 --leptonXVersion=3.0.1` |
+
+## Building the schematics package
+
+Because `@abp/ng.schematics` is compiled with plain `tsc` rather than `ng-packagr`, the workspace ships dedicated scripts:
+
+```json npm/ng-packs/package.json (excerpt)
+"build:schematics": "cd scripts && yarn && yarn build:schematics && cd ..",
+"dev:schematics":   "tsc -p packages/schematics/tsconfig.json -w",
+"mock:schematics":  "cd scripts/mock-schematic && yarn && yarn start"
+```
+
+The `build:all` script chains `build:schematics` after the Angular libraries:
+
+```json npm/ng-packs/package.json (excerpt)
+"build:all": "nx run-many --target=build --all --exclude=dev-app,schematics --prod &&  npm run build:schematics"
+```
+
+## Cross-references
+
+- Generated proxies call into [`@abp/ng.core`](/ng/core#restservice) `RestService` and surface inside [`@abp/ng.components/extensible`](/ng/components#extensible--abpngcomponentsextensible) grids.
+- `change-theme` mutates the imports of [`@abp/ng.theme.basic`](/ng/theme-basic) — replacing them with Lepton / LeptonX equivalents.
+- `update-version` keeps the peer pins listed in the [`@abp/ng.*` overview](/ng/overview#peer-dependency-pins) consistent.
+- Proxy generation pairs naturally with the [Identity](/modules/identity), [Permission Management](/modules/permission-management), [Setting Management](/modules/setting-management), [Feature Management](/modules/feature-management), [Tenant Management](/modules/tenant-management), and [Account](/modules/account) backend modules — each one is published with its own pre-generated proxies inside `npm/ng-packs/packages/<module>/src/lib/proxy/`.

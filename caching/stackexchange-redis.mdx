@@ -1,0 +1,515 @@
+---
+title: "StackExchange.Redis: AbpRedisCache and pipelined batches"
+sidebarTitle: "Redis"
+description: "Volo.Abp.Caching.StackExchangeRedis replaces Microsoft's RedisCache with AbpRedisCache, adds ICacheSupportsMultipleItems batches, and binds Redis config."
+---
+
+`Volo.Abp.Caching.StackExchangeRedis` is the production backing store for ABP's typed cache. It depends on `AbpCachingModule` and, when enabled, **replaces the default `Microsoft.Extensions.Caching.Distributed.IDistributedCache` singleton with `AbpRedisCache`** — a subclass of `Microsoft.Extensions.Caching.StackExchangeRedis.RedisCache` that adds the `ICacheSupportsMultipleItems` batch contract documented in [Distributed cache](/caching/distributed-cache). Application code does not change; calls to `IDistributedCache<TCacheItem>` automatically go through Redis.
+
+This page reads `framework/src/Volo.Abp.Caching.StackExchangeRedis` end to end: the module wiring, the `AbpRedisCache` class and the reflection it uses to reach the base type's internals, the pipelined `HashMemberGetMany`/`HashMemberGetManyAsync` extensions, and the configuration shape understood by the module. For the overall design of the typed cache, start with the [Caching overview](/caching/overview).
+
+## Package layout
+
+The package is small — three source files under `framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/`.
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpCachingStackExchangeRedisModule.cs` | `AbpModule` | Wires `AddStackExchangeRedisCache` and replaces `IDistributedCache` with `AbpRedisCache`. |
+| `AbpRedisCache.cs` | `RedisCache` subclass | Adds `ICacheSupportsMultipleItems` via reflection over the base type's internals. |
+| `AbpRedisExtensions.cs` | static class | `HashMemberGetMany` / `HashMemberGetManyAsync` extension methods on `IDatabase`. |
+
+The csproj depends on `Volo.Abp.Caching` (so `AbpCachingModule` is loaded transitively) and on `Microsoft.Extensions.Caching.StackExchangeRedis` (so the base `RedisCache` and its `RedisCacheOptions` are available).
+
+## `AbpCachingStackExchangeRedisModule`
+
+The module is declarative and reads from `IConfiguration`:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpCachingStackExchangeRedisModule.cs"
+[DependsOn(
+    typeof(AbpCachingModule)
+    )]
+public class AbpCachingStackExchangeRedisModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        var redisEnabled = configuration["Redis:IsEnabled"];
+        if (string.IsNullOrEmpty(redisEnabled) || bool.Parse(redisEnabled))
+        {
+            context.Services.AddStackExchangeRedisCache(options =>
+            {
+                var redisConfiguration = configuration["Redis:Configuration"];
+                if (!redisConfiguration.IsNullOrEmpty())
+                {
+                    options.Configuration = redisConfiguration;
+                }
+            });
+
+            context.Services.Replace(ServiceDescriptor.Singleton<IDistributedCache, AbpRedisCache>());
+        }
+    }
+}
+```
+
+Three things to notice:
+
+- **`Redis:IsEnabled` defaults to `true`.** A missing or empty configuration value means Redis is on. The kill-switch (`"Redis:IsEnabled": "false"`) leaves `AbpCachingModule`'s `AddDistributedMemoryCache` registration in place, so the typed cache stays in-process. Use this for unit tests or local development without Redis.
+- **`Redis:Configuration` is the StackExchange.Redis connection string.** It is the standard format documented by StackExchange.Redis (`"localhost:6379,abortConnect=false"`, `"redis-prod.internal:6380,ssl=true,password=..."`, etc.) and is assigned to `RedisCacheOptions.Configuration`. If you need a `ConfigurationOptions` object (sentinel, channel prefix, name) or a `ConnectionMultiplexerFactory`, configure `RedisCacheOptions` directly after the module's `ConfigureServices` runs.
+- **The singleton is replaced, not added.** `context.Services.Replace(...)` swaps the `IDistributedCache` registration that `AddStackExchangeRedisCache` just added (a singleton `RedisCache`) with `AbpRedisCache`, keeping the same `RedisCacheOptions` plumbing. This is why `AbpRedisCache`'s constructor takes the same `IOptions<RedisCacheOptions>` parameter the base type expects.
+
+### Configuration shape
+
+`appsettings.json` for a Redis-backed deployment typically looks like:
+
+```json title="appsettings.json"
+{
+  "Redis": {
+    "IsEnabled": true,
+    "Configuration": "localhost:6379,abortConnect=false"
+  }
+}
+```
+
+The two keys are both string-typed at the module — `bool.Parse` is called on `Redis:IsEnabled`, and `Redis:Configuration` is forwarded to `RedisCacheOptions.Configuration` as-is. Environment-variable overrides follow the standard ASP.NET Core conventions described in [Environment variables](/config/options-classes) (e.g. `Redis__IsEnabled=false`).
+
+<Note>
+ABP does not introduce its own `AbpRedisCacheOptions` type. The configuration target for the connection itself is `Microsoft.Extensions.Caching.StackExchangeRedis.RedisCacheOptions`, which the module configures inside the `AddStackExchangeRedisCache(...)` callback. To customise instance names, channel prefixes, `ConfigurationOptions`, or the `ConnectionMultiplexerFactory`, post-`Configure<RedisCacheOptions>` from a downstream module.
+</Note>
+
+For example, to set an instance name (which becomes a per-key prefix at the Redis layer — distinct from `AbpDistributedCacheOptions.KeyPrefix`, see [Caching overview](/caching/overview)):
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<RedisCacheOptions>(options =>
+    {
+        options.InstanceName = "myapp:";
+    });
+}
+```
+
+## `AbpRedisCache`
+
+`AbpRedisCache` exists for a single reason: to provide the batch operations that the typed `DistributedCache<,>` discovers via `ICacheSupportsMultipleItems`. Microsoft's base `RedisCache` exposes only single-item `Get`/`Set`/`Refresh`/`Remove`, so a `GetMany` call against the unmodified base type round-trips once per key. With `AbpRedisCache`, a single batch call dispatches all keys in parallel through one `IDatabase` connection.
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+[DisableConventionalRegistration]
+public class AbpRedisCache : RedisCache, ICacheSupportsMultipleItems
+{
+    protected static readonly string AbsoluteExpirationKey;
+    protected static readonly string SlidingExpirationKey;
+    protected static readonly string DataKey;
+    protected static readonly long NotPresent;
+
+    private readonly static FieldInfo SetScriptField;
+    private readonly static FieldInfo RedisDatabaseField;
+    private readonly static MethodInfo ConnectMethod;
+    private readonly static MethodInfo ConnectAsyncMethod;
+    private readonly static MethodInfo MapMetadataMethod;
+    private readonly static MethodInfo GetAbsoluteExpirationMethod;
+    private readonly static MethodInfo GetExpirationInSecondsMethod;
+
+    protected IDatabase RedisDatabase => GetRedisDatabase()!;
+    private IDatabase? _redisDatabase;
+
+    protected string Instance { get; }
+    // ...
+}
+```
+
+`[DisableConventionalRegistration]` opts the class out of ABP's conventional registration scanner — it is registered explicitly by the module's `Services.Replace(...)` call. The class extends `RedisCache`, so all the existing `Get`/`Set`/`Refresh`/`Remove` calls go through the inherited code path; only the batch APIs and the connection helpers are added.
+
+### The static reflection cache
+
+The base `RedisCache` keeps several pieces of state and helper methods `internal` or `private`, but the batch implementations need to:
+
+- Read the underlying `IDatabase` (`_cache` field) without re-connecting.
+- Invoke the base `Connect` / `ConnectAsync` private methods.
+- Reuse the LUA script the base type uses for `Set` (`_setScript` field).
+- Reuse the static helpers `MapMetadata`, `GetAbsoluteExpiration`, and `GetExpirationInSeconds`.
+- Read the `AbsoluteExpirationKey`, `SlidingExpirationKey`, `DataKey`, and `NotPresent` constants used in the Redis hash layout.
+
+`AbpRedisCache` resolves all of these once in its static constructor:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+static AbpRedisCache()
+{
+    var type = typeof(RedisCache);
+
+    RedisDatabaseField = Check.NotNull(type.GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic), nameof(RedisDatabaseField))!;
+
+    SetScriptField = Check.NotNull(type.GetField("_setScript", BindingFlags.Instance | BindingFlags.NonPublic), nameof(SetScriptField))!;
+
+    ConnectMethod = Check.NotNull(type.GetMethod("Connect", BindingFlags.Instance | BindingFlags.NonPublic), nameof(ConnectMethod))!;
+
+    ConnectAsyncMethod = Check.NotNull(type.GetMethod("ConnectAsync", BindingFlags.Instance | BindingFlags.NonPublic), nameof(ConnectAsyncMethod))!;
+
+    MapMetadataMethod = Check.NotNull(type.GetMethod("MapMetadata", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Static), nameof(MapMetadataMethod))!;
+
+    GetAbsoluteExpirationMethod = Check.NotNull(type.GetMethod("GetAbsoluteExpiration", BindingFlags.Static | BindingFlags.NonPublic), nameof(GetAbsoluteExpirationMethod))!;
+
+    GetExpirationInSecondsMethod = Check.NotNull(type.GetMethod("GetExpirationInSeconds", BindingFlags.Static | BindingFlags.NonPublic), nameof(GetExpirationInSecondsMethod))!;
+
+    AbsoluteExpirationKey = type.GetField("AbsoluteExpirationKey", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!.ToString()!;
+    SlidingExpirationKey = type.GetField("SlidingExpirationKey", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!.ToString()!;
+    DataKey = type.GetField("DataKey", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!.ToString()!;
+
+    NotPresent = type.GetField("NotPresent", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!.To<int>();
+}
+```
+
+<Warning>
+This is the most fragile part of the whole package. It binds at runtime to private fields of `Microsoft.Extensions.Caching.StackExchangeRedis.RedisCache`. When the upstream package renames or removes any of these members, `AbpRedisCache` fails to load. ABP keeps the package version-pinned against a known-good `Microsoft.Extensions.Caching.StackExchangeRedis` to avoid surprises — when you change that version, smoke-test the cache against a real Redis instance.
+</Warning>
+
+### Construction
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+public AbpRedisCache(IOptions<RedisCacheOptions> optionsAccessor)
+    : base(optionsAccessor)
+{
+    Instance = optionsAccessor.Value.InstanceName ?? string.Empty;
+}
+```
+
+The constructor signature matches the base type so the singleton replacement is a drop-in. `Instance` mirrors `RedisCacheOptions.InstanceName` and is used as the per-key prefix when computing Redis hash slots.
+
+### `Connect` / `ConnectAsync`
+
+The two helpers ensure the underlying `IDatabase` is initialised before the batch calls dispatch:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+protected virtual void Connect()
+{
+    if (GetRedisDatabase() != null)
+    {
+        return;
+    }
+
+    ConnectMethod.Invoke(this, Array.Empty<object>());
+}
+
+protected virtual async Task ConnectAsync(CancellationToken token = default)
+{
+    if (GetRedisDatabase() != null)
+    {
+        return;
+    }
+
+    await (Task)ConnectAsyncMethod.Invoke(this, new object[] { token })!;
+}
+
+private IDatabase? GetRedisDatabase()
+{
+    return _redisDatabase ??= RedisDatabaseField.GetValue(this) as IDatabase;
+}
+```
+
+`GetRedisDatabase` memoises the field read — the first call triggers the reflection lookup, every subsequent call is a plain field access.
+
+### `GetMany` / `GetManyAsync`
+
+Both forward into the shared `GetAndRefreshMany` path:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+public byte[]?[] GetMany(IEnumerable<string> keys)
+{
+    keys = Check.NotNull(keys, nameof(keys));
+
+    return GetAndRefreshMany(keys, true);
+}
+
+public async Task<byte[]?[]> GetManyAsync(
+    IEnumerable<string> keys,
+    CancellationToken token = default)
+{
+    keys = Check.NotNull(keys, nameof(keys));
+
+    return await GetAndRefreshManyAsync(keys, true, token);
+}
+```
+
+`GetAndRefreshMany` is where the real work happens. It connects, prefixes each key with the configured `Instance`, fires `HashMemberGetMany` (or its async variant) for the three hash fields, and then issues one `KeyExpire` per result to honour sliding expirations:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+protected virtual async Task<byte[]?[]> GetAndRefreshManyAsync(
+    IEnumerable<string> keys,
+    bool getData,
+    CancellationToken token = default)
+{
+    token.ThrowIfCancellationRequested();
+
+    await ConnectAsync(token);
+
+    var keyArray = keys.Select(key => Instance + key).ToArray();
+    RedisValue[][] results;
+
+    if (getData)
+    {
+        results = await RedisDatabase.HashMemberGetManyAsync(keyArray, AbsoluteExpirationKey,
+            SlidingExpirationKey, DataKey);
+    }
+    else
+    {
+        results = await RedisDatabase.HashMemberGetManyAsync(keyArray, AbsoluteExpirationKey,
+            SlidingExpirationKey);
+    }
+
+    await Task.WhenAll(PipelineRefreshManyAndOutData(keyArray, results, out var bytes));
+
+    return bytes;
+}
+```
+
+`PipelineRefreshManyAndOutData` computes the residual TTL using both the absolute and sliding expiration recorded in the hash, then issues `KeyExpireAsync` per key that has a sliding component:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+protected virtual Task[] PipelineRefreshManyAndOutData(
+    string[] keys,
+    RedisValue[][] results,
+    out byte[]?[] bytes)
+{
+    bytes = new byte[keys.Length][];
+    var tasks = new Task[keys.Length];
+
+    for (var i = 0; i < keys.Length; i++)
+    {
+        if (results[i].Length >= 2)
+        {
+            MapMetadata(results[i], out var absExpr, out var sldExpr);
+
+            if (sldExpr.HasValue)
+            {
+                TimeSpan? expr;
+
+                if (absExpr.HasValue)
+                {
+                    var relExpr = absExpr.Value - DateTimeOffset.Now;
+                    expr = relExpr <= sldExpr.Value ? relExpr : sldExpr;
+                }
+                else
+                {
+                    expr = sldExpr;
+                }
+
+                tasks[i] = RedisDatabase.KeyExpireAsync(keys[i], expr);
+            }
+            else
+            {
+                tasks[i] = Task.CompletedTask;
+            }
+        }
+
+        if (results[i].Length >= 3 && results[i][2].HasValue)
+        {
+            bytes[i] = results[i][2];
+        }
+        else
+        {
+            bytes[i] = null;
+        }
+    }
+
+    return tasks;
+}
+```
+
+The same logic underpins `RefreshMany` / `RefreshManyAsync`, except `getData` is `false`, so only the two expiration fields are fetched and the data slot is ignored.
+
+### `SetMany` / `SetManyAsync`
+
+The set path uses the base type's set LUA script — read via the `SetScriptField` reflection handle — and pipelines one `EVAL` per item:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+public async Task SetManyAsync(
+    IEnumerable<KeyValuePair<string, byte[]>> items,
+    DistributedCacheEntryOptions options,
+    CancellationToken token = default)
+{
+    token.ThrowIfCancellationRequested();
+
+    await ConnectAsync(token);
+
+    await Task.WhenAll(PipelineSetMany(items, options));
+}
+
+protected virtual Task[] PipelineSetMany(
+    IEnumerable<KeyValuePair<string, byte[]>> items,
+    DistributedCacheEntryOptions options)
+{
+    items = Check.NotNull(items, nameof(items));
+    options = Check.NotNull(options, nameof(options));
+
+    var itemArray = items.ToArray();
+    var tasks = new Task[itemArray.Length];
+    var creationTime = DateTimeOffset.UtcNow;
+    var absoluteExpiration = GetAbsoluteExpiration(creationTime, options);
+
+    for (var i = 0; i < itemArray.Length; i++)
+    {
+        tasks[i] = RedisDatabase.ScriptEvaluateAsync(GetSetScript(), new RedisKey[] { Instance + itemArray[i].Key },
+            new RedisValue[]
+            {
+                    absoluteExpiration?.Ticks ?? NotPresent,
+                    options.SlidingExpiration?.Ticks ?? NotPresent,
+                    GetExpirationInSeconds(creationTime, absoluteExpiration, options) ?? NotPresent,
+                    itemArray[i].Value
+            });
+    }
+
+    return tasks;
+}
+```
+
+The four `RedisValue` arguments — absolute expiration ticks, sliding expiration ticks, expiration seconds, and the serialized payload — match the contract the base type's LUA script expects. Reusing the base script (instead of writing a new one) is what guarantees forward compatibility with the on-disk Redis representation of single-item `Set` calls: an entry written with `Set` can be read with `GetMany` and vice versa.
+
+### `RemoveMany` / `RemoveManyAsync`
+
+Remove is the simplest case — `KeyDelete` takes an array of keys natively:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisCache.cs"
+public void RemoveMany(IEnumerable<string> keys)
+{
+    keys = Check.NotNull(keys, nameof(keys));
+
+    Connect();
+
+    RedisDatabase.KeyDelete(keys.Select(key => (RedisKey)(Instance + key)).ToArray());
+}
+
+public async Task RemoveManyAsync(IEnumerable<string> keys, CancellationToken token = default)
+{
+    keys = Check.NotNull(keys, nameof(keys));
+
+    token.ThrowIfCancellationRequested();
+    await ConnectAsync(token);
+
+    await RedisDatabase.KeyDeleteAsync(keys.Select(key => (RedisKey)(Instance + key)).ToArray());
+}
+```
+
+## `AbpRedisExtensions.HashMemberGetMany`
+
+The batch-read helpers live in a small static class. They take a flat array of keys and a list of hash fields, issue one `HashGetAsync` per key in parallel, and either block synchronously (`cache.Wait(task)`) or `Task.WhenAll`-await asynchronously:
+
+```csharp title="framework/src/Volo.Abp.Caching.StackExchangeRedis/Volo/Abp/Caching/StackExchangeRedis/AbpRedisExtensions.cs"
+public static class AbpRedisExtensions
+{
+    public static RedisValue[][] HashMemberGetMany(
+        this IDatabase cache,
+        string[] keys,
+        params string[] members)
+    {
+        var tasks = new Task<RedisValue[]>[keys.Length];
+        var fields = members.Select(member => (RedisValue)member).ToArray();
+        var results = new RedisValue[keys.Length][];
+
+        for (var i = 0; i < keys.Length; i++)
+        {
+            tasks[i] = cache.HashGetAsync((RedisKey)keys[i], fields);
+        }
+
+        for (var i = 0; i < tasks.Length; i++)
+        {
+            results[i] = cache.Wait(tasks[i]);
+        }
+
+        return results;
+    }
+
+    public static async Task<RedisValue[][]> HashMemberGetManyAsync(
+        this IDatabase cache,
+        string[] keys,
+        params string[] members)
+    {
+        var tasks = new Task<RedisValue[]>[keys.Length];
+        var fields = members.Select(member => (RedisValue)member).ToArray();
+
+        for (var i = 0; i < keys.Length; i++)
+        {
+            tasks[i] = cache.HashGetAsync((RedisKey)keys[i], fields);
+        }
+
+        return await Task.WhenAll(tasks);
+    }
+}
+```
+
+The shape of the call is "N keys, each fetching M fields". Internally StackExchange.Redis pipelines all the requests through a single physical connection, so the wire cost of fetching 100 keys is one round-trip plus N+1 messages, not N round-trips. This is the win that `AbpRedisCache` unlocks for `DistributedCache<,>.GetMany` and friends — see [Distributed cache](/caching/distributed-cache#batch-apis-and-icachesupportsmultipleitems) for the dispatch side.
+
+## How it interacts with ABP's typed cache
+
+Because `AbpRedisCache` is `IDistributedCache + ICacheSupportsMultipleItems`, every typed cache resolved through `IDistributedCache<TCacheItem>` automatically benefits:
+
+<Steps>
+  <Step title="Resolution">
+    `IDistributedCache<ProductCacheItem>` resolves to a singleton `DistributedCache<ProductCacheItem>` whose `Cache` field is the singleton `AbpRedisCache`.
+  </Step>
+  <Step title="Single-item read">
+    `GetAsync(...)` calls the inherited `RedisCache.GetAsync` (via the base type's `IDistributedCache` interface) — Redis returns the bytes, the typed cache deserializes through `Utf8JsonDistributedCacheSerializer`.
+  </Step>
+  <Step title="Batch read">
+    `GetManyAsync(...)` checks `Cache is ICacheSupportsMultipleItems` — that matches, so it calls `AbpRedisCache.GetManyAsync`, which fires `HashMemberGetManyAsync` in one pipelined round-trip.
+  </Step>
+  <Step title="Refresh">
+    `RefreshManyAsync(...)` similarly dispatches through `AbpRedisCache.RefreshManyAsync`, which fetches only the expiration fields and reissues `KeyExpireAsync` for the sliding ones.
+  </Step>
+  <Step title="Write">
+    `SetManyAsync(...)` pipelines per-item EVAL calls using the base type's existing LUA script, so writes are wire-compatible with single-item `Set`.
+  </Step>
+</Steps>
+
+## Keys on the wire
+
+The Redis-side key for a typed cache call combines `RedisCacheOptions.InstanceName` (the `Instance` field on `AbpRedisCache`) with the normalized key produced by `DistributedCacheKeyNormalizer`:
+
+```
+<InstanceName><normalized key>
+```
+
+So with `RedisCacheOptions.InstanceName = "myapp:"`, `AbpDistributedCacheOptions.KeyPrefix = "prod-"`, tenant id `5e8f...`, cache name `MyApp.Catalog.Product`, and key `42`, the Redis key is:
+
+```
+myapp:t:5e8f...,c:MyApp.Catalog.Product,k:prod-42
+```
+
+These segments serve different purposes:
+
+- `InstanceName` is shared by all caches in the application — useful for hosting multiple unrelated apps on the same Redis cluster.
+- `KeyPrefix` is shared by all caches in the same `AbpDistributedCacheOptions` scope — useful for separating environments (`dev-`, `staging-`, `prod-`).
+- `t:<tenantId>` partitions per tenant (see [Multi-tenancy current tenant](/multitenancy/current-tenant)) unless `[IgnoreMultiTenancy]` is set on the cache item type.
+- `c:<CacheName>` partitions per CLR type (or per `[CacheName]` value).
+
+## Switching off Redis at runtime
+
+The `Redis:IsEnabled` switch is the supported way to fall back to the in-memory cache. It is read once at module load — there is no runtime toggle. Practical patterns:
+
+- **Integration tests**: set `"Redis:IsEnabled": "false"` in the test host's configuration so tests run without Redis.
+- **Local dev**: set the same in `appsettings.Development.json` so first-run developers don't need a Redis container.
+- **Disaster fallback**: not directly supported — if Redis is down at runtime, the cache returns errors that `AbpDistributedCacheOptions.HideErrors` converts into cache misses. The typed cache continues to serve the application; only performance degrades.
+
+See [Configuration: appsettings](/config/connection-strings-and-databases) for environment-specific overrides and [Configuration: environment variables](/config/options-classes) for container-friendly forms.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Caching overview" icon="house" href="/caching/overview">
+    The typed cache, `AbpDistributedCacheOptions`, cache-name and multi-tenancy attributes.
+  </Card>
+  <Card title="Distributed cache" icon="layer-group" href="/caching/distributed-cache">
+    How `DistributedCache<,>` dispatches batch calls through `ICacheSupportsMultipleItems`.
+  </Card>
+  <Card title="Multi-tenancy" icon="building" href="/multitenancy/overview">
+    `ICurrentTenant`, the source of the `t:<tenantId>` segment.
+  </Card>
+  <Card title="Options pattern" icon="sliders" href="/config/options-classes">
+    Configuring `RedisCacheOptions` and `AbpDistributedCacheOptions` from a module.
+  </Card>
+  <Card title="Environment variables" icon="terminal" href="/config/options-classes">
+    Overriding `Redis:Configuration` and `Redis:IsEnabled` per environment.
+  </Card>
+  <Card title="appsettings" icon="file-code" href="/config/connection-strings-and-databases">
+    Binding the `Redis` configuration section in layered hosts.
+  </Card>
+</CardGroup>

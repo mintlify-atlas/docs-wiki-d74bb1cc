@@ -1,0 +1,363 @@
+---
+title: "IMenuContributor: register, order, and gate menu items"
+sidebarTitle: "Menu contributors"
+description: "Patterns for IMenuContributor: name guards, MenuConfigurationContext, ApplicationMenuItem ordering, RequirePermissions, examples from Identity and Account."
+---
+
+A menu contributor is the unit of menu extensibility in ABP. Every module that wants to add items to the navbar, the user menu, or any custom menu implements `IMenuContributor`, registers itself in `AbpNavigationOptions.MenuContributors`, and is invoked whenever `MenuManager.GetInternalAsync` runs. This page is the practical guide to the pattern — the contract, the guard idiom, the `MenuConfigurationContext` services, ordering conventions, permission gating, and how the real modules in this repository (`Volo.Abp.Identity.Web`, `Volo.Abp.Account.Web`) put it together. For the underlying composition algorithm, see [Navigation overview](/navigation/overview).
+
+## The contract
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/IMenuContributor.cs
+public interface IMenuContributor
+{
+    Task ConfigureMenuAsync(MenuConfigurationContext context);
+}
+```
+
+That's it. One async method, one context. The context exposes the in-flight `ApplicationMenu`, the `IServiceProvider` for the current scope, and lazily resolved `IAuthorizationService` and `IStringLocalizerFactory`. Contributors are stateless (the framework instantiates them once per `AbpNavigationOptions.MenuContributors.Add(...)`) and are invoked sequentially, in registration order, inside a dedicated DI scope per menu request.
+
+## Registering a contributor
+
+Contributors live in module classes. The convention is to add them in `ConfigureServices`:
+
+```csharp
+[DependsOn(typeof(AbpUiNavigationModule))]
+public class MyFeatureWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new MyFeatureMainMenuContributor());
+        });
+    }
+}
+```
+
+A few rules the framework relies on:
+
+- Contributors must be added before the host's `ConfigureServices` finishes — `MenuManager` snapshots the list when it reads `IOptions<AbpNavigationOptions>`.
+- A module typically registers **one contributor per menu name** (Main, User, Shortcut). Splitting is fine; combining is also fine — the guard idiom handles both.
+- The framework itself registers `DefaultMenuContributor` from `AbpUiNavigationModule` — see [Navigation overview](/navigation/overview).
+
+## The guard idiom
+
+Every contributor in the codebase opens with a single `if`:
+
+```csharp
+public Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main)
+    {
+        return Task.CompletedTask;
+    }
+
+    // ...add items...
+}
+```
+
+This is required, not stylistic. Because `MenuManager` iterates every named menu in `AbpNavigationOptions.MainMenuNames` plus arbitrary `GetAsync(name)` calls (for `User`, `Shortcut`, etc.), your contributor will be invoked for menus it has no opinion on. Without the guard, items would leak into the user menu and other named menus.
+
+| Constant from `StandardMenus` | When to claim it                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------- |
+| `Main`                        | Items shown in the top navbar.                                                  |
+| `User`                        | Items in the user-dropdown (account settings, logout).                          |
+| `Shortcut`                    | Items in the optional shortcut/quick-action menu (used by some themes).         |
+
+You can also guard on a custom name you've defined and added to `AbpNavigationOptions.MainMenuNames`.
+
+## What `MenuConfigurationContext` gives you
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/IMenuConfigurationContext.cs
+public interface IMenuConfigurationContext : IServiceProviderAccessor
+{
+    ApplicationMenu Menu { get; }
+    IAuthorizationService AuthorizationService { get; }
+    IStringLocalizerFactory StringLocalizerFactory { get; }
+}
+```
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/MenuConfigurationContext.cs
+public Task<bool> IsGrantedAsync(string policyName)
+    => AuthorizationService.IsGrantedAsync(policyName);
+
+public IStringLocalizer? GetDefaultLocalizer()
+    => StringLocalizerFactory.CreateDefaultOrNull();
+
+public IStringLocalizer GetLocalizer<T>()
+    => StringLocalizerFactory.Create<T>();
+
+public IStringLocalizer GetLocalizer(Type resourceType)
+    => StringLocalizerFactory.Create(resourceType);
+```
+
+Three idioms cover ~95% of real contributors:
+
+- **`context.Menu`** — the menu you are building. Read or mutate `Items` and `Groups`. Use `context.Menu.GetAdministration()` if you want to nest under the framework-seeded Administration group.
+- **`context.GetLocalizer<MyResource>()`** — get a string localizer for your module's localisation resource. Use it for `DisplayName` strings.
+- **`context.ServiceProvider`** — escape hatch for anything else (`GetService<IFooBar>()`).
+
+Avoid calling `context.IsGrantedAsync(...)` inside the contributor — instead attach `RequirePermissions(...)` to the item and let the batch state checker resolve them in one round-trip.
+
+## Example: `AbpIdentityWebMainMenuContributor`
+
+The Identity module's MVC contributor is short and idiomatic. It claims the Main menu, builds an `Identity Management` group, and nests `Roles` and `Users` under it with permission requirements:
+
+```csharp modules/identity/src/Volo.Abp.Identity.Web/Navigation/AbpIdentityWebMainMenuContributor.cs
+public class AbpIdentityWebMainMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main)
+        {
+            return Task.CompletedTask;
+        }
+
+        var l = context.GetLocalizer<IdentityResource>();
+
+        var identityMenuItem = new ApplicationMenuItem(
+            IdentityMenuNames.GroupName,
+            l["Menu:IdentityManagement"],
+            icon: "fa fa-id-card-o");
+
+        identityMenuItem.AddItem(new ApplicationMenuItem(
+            IdentityMenuNames.Roles, l["Roles"], url: "~/Identity/Roles")
+            .RequirePermissions(IdentityPermissions.Roles.Default));
+
+        identityMenuItem.AddItem(new ApplicationMenuItem(
+            IdentityMenuNames.Users, l["Users"], url: "~/Identity/Users")
+            .RequirePermissions(IdentityPermissions.Users.Default));
+
+        context.Menu.GetAdministration().AddItem(identityMenuItem);
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Notes worth absorbing:
+
+- **Stable item names** live in a constants class. Other modules can find your items by name and reorder/remove them:
+  ```csharp modules/identity/src/Volo.Abp.Identity.Web/Navigation/IdentityMenuNames.cs
+  public class IdentityMenuNames
+  {
+      public const string GroupName = "AbpIdentity";
+      public const string Roles = GroupName + ".Roles";
+      public const string Users = GroupName + ".Users";
+  }
+  ```
+- **Nesting under Administration** — `context.Menu.GetAdministration()` is an extension method that does `GetMenuItem(DefaultMenuNames.Application.Main.Administration)`. Every module that targets the admin area uses this single seam, so the Administration group is consistent.
+- **Permissions via extension** — `.RequirePermissions(IdentityPermissions.Roles.Default)` defers the check; if a user doesn't have the permission, `MenuManager.CheckPermissionsAsync` removes the item, and if `Identity Management` ends up empty it is removed by `Normalize()`.
+- **Synchronous return value** — the method returns `Task.CompletedTask` because it does no I/O. The `Async` suffix on the interface is for contributors that legitimately need to await.
+
+## Example: `AbpAccountUserMenuContributor`
+
+The Account module contributes to the `User` menu instead:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountUserMenuContributor.cs
+public class AbpAccountUserMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.User)
+        {
+            return Task.CompletedTask;
+        }
+
+        var uiResource      = context.GetLocalizer<AbpUiResource>();
+        var accountResource = context.GetLocalizer<AccountResource>();
+
+        context.Menu.AddItem(new ApplicationMenuItem(
+            "Account.Manage", accountResource["MyAccount"],
+            url: "~/Account/Manage", icon: "fa fa-cog",
+            order: 1000, null));
+
+        context.Menu.AddItem(new ApplicationMenuItem(
+            "Account.Logout", uiResource["Logout"],
+            url: "~/Account/Logout", icon: "fa fa-power-off",
+            order: int.MaxValue - 1000));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Two patterns to copy:
+
+1. **Multiple localizers in one contributor** — both `AbpUiResource` (for "Logout") and `AccountResource` (for "MyAccount") are resolved. Contributors are not single-resource gated.
+2. **`order: int.MaxValue - 1000` for Logout** — the convention is to keep logout near the bottom but leave room for absolute-last items (a "Goodbye" item at `int.MaxValue` would still come after). Mirror this when you contribute "destructive" items.
+
+## Ordering rules
+
+Every `ApplicationMenuItem` has `Order` (default `ApplicationMenuItem.DefaultOrder = 1000`). `ApplicationMenuItemList.Normalize()` sorts ascending, **stably** (well, by `OrderBy` — items with equal `Order` keep insertion order from a single contributor but the cross-contributor order is whatever `MenuContributors` produces).
+
+Conventions baked into the codebase:
+
+| Order range            | Convention                                                            |
+| ---------------------- | --------------------------------------------------------------------- |
+| `0..999`               | Pinned items (Dashboard, Home).                                       |
+| `1000` (default)       | Normal items — most contributors don't set `order` explicitly.        |
+| `2000..10000`          | Feature-area groupings (Identity, CMS, Saas, etc.).                   |
+| `int.MaxValue - 1000`  | Sign-out / destructive / last-in-section items.                       |
+
+To re-order someone else's item from a downstream contributor, use the extension:
+
+```csharp
+context.Menu.SetSubItemOrder(IdentityMenuNames.GroupName, order: 500);
+// or, recursively:
+var users = context.Menu.FindMenuItem(IdentityMenuNames.Users);
+if (users != null) users.Order = 200;
+```
+
+`SetSubItemOrder` is a direct-children operation; `FindMenuItem` walks the entire tree. See `ApplicationMenuExtensions` and `HasMenuItemsExtensions` in [Navigation overview](/navigation/overview) for the full surface.
+
+## Replacing or removing items
+
+Because contributors run in registration order, a downstream module can remove items that an upstream module added:
+
+```csharp
+public Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return Task.CompletedTask;
+
+    // Remove the Users page contributed by Identity:
+    context.Menu.GetAdministration().TryRemoveMenuItem(IdentityMenuNames.Users);
+    return Task.CompletedTask;
+}
+```
+
+Register this contributor *after* `AbpIdentityWebMainMenuContributor` (i.e. in a module whose `[DependsOn]` includes `AbpIdentityWebModule`). The dependency graph determines registration order, so taking a dependency on the producing module is the canonical way to guarantee "run after".
+
+<Warning>
+`TryRemoveMenuItem` returns `bool`. If the item name changes upstream, your removal silently no-ops. For brittle integrations, log when `false` is returned.
+</Warning>
+
+## Permission gating in depth
+
+`ApplicationMenuItem` implements `IHasSimpleStateCheckers<ApplicationMenuItem>`. The `RequirePermissions(...)` extension (in `Volo.Abp.Authorization.Permissions`) attaches a checker that integrates with the batch state-checker pipeline:
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/MenuManager.cs
+protected virtual async Task CheckPermissionsAsync(IServiceProvider serviceProvider, IHasMenuItems menuWithItems)
+{
+    var allMenuItems = new List<ApplicationMenuItem>();
+    GetAllMenuItems(menuWithItems, allMenuItems);
+
+    foreach (var item in allMenuItems)
+    {
+        if (!item.RequiredPermissionName.IsNullOrWhiteSpace())
+        {
+            item.RequirePermissions(item.RequiredPermissionName!);
+        }
+    }
+
+    var checkPermissionsMenuItems = allMenuItems.Where(x => x.StateCheckers.Any()).ToArray();
+
+    if (checkPermissionsMenuItems.Any())
+    {
+        var toBeDeleted = new HashSet<ApplicationMenuItem>();
+        var result = await SimpleStateCheckerManager.IsEnabledAsync(checkPermissionsMenuItems);
+        foreach (var menu in checkPermissionsMenuItems)
+        {
+            if (!result[menu])
+            {
+                toBeDeleted.Add(menu);
+            }
+        }
+
+        RemoveMenus(menuWithItems, toBeDeleted);
+    }
+}
+```
+
+Two consequences for contributors:
+
+- **Multiple `RequirePermissions(a, b, c)` calls on the same item are AND-combined.** If you need OR semantics, use a custom `ISimpleStateChecker<ApplicationMenuItem>`.
+- **Items whose checkers all evaluate `false` are removed before `Normalize()`.** Their now-empty parents become eligible for removal as "leaf with no URL".
+
+See [Authorization](/authz) for the `IPermissionDefinitionProvider` side of this — items reference permission names, which must be declared by a definition provider to be assignable.
+
+## Async contributors
+
+Some contributors do need to await — e.g. consulting feature flags or remote services. The full contract is `Task`-returning:
+
+```csharp
+public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return;
+
+    var featureChecker = context.ServiceProvider.GetRequiredService<IFeatureChecker>();
+    if (await featureChecker.IsEnabledAsync("MyApp.Reports"))
+    {
+        context.Menu.AddItem(new ApplicationMenuItem("Reports", "Reports", url: "~/Reports"));
+    }
+}
+```
+
+Prefer this over attaching state checkers for things that don't change per-request — feature checks at contribution time avoid the per-item overhead of the batch evaluator.
+
+## Localising menu items
+
+Always pass an `IStringLocalizer` value, never a raw string, for `DisplayName`:
+
+```csharp
+var l = context.GetLocalizer<MyModuleResource>();
+context.Menu.AddItem(new ApplicationMenuItem("My.Reports", l["Menu:Reports"]));
+```
+
+`l["Menu:Reports"]` returns a `LocalizedString` that the menu's `DisplayName` setter happily accepts (it has an implicit conversion). The resource type's JSON files supply the per-culture text.
+
+## Grouping items inside a menu
+
+`ApplicationMenu` also has `Groups` — an `ApplicationMenuGroupList` of optional grouping headers. Add a group and reference it from items via `GroupName`:
+
+```csharp
+context.Menu.AddGroup(new ApplicationMenuGroup("AbpIdentity.Settings", l["Settings"]));
+context.Menu.AddItem(new ApplicationMenuItem(
+    "Identity.Settings.General", l["General"], url: "~/Identity/Settings",
+    groupName: "AbpIdentity.Settings"));
+```
+
+`MenuManager.NormalizeMenuGroup` collapses dangling group references — if an item references a group name that no group on the parent menu declares, the `GroupName` is nulled out so the item still renders.
+
+## Ordering within the contributor pipeline
+
+The pipeline runs `Options.MenuContributors` in insertion order. To force your contributor to run after another module's:
+
+1. Make your module depend on that module (`[DependsOn(typeof(AbpIdentityWebModule))]`). The module dependency resolution ensures upstream `ConfigureServices` (and thus their `Options.MenuContributors.Add(...)`) runs first.
+2. If you want to run **before** an upstream contributor, you cannot rely on `[DependsOn]` because the upstream module is loaded later. Use `Options.MenuContributors.Insert(0, ...)` and document the constraint.
+
+## A complete recipe
+
+<Steps>
+  <Step title="Pick a menu name">
+    `StandardMenus.Main`, `StandardMenus.User`, or a custom name you've added to `AbpNavigationOptions.MainMenuNames`.
+  </Step>
+  <Step title="Define menu name constants">
+    Mirror `IdentityMenuNames` — a `public class` with `public const string` fields. Stable names are how other modules find and re-order your items.
+  </Step>
+  <Step title="Implement IMenuContributor">
+    One guard, build items with `new ApplicationMenuItem(...)`, attach `.RequirePermissions(...)` as needed, nest under `GetAdministration()` or add to `context.Menu` directly.
+  </Step>
+  <Step title="Register in your module">
+    `Configure<AbpNavigationOptions>(o => o.MenuContributors.Add(new MyContributor()))`.
+  </Step>
+  <Step title="Add localisation">
+    Add `"Menu:..."` keys to your resource JSON; pull them via `context.GetLocalizer<MyResource>()`.
+  </Step>
+  <Step title="Declare permissions">
+    The permission names you pass to `RequirePermissions(...)` must be declared in an `IPermissionDefinitionProvider`. See [Authorization](/authz).
+  </Step>
+</Steps>
+
+<Check>
+Smoke test: with no permissions granted, your top-level group should be removed by `Normalize()` (because all leaves were filtered out). If it stays visible as an empty parent, one of your items is missing `RequirePermissions(...)` or has a non-null `Url`.
+</Check>
+
+## See also
+
+- [Navigation overview](/navigation/overview) — `IMenuManager`, the model, the build pipeline.
+- [Themes overview](/themes/overview) — the consumers of the resulting `ApplicationMenu`.
+- [Basic Theme module](/themes/basic-theme-module) — `MainNavbarMenuViewComponent` renders what your contributor produces.
+- [Authorization](/authz) — permission definition providers, `IAuthorizationService`, `ICurrentUser`.
+- [HTTP client](/http) — dynamic proxies and the `~/Abp/ApplicationConfigurationScript` endpoint that ships the menu to JS clients.

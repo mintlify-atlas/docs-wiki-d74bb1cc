@@ -1,0 +1,512 @@
+---
+title: "Users Abstractions and Domain: IUserData, IUser and Lookup"
+sidebarTitle: "Abstractions & Domain"
+description: "Inside Volo.Abp.Users.Abstractions and Volo.Abp.Users.Domain — IUserData, UserEto, IExternalUserLookupServiceProvider, IUser and UserLookupService."
+---
+
+The Users module's contract layer is split across two assemblies. `Volo.Abp.Users.Abstractions` carries the cross‑boundary DTOs and the federation seam — the bits that should be reusable from a module that *does not* depend on DDD or a database. `Volo.Abp.Users.Domain` adds the aggregate contract, the repository contract, and the `UserLookupService<TUser, TUserRepository>` that ties them to an external Identity Provider when one is configured. This page walks every type in both projects with the real signatures, and ends with the lookup‑plus‑sync algorithm that makes federation transparent.
+
+<Info>
+Projects: [`modules/users/src/Volo.Abp.Users.Abstractions/`](https://github.com/abpframework/abp/tree/dev/modules/users/src/Volo.Abp.Users.Abstractions) and [`modules/users/src/Volo.Abp.Users.Domain/`](https://github.com/abpframework/abp/tree/dev/modules/users/src/Volo.Abp.Users.Domain).
+</Info>
+
+## File inventory — `Volo.Abp.Users.Abstractions`
+
+| File | Type kind | Role |
+| --- | --- | --- |
+| `IUserData.cs` | interface | Read‑only DTO contract for cross‑module user references |
+| `UserData.cs` | class | Mutable concrete implementation of `IUserData` with copy constructors |
+| `UserEto.cs` | class | Event‑transfer object — same shape as `IUserData`, decorated with `[EventName]` |
+| `UserPasswordChangeRequestedEto.cs` | class | ETO published when a password change is requested across services |
+| `IExternalUserLookupServiceProvider.cs` | interface | Federation seam for external IdPs |
+| `AbpUsersAbstractionModule.cs` | `AbpModule` | DI module declaration |
+
+## File inventory — `Volo.Abp.Users.Domain`
+
+| File | Type kind | Role |
+| --- | --- | --- |
+| `IUser.cs` | interface | Aggregate contract — implemented by `IdentityUser` & friends |
+| `IUserRepository.cs` | interface (generic) | Per‑aggregate repository contract |
+| `IUserLookupService.cs` | interface (generic) | Local‑plus‑federated lookup service contract |
+| `UserLookupService.cs` | abstract class | Default lookup implementation with federation algorithm |
+| `UserLookupServiceExtensions.cs` | static class | Convenience overloads |
+| `IUpdateUserData.cs` | interface | Optional aggregate hook for sync from external user data |
+| `AbpUserExtensions.cs` | static class | `IUser.ToAbpUserData()` projection |
+| `AbpUsersDomainModule.cs` | `AbpModule` | DI module declaration |
+
+## `IUserData`: the cross‑boundary contract
+
+This is the single contract every other module sees. It carries identity, the tenant key, the display fields, and confirmation flags — and *no* secrets.
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/IUserData.cs"
+public interface IUserData : IHasExtraProperties
+{
+    Guid Id { get; }
+    Guid? TenantId { get; }
+    string UserName { get; }
+    string Name { get; }
+    string Surname { get; }
+    bool IsActive { get; }
+
+    [CanBeNull] string Email { get; }
+    bool EmailConfirmed { get; }
+
+    [CanBeNull] string PhoneNumber { get; }
+    bool PhoneNumberConfirmed { get; }
+}
+```
+
+`IHasExtraProperties` means any module that publishes a `UserData` can attach custom metadata — and a subscriber can read it without coupling to the Identity assembly.
+
+### `UserData` — the mutable carrier
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/UserData.cs"
+public class UserData : IUserData
+{
+    public Guid Id { get; set; }
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public bool IsActive { get; set; }
+    public string Email { get; set; }
+    public bool EmailConfirmed { get; set; }
+    public string PhoneNumber { get; set; }
+    public bool PhoneNumberConfirmed { get; set; }
+    public ExtraPropertyDictionary ExtraProperties { get; }
+
+    public UserData() { }
+
+    public UserData(IUserData userData) { /* copy ctor */ }
+
+    public UserData(
+        Guid id,
+        [NotNull] string userName,
+        [CanBeNull] string email = null,
+        [CanBeNull] string name = null,
+        [CanBeNull] string surname = null,
+        bool emailConfirmed = false,
+        [CanBeNull] string phoneNumber = null,
+        bool phoneNumberConfirmed = false,
+        Guid? tenantId = null,
+        bool isActive = true,
+        ExtraPropertyDictionary extraProperties = null) { /* … */ }
+}
+```
+
+Two constructors are important:
+
+- The **copy constructor** — used by the `UserLookupService` to materialise the response from an external IdP into a local concrete.
+- The **value constructor** — used by `AbpUserExtensions.ToAbpUserData()` to project a real `IUser` aggregate into the cross‑module DTO.
+
+### `AbpUserExtensions.ToAbpUserData`
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/AbpUserExtensions.cs"
+public static class AbpUserExtensions
+{
+    public static IUserData ToAbpUserData(this IUser user)
+    {
+        return new UserData(
+            id: user.Id,
+            userName: user.UserName,
+            email: user.Email,
+            name: user.Name,
+            surname: user.Surname,
+            isActive: user.IsActive,
+            emailConfirmed: user.EmailConfirmed,
+            phoneNumber: user.PhoneNumber,
+            phoneNumberConfirmed: user.PhoneNumberConfirmed,
+            tenantId: user.TenantId,
+            extraProperties: user.ExtraProperties
+        );
+    }
+}
+```
+
+This extension is the canonical way a consuming module turns a *typed aggregate* into a *cross‑module DTO* before publishing an event or returning a response.
+
+## `UserEto` and `UserPasswordChangeRequestedEto`
+
+ETO ("event transfer object") types are what go over the distributed event bus.
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/UserEto.cs"
+[EventName("Volo.Abp.Users.User")]
+public class UserEto : IUserData, IMultiTenant
+{
+    public Guid Id { get; set; }
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public bool IsActive { get; set; }
+    public string Email { get; set; }
+    public bool EmailConfirmed { get; set; }
+    public string PhoneNumber { get; set; }
+    public bool PhoneNumberConfirmed { get; set; }
+    public ExtraPropertyDictionary ExtraProperties { get; set; }
+}
+```
+
+The `[EventName("Volo.Abp.Users.User")]` attribute is what other services subscribe to — e.g. an Audit Logging microservice that wants to maintain its own copy of `UserName` for log decoration. The name is stable: every ABP release keeps it the same so cross‑service contracts don't rot.
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/UserPasswordChangeRequestedEto.cs"
+[Serializable]
+[EventName("Volo.Abp.Users.UserPasswordChangeRequested")]
+public class UserPasswordChangeRequestedEto : IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Password { get; set; }
+}
+```
+
+This second ETO supports password‑sync scenarios — a federated host can react to it and propagate the change to its IdP.
+
+## `IExternalUserLookupServiceProvider`: the federation seam
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/IExternalUserLookupServiceProvider.cs"
+public interface IExternalUserLookupServiceProvider
+{
+    Task<IUserData> FindByIdAsync(Guid id, CancellationToken cancellationToken = default);
+
+    Task<IUserData> FindByUserNameAsync(string userName, CancellationToken cancellationToken = default);
+
+    Task<List<IUserData>> SearchAsync(
+        string sorting = null,
+        string filter = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        CancellationToken cancellationToken = default);
+
+    Task<long> GetCountAsync(
+        string filter = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+When a host wires an implementation, `UserLookupService` will:
+
+1. Try the local repository first.
+2. Fall back to the external provider on a miss (or always, if `SkipExternalLookupIfLocalUserExists = false`).
+3. Insert / update / delete the local shadow row so subsequent calls hit the local cache.
+
+If the host *does not* register an implementation, the federation branch is skipped entirely and every call goes straight to the local repository.
+
+## `AbpUsersAbstractionModule`
+
+```csharp title="Volo.Abp.Users.Abstractions/Volo/Abp/Users/AbpUsersAbstractionModule.cs"
+//TODO: Consider to (somehow) move this to the framework to the same assemblily of ICurrentUser!
+
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpEventBusModule)
+)]
+public class AbpUsersAbstractionModule : AbpModule { }
+```
+
+The two dependencies are exactly what the abstractions need: `IMultiTenant` from MultiTenancy, `EventName` and ETO discovery from EventBus. Nothing else.
+
+## `IUser`: the aggregate contract
+
+The Domain layer's contract for *any* user aggregate that wants to participate in the Users ecosystem:
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/IUser.cs"
+public interface IUser : IAggregateRoot<Guid>, IMultiTenant, IHasExtraProperties
+{
+    string UserName { get; }
+    [CanBeNull] string Email { get; }
+    [CanBeNull] string Name { get; }
+    [CanBeNull] string Surname { get; }
+    bool IsActive { get; }
+    bool EmailConfirmed { get; }
+    [CanBeNull] string PhoneNumber { get; }
+    bool PhoneNumberConfirmed { get; }
+}
+```
+
+Implementations in the wild:
+
+- `Volo.Abp.Identity.IdentityUser` — the canonical implementation in the Identity module.
+- `Volo.Abp.LinkUsers.LinkUser` (commercial) — implements the same contract on a separate aggregate so link‑user impersonation reuses every Users module helper.
+
+<Note>
+`IUser` is read‑only in the contract; setter shape is up to the implementer. Identity exposes setters as `internal` and routes mutations through `IdentityUserManager`.
+</Note>
+
+## `IUserRepository<TUser>`
+
+A small, generic repository contract — exactly the operations a federated lookup service needs:
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/IUserRepository.cs"
+public interface IUserRepository<TUser> : IBasicRepository<TUser, Guid>
+    where TUser : class, IUser, IAggregateRoot<Guid>
+{
+    Task<TUser> FindByUserNameAsync(string userName, CancellationToken cancellationToken = default);
+
+    Task<List<TUser>> GetListAsync(IEnumerable<Guid> ids, CancellationToken cancellationToken = default);
+
+    Task<List<TUser>> SearchAsync(
+        string sorting = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        string filter = null,
+        CancellationToken cancellationToken = default
+    );
+
+    Task<long> GetCountAsync(
+        string filter = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+The base type is `IBasicRepository<TUser, Guid>` rather than the queryable `IRepository<,>` — the user table is performance‑sensitive and callers should be funneled through these named methods.
+
+## `IUserLookupService<TUser>` and `UserLookupService<,>`
+
+The lookup service interface mirrors the federation provider but is *generic over the aggregate*, so callers receive `IdentityUser` (not just `IUserData`) on local hits.
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/IUserLookupService.cs"
+public interface IUserLookupService<TUser> where TUser : class, IUser
+{
+    Task<TUser> FindByIdAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<TUser> FindByUserNameAsync(string userName, CancellationToken cancellationToken = default);
+
+    Task<List<IUserData>> SearchAsync(
+        string sorting = null,
+        string filter = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        CancellationToken cancellationToken = default);
+
+    Task<long> GetCountAsync(
+        string filter = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Note that `SearchAsync` returns `IUserData` — search results may come from the external provider where no local aggregate exists, so the response type stays neutral.
+
+### Implementation: the federation algorithm
+
+`UserLookupService<TUser, TUserRepository>` is `abstract` — concrete subclasses implement `CreateUser(IUserData)` to project the federated payload onto their concrete aggregate type. Everything else is provided.
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/UserLookupService.cs"
+public abstract class UserLookupService<TUser, TUserRepository>
+    : IUserLookupService<TUser>, ITransientDependency
+    where TUser : class, IUser
+    where TUserRepository : IUserRepository<TUser>
+{
+    protected bool SkipExternalLookupIfLocalUserExists { get; set; } = true;
+
+    public IExternalUserLookupServiceProvider ExternalUserLookupServiceProvider { get; set; }
+    public ILogger<UserLookupService<TUser, TUserRepository>> Logger { get; set; }
+
+    protected UserLookupService(TUserRepository userRepository, IUnitOfWorkManager unitOfWorkManager) { /* … */ }
+
+    public async Task<TUser> FindByIdAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        var localUser = await _userRepository.FindAsync(id, cancellationToken: cancellationToken);
+
+        if (ExternalUserLookupServiceProvider == null) return localUser;
+        if (SkipExternalLookupIfLocalUserExists && localUser != null) return localUser;
+
+        IUserData externalUser;
+        try
+        {
+            externalUser = await ExternalUserLookupServiceProvider.FindByIdAsync(id, cancellationToken);
+            if (externalUser == null)
+            {
+                if (localUser != null)
+                {
+                    //TODO: Instead of deleting, should be make it inactive or something like that?
+                    await WithNewUowAsync(() => _userRepository.DeleteAsync(localUser, cancellationToken: cancellationToken));
+                }
+                return null;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogException(ex);
+            return localUser;       // fail open: external provider down → local user wins
+        }
+
+        if (localUser == null)
+        {
+            await WithNewUowAsync(() => _userRepository.InsertAsync(CreateUser(externalUser), cancellationToken: cancellationToken));
+            return await _userRepository.FindAsync(id, cancellationToken: cancellationToken);
+        }
+
+        if (localUser is IUpdateUserData && ((IUpdateUserData)localUser).Update(externalUser))
+        {
+            await WithNewUowAsync(() => _userRepository.UpdateAsync(localUser, cancellationToken: cancellationToken));
+        }
+        else
+        {
+            return localUser;
+        }
+
+        return await _userRepository.FindAsync(id, cancellationToken: cancellationToken);
+    }
+
+    protected abstract TUser CreateUser(IUserData externalUser);
+}
+```
+
+Three behaviours worth highlighting:
+
+- **Fail‑open.** If the external provider throws, the local user (possibly stale) is returned. The lookup never blocks the caller on IdP downtime.
+- **Silent sync.** If the external provider returns a user but the local doesn't have one, the service inserts the local shadow inside a new UoW (`WithNewUowAsync`). The caller never sees the insert.
+- **Optional update.** If `TUser` implements `IUpdateUserData`, the service asks the aggregate to apply the external data to itself. Only if `Update` returns `true` (the aggregate considers itself dirty) is `UpdateAsync` called. This is how Identity keeps `IdentityUser.UserName`, `Name`, `Surname` in sync without overwriting password/role state.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant LS as UserLookupService
+    participant Repo as IUserRepository
+    participant Ext as IExternalUserLookupServiceProvider
+
+    Caller->>LS: FindByIdAsync(id)
+    LS->>Repo: FindAsync(id)
+    Repo-->>LS: localUser or null
+
+    alt no external provider
+        LS-->>Caller: localUser
+    else SkipExternalLookupIfLocalUserExists &amp;&amp; localUser != null
+        LS-->>Caller: localUser
+    else
+        LS->>Ext: FindByIdAsync(id)
+        alt external throws
+            LS-->>Caller: localUser (stale)
+        else external returns null
+            alt localUser != null
+                LS->>Repo: DeleteAsync(localUser) [new UoW]
+            end
+            LS-->>Caller: null
+        else external returns userData
+            alt localUser == null
+                LS->>Repo: InsertAsync(CreateUser(externalUser)) [new UoW]
+            else localUser is IUpdateUserData &amp;&amp; .Update(externalUser) == true
+                LS->>Repo: UpdateAsync(localUser) [new UoW]
+            end
+            LS->>Repo: FindAsync(id)
+            Repo-->>LS: fresh localUser
+            LS-->>Caller: localUser
+        end
+    end
+```
+
+### `IUpdateUserData`
+
+The sync hook is tiny:
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/IUpdateUserData.cs"
+public interface IUpdateUserData
+{
+    bool Update([NotNull] IUserData user);
+}
+```
+
+Return `true` if any field changed; the lookup service will commit. Return `false` to skip the update entirely. The aggregate is in charge of deciding what counts as a meaningful diff.
+
+<Tip>
+Implement `IUpdateUserData` on your own user aggregates if you're federating from an external IdP. Skipping it means the local shadow drifts — names and emails will never sync.
+</Tip>
+
+## `SearchAsync` and `GetCountAsync`
+
+When the external provider is configured, search is delegated to it directly:
+
+```csharp
+public async Task<List<IUserData>> SearchAsync(/* … */)
+{
+    if (ExternalUserLookupServiceProvider != null)
+    {
+        return await ExternalUserLookupServiceProvider
+            .SearchAsync(sorting, filter, maxResultCount, skipCount, cancellationToken);
+    }
+
+    var localUsers = await _userRepository
+        .SearchAsync(sorting, maxResultCount, skipCount, filter, cancellationToken);
+
+    return localUsers.Cast<IUserData>().ToList();
+}
+```
+
+Search is *not* hybrid — the lookup service either federates entirely or stays entirely local. The reason: paging across two heterogeneous sources would produce duplicates and break ordering. Hosts that want hybrid search build it in the application layer.
+
+## `AbpUsersDomainModule`
+
+```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/AbpUsersDomainModule.cs"
+[DependsOn(
+    typeof(AbpUsersDomainSharedModule),
+    typeof(AbpUsersAbstractionModule),
+    typeof(AbpDddDomainModule)
+    )]
+public class AbpUsersDomainModule : AbpModule { }
+```
+
+`AbpDddDomainModule` is what brings in `IAggregateRoot<Guid>`, `IRepository<,>`, the UoW pipeline — everything `UserLookupService` needs.
+
+## Domain.Shared: just the constants
+
+```csharp title="Volo.Abp.Users.Domain.Shared/Volo/Abp/Users/AbpUsersDomainSharedModule.cs"
+public class AbpUsersDomainSharedModule : AbpModule { }
+```
+
+```csharp title="Volo.Abp.Users.Domain.Shared/Volo/Abp/Users/AbpUserConsts.cs"
+public class AbpUserConsts
+{
+    public static int MaxUserNameLength { get; set; } = 256;
+    public static int MaxNameLength { get; set; } = 64;
+    public static int MaxSurnameLength { get; set; } = 64;
+    public static int MaxEmailLength { get; set; } = 256;
+    public static int MaxPhoneNumberLength { get; set; } = 16;
+}
+```
+
+The shared package is intentionally empty of behaviour — it carries only the length consts shared between Domain and the persistence packages.
+
+## A consumer example
+
+A module that wants to display a user reference (say, "last edited by") asks for `IUserLookupService<IdentityUser>` from the Identity module:
+
+```csharp
+public class BookAppService
+{
+    private readonly IUserLookupService<IdentityUser> _userLookup;
+
+    public async Task<BookDto> GetAsync(Guid id)
+    {
+        var book = await _bookRepository.GetAsync(id);
+        var editor = await _userLookup.FindByIdAsync(book.LastEditorId);
+
+        return new BookDto
+        {
+            Title = book.Title,
+            LastEditor = editor?.UserName ?? "(deleted user)"
+        };
+    }
+}
+```
+
+If the host runs against an external IdP, that single call may produce a shadow `IdentityUser` row on first use, and `editor` resolves to a full Identity aggregate on subsequent calls. The caller never sees the federation logic.
+
+## Where to next
+
+<CardGroup cols={3}>
+<Card title="Persistence" icon="database" href="/modules/users/persistence">
+`ConfigureAbpUser<TUser>`, `EfCoreUserRepositoryBase<,>` and `MongoUserRepositoryBase<,>`.
+</Card>
+<Card title="Overview" icon="map" href="/modules/users/overview">
+Package matrix, dependency graph, and where the Users module fits among siblings.
+</Card>
+<Card title="Identity module" icon="user" href="/modules/identity">
+The canonical consumer — `IdentityUser : IUser` and `IdentityUserLookupService : UserLookupService<…>`.
+</Card>
+</CardGroup>
+
+## Related reading
+
+- [`/modules/identity`](/modules/identity) — see how Identity satisfies every contract on this page.
+- [`/auditing/overview`](/auditing/overview) — Audit Logging stores `UserName` from `IUserData`.
+- [`/background/jobs-overview`](/background/jobs-overview) — sibling read of how a small abstractions package can support many consumers.

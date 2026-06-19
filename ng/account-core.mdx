@@ -1,0 +1,524 @@
+---
+title: "@abp/ng.account.core — Account Services, Proxies, and State"
+sidebarTitle: "Account Core"
+description: "Headless ABP account package — AuthWrapperService, TenantBoxService, typed Account & Profile proxies, plus AccountConfigModule menu routes."
+---
+
+`@abp/ng.account.core` is the headless layer underneath the visible login / register / manage-profile screens. It carries everything that is **not** a component template: the typed HTTP proxies for `/api/account/*`, the lightweight services that decide whether the tenant switcher and local login buttons are visible, and an optional `config` subpath (`@abp/ng.account/config`) that registers menu entries with `RoutesService`. UI packages such as `@abp/ng.account` and `@abp/ng.theme.basic` import from here, never from `@abp/ng.account` directly, so that custom theme authors can build their own login pages while reusing the same backend bindings.
+
+This page documents the published surface of the npm package, including its `proxy` secondary entrypoint and the `account/config` companion module that ships alongside the UI package.
+
+<Info>
+  The package is published as **`@abp/ng.account.core`** from `npm/ng-packs/packages/account-core`. Generated proxies live at the secondary entrypoint **`@abp/ng.account.core/proxy`**. Menu / route contribution is in the sibling **`@abp/ng.account/config`** entrypoint (under `packages/account/config`).
+</Info>
+
+## Package layout
+
+```text packages/account-core
+account-core/
+├── package.json                     # @abp/ng.account.core
+├── ng-package.json
+├── src/
+│   ├── public-api.ts
+│   └── lib/
+│       ├── auth-wrapper.service.ts  # visibility of login/register & tenant box
+│       └── tenant-box.service.ts    # switch tenant by name
+└── proxy/                           # secondary entrypoint @abp/ng.account.core/proxy
+    ├── ng-package.json
+    └── src/
+        ├── public-api.ts
+        └── lib/
+            ├── index.ts
+            └── proxy/
+                ├── index.ts
+                ├── account/
+                │   ├── account.service.ts   # register / reset-password / send-code
+                │   ├── profile.service.ts   # /api/account/my-profile
+                │   ├── models.ts
+                │   └── web/areas/account/controllers/
+                │       ├── account.service.ts   # login / check-password / logout
+                │       └── models/
+                │           ├── login-result-type.enum.ts
+                │           └── models.ts
+                └── identity/
+                    ├── index.ts
+                    └── models.ts   # IdentityUserDto (re-used by /register)
+```
+
+The companion **config** module — registered under the same npm name `@abp/ng.account` but in the `config` ng-package — lives next door:
+
+```text packages/account/config
+account/config/
+├── ng-package.json                  # entrypoint: @abp/ng.account/config
+└── src/
+    ├── public-api.ts
+    ├── account-config.module.ts
+    ├── enums/
+    │   └── route-names.ts           # eAccountRouteNames
+    ├── providers/
+    │   └── route.provider.ts        # APP_INITIALIZER → routesService.add(...)
+    └── utils/
+        └── factories.ts             # navigateToManageProfileFactory
+```
+
+## Public API surface
+
+The barrel re-exports just two files — everything else is consumed via the `proxy` subpath:
+
+```ts packages/account-core/src/public-api.ts
+/*
+ * Public API Surface of account-core
+ */
+
+export * from './lib/auth-wrapper.service';
+export * from './lib/tenant-box.service';
+```
+
+```ts packages/account-core/proxy/src/public-api.ts
+export * from './lib/index';
+```
+
+```ts packages/account-core/proxy/src/lib/index.ts
+export * from './proxy/account';
+export * from './proxy/identity';
+import * as Account from './account';
+import * as Identity from './identity';
+export { Account, Identity };
+```
+
+Consumers can therefore use either flat imports (`import { ProfileService } from '@abp/ng.account.core/proxy'`) or the namespaced form (`Account.ProfileService`).
+
+## AuthWrapperService — visibility logic for auth pages
+
+`AuthWrapperService` is the small piece of state shared between the **AuthWrapper** layout component and the login / register / forgot-password screens. It answers three questions per render:
+
+1. Is multi-tenancy enabled at all? (reads `configState.getDeep$('multiTenancy.isEnabled')`)
+2. Is local login enabled? (reads the `Abp.Account.EnableLocalLogin` setting)
+3. Should the tenant-switch box show on the current route? (checks `route.snapshot.data.tenantBoxVisible`)
+
+```ts packages/account-core/src/lib/auth-wrapper.service.ts
+@Injectable()
+export class AuthWrapperService {
+  isMultiTenancyEnabled$ = this.configState.getDeep$('multiTenancy.isEnabled');
+
+  get enableLocalLogin$(): Observable<boolean> {
+    return this.configState
+      .getSetting$('Abp.Account.EnableLocalLogin')
+      .pipe(map(value => value?.toLowerCase() !== 'false'));
+  }
+
+  tenantBoxKey = 'Account.TenantBoxComponent';
+  route: ActivatedRoute;
+
+  get isTenantBoxVisibleForCurrentRoute() {
+    return this.getMostInnerChild().data.tenantBoxVisible ?? true;
+  }
+
+  get isTenantBoxVisible() {
+    return this.isTenantBoxVisibleForCurrentRoute && this.multiTenancy.isTenantBoxVisible;
+  }
+
+  constructor(
+    public readonly multiTenancy: MultiTenancyService,
+    private configState: ConfigStateService,
+    injector: Injector,
+  ) {
+    this.route = injector.get(ActivatedRoute);
+  }
+
+  private getMostInnerChild() {
+    let child = this.route.snapshot;
+    let depth = 0;
+    const depthLimit = 10;
+    while (child.firstChild && depth < depthLimit) {
+      child = child.firstChild;
+      depth++;
+    }
+    return child;
+  }
+}
+```
+
+| Member | Type | Source |
+| --- | --- | --- |
+| `isMultiTenancyEnabled$` | `Observable<boolean>` | `multiTenancy.isEnabled` deep field of app config |
+| `enableLocalLogin$` | `Observable<boolean>` | Setting `Abp.Account.EnableLocalLogin` |
+| `isTenantBoxVisibleForCurrentRoute` | `boolean` | Deepest child route's `data.tenantBoxVisible` |
+| `isTenantBoxVisible` | `boolean` | Combined with `MultiTenancyService.isTenantBoxVisible` |
+| `tenantBoxKey` | `string` | Replaceable-component key for theme overrides |
+
+The `AccountRoutingModule` in `@abp/ng.account` sets `data: { tenantBoxVisible: false }` on the `reset-password` route — that data hop is exactly what `getMostInnerChild` walks down to.
+
+## TenantBoxService — switch-tenant modal logic
+
+`TenantBoxService` powers the "Tenant: …" badge on the login page. It looks up a tenant by name, persists it through `SessionStateService`, and refreshes the application state so subsequent requests carry the new `__tenant` header.
+
+```ts packages/account-core/src/lib/tenant-box.service.ts
+@Injectable()
+export class TenantBoxService {
+  currentTenant$ = this.sessionState.getTenant$();
+
+  name?: string;
+  isModalVisible!: boolean;
+  modalBusy!: boolean;
+
+  constructor(
+    private toasterService: ToasterService,
+    private tenantService: AbpTenantService,
+    private sessionState: SessionStateService,
+    private configState: ConfigStateService,
+  ) {}
+
+  onSwitch() {
+    const tenant = this.sessionState.getTenant();
+    this.name = tenant?.name || '';
+    this.isModalVisible = true;
+  }
+
+  save() {
+    if (!this.name) {
+      this.setTenant(null);
+      this.isModalVisible = false;
+      return;
+    }
+
+    this.modalBusy = true;
+    this.tenantService
+      .findTenantByName(this.name)
+      .pipe(finalize(() => (this.modalBusy = false)))
+      .subscribe(({ success, tenantId: id, ...tenant }) => {
+        if (!success) { this.showError(); return; }
+        this.setTenant({ ...tenant, id, isAvailable: true });
+        this.isModalVisible = false;
+      });
+  }
+
+  private setTenant(tenant: CurrentTenantDto | null) {
+    this.sessionState.setTenant(tenant);
+    this.configState.refreshAppState();
+  }
+
+  private showError() {
+    this.toasterService.error('AbpUiMultiTenancy::GivenTenantIsNotAvailable', 'AbpUi::Error', {
+      messageLocalizationParams: [this.name || ''],
+    });
+  }
+}
+```
+
+`AbpTenantService` is the core proxy for `/api/abp/multi-tenancy/tenants/by-name/{name}`. `refreshAppState()` re-fetches `/api/abp/application-configuration` so permissions, languages and current-tenant flow through `ConfigStateService` to the rest of the SPA.
+
+## Proxies — `@abp/ng.account.core/proxy`
+
+### Account (registration / forgotten password)
+
+```ts packages/account-core/proxy/src/lib/proxy/account/account.service.ts
+@Injectable({ providedIn: 'root' })
+export class AccountService {
+  apiName = 'AbpAccount';
+
+  register = (input: RegisterDto) =>
+    this.restService.request<any, IdentityUserDto>(
+      { method: 'POST', url: '/api/account/register', body: input },
+      { apiName: this.apiName },
+    );
+
+  resetPassword = (input: ResetPasswordDto) =>
+    this.restService.request<any, void>(
+      { method: 'POST', url: '/api/account/reset-password', body: input },
+      { apiName: this.apiName },
+    );
+
+  sendPasswordResetCode = (input: SendPasswordResetCodeDto) =>
+    this.restService.request<any, void>(
+      { method: 'POST', url: '/api/account/send-password-reset-code', body: input },
+      { apiName: this.apiName },
+    );
+
+  constructor(private restService: RestService) {}
+}
+```
+
+### Profile (current-user CRUD)
+
+```ts packages/account-core/proxy/src/lib/proxy/account/profile.service.ts
+@Injectable({ providedIn: 'root' })
+export class ProfileService {
+  apiName = 'AbpAccount';
+
+  changePassword = (input: ChangePasswordInput) =>
+    this.restService.request<any, void>(
+      { method: 'POST', url: '/api/account/my-profile/change-password', body: input },
+      { apiName: this.apiName },
+    );
+
+  get = () =>
+    this.restService.request<any, ProfileDto>(
+      { method: 'GET', url: '/api/account/my-profile' },
+      { apiName: this.apiName },
+    );
+
+  update = (input: UpdateProfileDto) =>
+    this.restService.request<any, ProfileDto>(
+      { method: 'PUT', url: '/api/account/my-profile', body: input },
+      { apiName: this.apiName },
+    );
+
+  constructor(private restService: RestService) {}
+}
+```
+
+### MVC login controller — `Account` namespace
+
+The MVC area controller is exposed under `Account.AccountService` (separate from the application service `AccountService` above):
+
+```ts packages/account-core/proxy/src/lib/proxy/account/web/areas/account/controllers/account.service.ts
+@Injectable({ providedIn: 'root' })
+export class AccountService {
+  apiName = 'AbpAccount';
+
+  checkPasswordByLogin = (login: UserLoginInfo) =>
+    this.restService.request<any, AbpLoginResult>(
+      { method: 'POST', url: '/api/account/check-password', body: login },
+      { apiName: this.apiName },
+    );
+
+  loginByLogin = (login: UserLoginInfo) =>
+    this.restService.request<any, AbpLoginResult>(
+      { method: 'POST', url: '/api/account/login', body: login },
+      { apiName: this.apiName },
+    );
+
+  logout = () =>
+    this.restService.request<any, void>(
+      { method: 'GET', url: '/api/account/logout' },
+      { apiName: this.apiName },
+    );
+
+  constructor(private restService: RestService) {}
+}
+```
+
+The `AbpLoginResult` payload is typed by `LoginResultType` (Success, InvalidUserNameOrPassword, NotAllowed, LockedOut, RequiresTwoFactor) — see `login-result-type.enum.ts`.
+
+### DTO catalogue
+
+<AccordionGroup>
+  <Accordion title="account/models.ts">
+    ```ts packages/account-core/proxy/src/lib/proxy/account/models.ts
+    export interface ChangePasswordInput {
+      currentPassword?: string;
+      newPassword: string;
+    }
+
+    export interface ProfileDto extends ExtensibleObject {
+      userName?: string;
+      email?: string;
+      name?: string;
+      surname?: string;
+      phoneNumber?: string;
+      isExternal: boolean;
+      hasPassword: boolean;
+      concurrencyStamp?: string;
+    }
+
+    export interface RegisterDto extends ExtensibleObject {
+      userName: string;
+      emailAddress: string;
+      password: string;
+      appName: string;
+    }
+
+    export interface ResetPasswordDto {
+      userId?: string;
+      resetToken: string;
+      password: string;
+    }
+
+    export interface SendPasswordResetCodeDto {
+      email: string;
+      appName: string;
+      returnUrl?: string;
+      returnUrlHash?: string;
+    }
+
+    export interface UpdateProfileDto extends ExtensibleObject {
+      userName?: string;
+      email?: string;
+      name?: string;
+      surname?: string;
+      phoneNumber?: string;
+      concurrencyStamp?: string;
+    }
+    ```
+  </Accordion>
+  <Accordion title="identity/models.ts (re-exported)">
+    ```ts packages/account-core/proxy/src/lib/proxy/identity/models.ts
+    import type { ExtensibleFullAuditedEntityDto } from '@abp/ng.core';
+
+    export interface IdentityUserDto extends ExtensibleFullAuditedEntityDto<string> {
+      tenantId?: string;
+      userName?: string;
+      name?: string;
+      surname?: string;
+      email?: string;
+      emailConfirmed: boolean;
+      phoneNumber?: string;
+      phoneNumberConfirmed: boolean;
+      isActive: boolean;
+      lockoutEnabled: boolean;
+      lockoutEnd?: string;
+      concurrencyStamp?: string;
+    }
+    ```
+
+    `IdentityUserDto` is duplicated here (rather than imported from `@abp/ng.identity/proxy`) so that the account flow doesn't pull the Identity UI bundle as a hard dependency.
+  </Accordion>
+</AccordionGroup>
+
+## `@abp/ng.account/config` — menu registration
+
+The `account/config` entrypoint contributes the side-menu nodes that the `@abp/ng.theme.shared` chrome reads. It is imported once in `app.module.ts`:
+
+```ts apps/dev/src/app/app.module.ts
+imports: [
+  AccountConfigModule.forRoot(),
+  // ...
+]
+```
+
+```ts packages/account/config/src/account-config.module.ts
+@NgModule()
+export class AccountConfigModule {
+  static forRoot(): ModuleWithProviders<AccountConfigModule> {
+    return {
+      ngModule: AccountConfigModule,
+      providers: [
+        ACCOUNT_ROUTE_PROVIDERS,
+        {
+          provide: NAVIGATE_TO_MANAGE_PROFILE,
+          useFactory: navigateToManageProfileFactory,
+          deps: [Injector],
+        },
+      ],
+    };
+  }
+}
+```
+
+`NAVIGATE_TO_MANAGE_PROFILE` is the injection token consumed by the `currentUser` toolbar dropdown in `@abp/ng.theme.shared`. The factory pushes the user to `/account/manage`, which keeps the toolbar decoupled from `@abp/ng.account`.
+
+### Route contributions
+
+```ts packages/account/config/src/providers/route.provider.ts
+export function configureRoutes(routes: RoutesService) {
+  return () => {
+    routes.add([
+      {
+        path: undefined,
+        name: eAccountRouteNames.Account,
+        invisible: true,
+        layout: eLayoutType.account,
+        order: 1,
+      },
+      { path: '/account/login',           name: eAccountRouteNames.Login,         parentName: eAccountRouteNames.Account, order: 1 },
+      { path: '/account/register',        name: eAccountRouteNames.Register,      parentName: eAccountRouteNames.Account, order: 2 },
+      {
+        path: '/account/manage',
+        name: eAccountRouteNames.ManageProfile,
+        parentName: eAccountRouteNames.Account,
+        layout: eLayoutType.application,  // shows under the user menu, not the auth layout
+        order: 3,
+      },
+      { path: '/account/forgot-password', name: eAccountRouteNames.ForgotPassword, parentName: eAccountRouteNames.Account, invisible: true },
+      { path: '/account/reset-password',  name: eAccountRouteNames.ResetPassword,  parentName: eAccountRouteNames.Account, invisible: true },
+    ]);
+  };
+}
+```
+
+```ts packages/account/config/src/enums/route-names.ts
+export const enum eAccountRouteNames {
+  Account        = 'AbpAccount::Menu:Account',
+  Login          = 'AbpAccount::Login',
+  Register       = 'AbpAccount::Register',
+  ManageProfile  = 'AbpAccount::MyAccount',
+  ForgotPassword = 'AbpAccount::ForgotPassword',
+  ResetPassword  = 'AbpAccount::ResetPassword',
+}
+```
+
+Localization keys (`AbpAccount::*`) resolve via `LocalizationService` against the server-emitted dictionaries from the [Account module](/modules/account).
+
+## Dependency graph
+
+```mermaid
+graph LR
+  AppModule[App AppModule]
+  CoreCfg[AccountConfigModule]
+  CoreSvc[@abp/ng.account.core<br/>AuthWrapperService, TenantBoxService]
+  Proxy[@abp/ng.account.core/proxy<br/>AccountService, ProfileService]
+  UI[@abp/ng.account<br/>AccountModule]
+  Theme[@abp/ng.theme.shared chrome]
+
+  AppModule --> CoreCfg
+  AppModule -.lazy.-> UI
+  UI --> CoreSvc
+  UI --> Proxy
+  CoreCfg -->|RoutesService.add| Theme
+  CoreCfg -->|NAVIGATE_TO_MANAGE_PROFILE| Theme
+  CoreSvc --> Proxy
+```
+
+## Configuration recipes
+
+<CardGroup cols={2}>
+  <Card title="Disable self-registration link" icon="user-slash">
+    Set `Abp.Account.IsSelfRegistrationEnabled = "false"` on the server — `LoginComponent` and `AuthWrapperService` will react automatically via `ConfigStateService.getSetting$`.
+  </Card>
+  <Card title="Hide tenant box on a route" icon="building-shield">
+    Add `data: { tenantBoxVisible: false }` to your Angular route. `AuthWrapperService.isTenantBoxVisibleForCurrentRoute` walks `route.snapshot` to find it.
+  </Card>
+  <Card title="External auth only" icon="key-skeleton">
+    Set `Abp.Account.EnableLocalLogin = "false"` — `enableLocalLogin$` flips to `false` and the local form hides.
+  </Card>
+  <Card title="Custom manage-profile target" icon="user-pen">
+    Override the `NAVIGATE_TO_MANAGE_PROFILE` provider after `AccountConfigModule.forRoot()` to redirect the user-menu link elsewhere (e.g. an internal HR page).
+  </Card>
+</CardGroup>
+
+## Working with the proxies
+
+<Steps>
+  <Step title="Inject the typed service">
+    ```ts
+    constructor(private profile: ProfileService) {}
+    ```
+  </Step>
+  <Step title="Subscribe to the observable">
+    ```ts
+    this.profile.get().subscribe(p => this.state.setProfile(p));
+    ```
+    The returned observable already uses `RestService`, which injects `Authorization`, `X-Requested-With`, `__tenant` and culture headers.
+  </Step>
+  <Step title="Hand the DTO to ManageProfileStateService">
+    The shared state lives in `@abp/ng.account` (see [Account UI](/ng/account-ui)) and is what the personal-settings tabs read.
+  </Step>
+</Steps>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.account (UI)" href="/ng/account-ui" icon="window-restore">
+    Login, register, manage-profile components, routing, layout overrides.
+  </Card>
+  <Card title="@abp/ng.core" href="/ng/core" icon="cubes">
+    `RestService`, `ConfigStateService`, `SessionStateService`, `AuthService`.
+  </Card>
+  <Card title="@abp/ng.components" href="/ng/components" icon="puzzle-piece">
+    `ReplaceableRouteContainerComponent`, extensible forms, page module.
+  </Card>
+  <Card title="Account server module" href="/modules/account" icon="server">
+    .NET implementation of `/api/account/*` endpoints proxied here.
+  </Card>
+</CardGroup>

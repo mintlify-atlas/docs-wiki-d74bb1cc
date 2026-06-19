@@ -1,0 +1,424 @@
+---
+title: "Current Tenant Accessor: ICurrentTenant and the AsyncLocal Scope"
+sidebarTitle: "Current tenant"
+description: "ICurrentTenant, CurrentTenant, ICurrentTenantAccessor, AsyncLocalCurrentTenantAccessor, NullTenantResolveResultAccessor, and the Change(...) scope pattern used everywhere in ABP."
+---
+
+`ICurrentTenant` is the ambient handle that every ABP service uses to ask
+"whose data am I working with right now?". It returns a nullable `Guid Id`, a
+`string? Name`, a convenience `IsAvailable` flag, and — crucially — a
+`Change(...)` method that returns an `IDisposable` so the caller can enter a
+*scope* in which a different tenant is current. The implementation is a thin
+read-through over `ICurrentTenantAccessor`, which is a singleton holding an
+`AsyncLocal<BasicTenantInfo?>`. All of this lives in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/` (the
+interfaces) and `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/`
+(the runtime). This page covers the contract, the slot, the change scope and
+the closely related `ITenantResolveResultAccessor`.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenant.cs` | Public read API + `Change(...)` |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenantAccessor.cs` | Mutable slot holding the current `BasicTenantInfo?` |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/BasicTenantInfo.cs` | Immutable `(TenantId, Name)` record |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/CurrentTenantExtensions.cs` | `GetId()` / `GetMultiTenancySide()` |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs` | Default `ICurrentTenant` reading the accessor |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AsyncLocalCurrentTenantAccessor.cs` | Singleton `AsyncLocal<BasicTenantInfo?>` |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/NullTenantResolveResultAccessor.cs` | Default `ITenantResolveResultAccessor` outside HTTP |
+| `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantResolveResultAccessor.cs` | Stores the resolver chain output for the current request |
+| `framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/HttpContextTenantResolveResultAccessor.cs` | HTTP-bound implementation |
+| `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AbpMultiTenancyModule.cs` | Registers the accessor as a singleton |
+
+## The contract
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenant.cs
+public interface ICurrentTenant
+{
+    bool IsAvailable { get; }
+
+    Guid? Id { get; }
+
+    string? Name { get; }
+
+    IDisposable Change(Guid? id, string? name = null);
+}
+```
+
+Three things to notice:
+
+1. `Id` is `Guid?`. A `null` id is *the host side*; a non-null id is a tenant.
+2. `Name` may be `null` even when `Id` has a value — the resolver only sets it
+   if the contributor knows it (e.g. the cookie/header contributors only carry
+   an id).
+3. `Change(...)` returns an `IDisposable`. Always wrap the call in `using` so
+   the scope is restored even if an exception is thrown.
+
+The convenience extensions throw when you assume a tenant is always present:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/CurrentTenantExtensions.cs
+public static Guid GetId([NotNull] this ICurrentTenant currentTenant)
+{
+    Check.NotNull(currentTenant, nameof(currentTenant));
+
+    if (currentTenant.Id == null)
+    {
+        throw new AbpException("Current Tenant Id is not available!");
+    }
+
+    return currentTenant.Id.Value;
+}
+
+public static MultiTenancySides GetMultiTenancySide(this ICurrentTenant currentTenant)
+{
+    return currentTenant.Id.HasValue
+        ? MultiTenancySides.Tenant
+        : MultiTenancySides.Host;
+}
+```
+
+Reach for `GetId()` only where the caller has *already* enforced that the code
+runs on a tenant side (e.g. a tenant-only application service); otherwise use
+`Id`/`IsAvailable` and branch.
+
+## The default implementation
+
+`CurrentTenant` is a transient that does no work of its own — it just reads
+from the accessor:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs
+public class CurrentTenant : ICurrentTenant, ITransientDependency
+{
+    public virtual bool IsAvailable => Id.HasValue;
+
+    public virtual Guid? Id => _currentTenantAccessor.Current?.TenantId;
+
+    public string? Name => _currentTenantAccessor.Current?.Name;
+
+    private readonly ICurrentTenantAccessor _currentTenantAccessor;
+
+    public CurrentTenant(ICurrentTenantAccessor currentTenantAccessor)
+    {
+        _currentTenantAccessor = currentTenantAccessor;
+    }
+    // Change(...) is shown below.
+}
+```
+
+Because the accessor's `Current` is itself nullable, the `?.TenantId` chain
+means **two different "host" states** project to the same observable
+behavior:
+
+| `_currentTenantAccessor.Current` | `_currentTenantAccessor.Current.TenantId` | `ICurrentTenant.Id` | Meaning |
+| --- | --- | --- | --- |
+| `null` | — | `null` | Never set — defaulted to host |
+| `BasicTenantInfo(null)` | `null` | `null` | Host explicitly entered with `Change(null)` |
+| `BasicTenantInfo(g)` | `g` | `g` | Tenant `g` |
+
+The accessor's source comment makes this contract explicit:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenantAccessor.cs
+/* A null Current indicates that we haven't set it explicitly.
+ * A null Current.TenantId indicates that we have set null tenant id value explicitly.
+ * A non-null Current.TenantId indicates that we have set a tenant id value explicitly.
+ */
+
+public interface ICurrentTenantAccessor
+{
+    BasicTenantInfo? Current { get; set; }
+}
+```
+
+`BasicTenantInfo` is an immutable record-style class:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/BasicTenantInfo.cs
+public class BasicTenantInfo
+{
+    public Guid? TenantId { get; }
+    public string? Name { get; }
+
+    public BasicTenantInfo(Guid? tenantId, string? name = null)
+    {
+        TenantId = tenantId;
+        Name = name;
+    }
+}
+```
+
+Mutability lives in the accessor, not the value.
+
+## `AsyncLocalCurrentTenantAccessor`
+
+The default accessor is a `static readonly` singleton wrapping `AsyncLocal<T>`,
+which gives every async logical control flow its own value:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AsyncLocalCurrentTenantAccessor.cs
+public class AsyncLocalCurrentTenantAccessor : ICurrentTenantAccessor
+{
+    public static AsyncLocalCurrentTenantAccessor Instance { get; } = new();
+
+    public BasicTenantInfo? Current {
+        get => _currentScope.Value;
+        set => _currentScope.Value = value;
+    }
+
+    private readonly AsyncLocal<BasicTenantInfo?> _currentScope;
+
+    private AsyncLocalCurrentTenantAccessor()
+    {
+        _currentScope = new AsyncLocal<BasicTenantInfo?>();
+    }
+}
+```
+
+It is registered explicitly as a singleton at module startup so DI cannot
+substitute a per-request copy by mistake:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AbpMultiTenancyModule.cs
+context.Services.AddSingleton<ICurrentTenantAccessor>(AsyncLocalCurrentTenantAccessor.Instance);
+```
+
+`AsyncLocal<T>` flows through `Task.Run`, `await`, `Parallel.ForEachAsync`,
+ThreadPool work items and `ConfigureAwait(false)` — the cases where a vanilla
+`ThreadLocal` would lose the value. That makes
+`using (CurrentTenant.Change(...))` safe inside any modern async pipeline.
+
+<Warning>
+The accessor singleton is process-wide. If you launch genuinely parallel work
+that needs *different* tenants, each branch must enter its own scope —
+`Change(...)` writes the same `AsyncLocal` slot for every branch that started
+*before* the call.
+</Warning>
+
+## The `Change(...)` scope pattern
+
+`Change(...)` is the only mutation API. The implementation is a snapshot/restore
+pair built on `DisposeAction`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs
+public IDisposable Change(Guid? id, string? name = null)
+{
+    return SetCurrent(id, name);
+}
+
+private IDisposable SetCurrent(Guid? tenantId, string? name = null)
+{
+    var parentScope = _currentTenantAccessor.Current;
+    _currentTenantAccessor.Current = new BasicTenantInfo(tenantId, name);
+
+    return new DisposeAction<ValueTuple<ICurrentTenantAccessor, BasicTenantInfo?>>(static (state) =>
+    {
+        var (currentTenantAccessor, parentScope) = state;
+        currentTenantAccessor.Current = parentScope;
+    }, (_currentTenantAccessor, parentScope));
+}
+```
+
+The captured `parentScope` is whatever was in the slot *before* the call —
+including `null`, which means "we hadn't set it explicitly". That guarantees
+the scope is a perfect bookend: enter, do work, dispose, restored.
+
+### Common usages
+
+The middleware does it for every request (see
+[/multitenancy/aspnet-core-resolvers](/multitenancy/aspnet-core-resolvers)):
+
+```csharp framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/MultiTenancyMiddleware.cs
+if (tenant?.Id != _currentTenant.Id)
+{
+    using (_currentTenant.Change(tenant?.Id, tenant?.Name))
+    {
+        // ...
+        await next(context);
+    }
+}
+else
+{
+    await next(context);
+}
+```
+
+The Tenant Management module's `TenantStore` switches to **host scope** when
+it needs to read the `Tenants` table without the multi-tenant query filter
+kicking in:
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Domain/Volo/Abp/TenantManagement/TenantStore.cs
+if (id.HasValue)
+{
+    using (CurrentTenant.Change(null))
+    {
+        var tenant = await TenantRepository.FindAsync(id.Value);
+        return await SetCacheAsync(cacheKey, tenant);
+    }
+}
+```
+
+Application code typically calls it in two situations:
+
+```csharp example.cs
+// 1) Seed/process data for a specific tenant from a background job
+using (CurrentTenant.Change(tenantId))
+{
+    await _orderAppService.SeedAsync();
+}
+
+// 2) Step out to the host side to query a host-owned table
+using (CurrentTenant.Change(null))
+{
+    var settings = await _settingsRepository.GetGlobalAsync();
+}
+```
+
+<Tip>
+Always wrap `Change(...)` in a `using` (or `await using`/`try/finally`). The
+disposer is the **only** thing that restores the previous tenant; leaking a
+scope means the rest of that async context will keep running under the wrong
+tenant — and tenant-filtered queries will start returning the wrong rows.
+</Tip>
+
+## The resolver-result accessor
+
+A second, closely related accessor records *which* contributor matched. The
+contract is identical in shape to `ICurrentTenantAccessor`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantResolveResultAccessor.cs
+public interface ITenantResolveResultAccessor
+{
+    TenantResolveResult? Result { get; set; }
+}
+```
+
+Outside HTTP, the framework registers a no-op stub so callers can blindly read
+the property and get `null`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/NullTenantResolveResultAccessor.cs
+public class NullTenantResolveResultAccessor : ITenantResolveResultAccessor, ISingletonDependency
+{
+    public TenantResolveResult? Result {
+        get => null;
+        set { }
+    }
+}
+```
+
+The ASP.NET Core package replaces it with an `HttpContext.Items`-backed
+implementation that mirrors the `IHttpContextAccessor` pattern:
+
+```csharp framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/HttpContextTenantResolveResultAccessor.cs
+[Dependency(ReplaceServices = true)]
+public class HttpContextTenantResolveResultAccessor : ITenantResolveResultAccessor, ITransientDependency
+{
+    public const string HttpContextItemName = "__AbpTenantResolveResult";
+
+    public TenantResolveResult? Result {
+        get => _httpContextAccessor.HttpContext?.Items[HttpContextItemName] as TenantResolveResult;
+        set {
+            if (_httpContextAccessor.HttpContext == null)
+            {
+                return;
+            }
+
+            _httpContextAccessor.HttpContext.Items[HttpContextItemName] = value;
+        }
+    }
+    // ...
+}
+```
+
+The middleware writes the result via
+`TenantConfigurationProvider.GetAsync(saveResolveResult: true)`. Downstream
+code uses it to make decisions: the error page builder, for example, will
+**clear** the tenant cookie if the failed resolution had come from the cookie
+contributor, preventing a stale id from re-poisoning the next request:
+
+```csharp framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/AbpAspNetCoreMultiTenancyOptions.cs
+if (tenantResolveResult.AppliedResolvers.Contains(CookieTenantResolveContributor.ContributorName) ||
+    context.Request.Cookies.ContainsKey(options.TenantKey))
+{
+    AbpMultiTenancyCookieHelper.SetTenantCookie(context, null, options.TenantKey);
+}
+```
+
+The middleware also uses the accessor *after* the change scope is entered, to
+decide whether to promote a `?__tenant=` URL into a cookie:
+
+```csharp framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/MultiTenancyMiddleware.cs
+if (_tenantResolveResultAccessor.Result != null &&
+    _tenantResolveResultAccessor.Result.AppliedResolvers.Contains(QueryStringTenantResolveContributor.ContributorName))
+{
+    AbpMultiTenancyCookieHelper.SetTenantCookie(context, _currentTenant.Id, _options.TenantKey);
+}
+```
+
+## Lifetime summary
+
+| Service | Lifetime | Registered in |
+| --- | --- | --- |
+| `ICurrentTenantAccessor` (`AsyncLocalCurrentTenantAccessor.Instance`) | Singleton (manually) | `AbpMultiTenancyModule` |
+| `ICurrentTenant` (`CurrentTenant`) | Transient | conventional registration |
+| `ITenantResolveResultAccessor` (Null) | Singleton | `NullTenantResolveResultAccessor` |
+| `ITenantResolveResultAccessor` (HTTP) | Transient, `ReplaceServices = true` | `AbpAspNetCoreMultiTenancyModule` |
+| `ITenantResolver` (`TenantResolver`) | Transient | conventional registration |
+| `ITenantConfigurationProvider` | Transient | conventional registration |
+
+The singleton accessor + transient `ICurrentTenant` split is intentional:
+**all** consumers of `ICurrentTenant` see the same `AsyncLocal` slot, so a
+`Change(...)` issued by the middleware is visible inside a domain service that
+was constructed by a child scope minutes earlier.
+
+## Interaction with other systems
+
+- **Permissions and settings** — `TenantSettingValueProvider` and the
+  permission/feature value providers key on `CurrentTenant.Id?.ToString()`. See
+  [/authz/permission-system](/authz/permission-system).
+- **Data filters** — `AbpDataFilter<IMultiTenant>` is enabled by default; the
+  EF Core/MongoDB integrations consult `CurrentTenant.Id` to add the
+  `TenantId == @id` predicate. See [/data/abp-data](/data/abp-data).
+- **HTTP clients** — the dynamic C# proxy layer forwards the current tenant id
+  as the `__tenant` HTTP header by default; see
+  [/http/dynamic-c-sharp-proxies](/http/dynamic-c-sharp-proxies).
+- **Distributed events** — `EtoBase`-derived events carry the tenant id so
+  subscribers re-enter the same scope on the receiving side.
+
+## Common pitfalls
+
+<AccordionGroup>
+  <Accordion title="Caching the tenant id outside a scope">
+    `CurrentTenant.Id` is *ambient*. Snapshotting it in a constructor and
+    using the cached value later inside `Change(...)` will silently produce the
+    wrong result. Read it lazily at the point of use.
+  </Accordion>
+  <Accordion title="Forgetting to dispose the scope">
+    The `Change(...)` disposer is what restores the previous slot. A leaked
+    scope poisons every subsequent operation in the same async context. Always
+    write `using (CurrentTenant.Change(...)) { ... }`.
+  </Accordion>
+  <Accordion title="Querying tenant configuration while inside that tenant's scope">
+    The TenantManagement `TenantStore` deliberately switches to
+    `CurrentTenant.Change(null)` before reading the `Tenants` table. If you
+    write your own `ITenantStore`, do the same — otherwise the query filter
+    will hide the row you are trying to load.
+  </Accordion>
+  <Accordion title="Assuming `ICurrentTenant.Id` is non-null">
+    Use `CurrentTenant.IsAvailable` before calling `GetId()`, or accept the
+    `AbpException` it throws as the explicit failure mode.
+  </Accordion>
+</AccordionGroup>
+
+## Next pages
+
+<CardGroup cols={2}>
+  <Card title="Tenant resolvers" href="/multitenancy/tenant-resolvers">
+    The pipeline that fills `CurrentTenant` before the middleware enters scope.
+  </Card>
+  <Card title="ASP.NET Core resolvers" href="/multitenancy/aspnet-core-resolvers">
+    HTTP-bound contributors and `MultiTenancyMiddleware`.
+  </Card>
+  <Card title="Connection-string resolver" href="/multitenancy/connection-string-resolver">
+    How `CurrentTenant.Id` chooses the database for the current request.
+  </Card>
+  <Card title="Tenant Management module" href="/modules/tenant-management/overview">
+    The CRUD module that supplies the `ITenantStore` used at runtime.
+  </Card>
+</CardGroup>

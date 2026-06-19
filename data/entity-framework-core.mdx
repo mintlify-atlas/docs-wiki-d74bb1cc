@@ -1,0 +1,542 @@
+---
+title: "Entity Framework Core Integration: AbpDbContext and Repositories"
+sidebarTitle: "EF Core"
+description: "How Volo.Abp.EntityFrameworkCore wires AbpDbContext, UnitOfWorkDbContextProvider, and EfCoreRepository into ABP's unit-of-work and repository pipeline."
+---
+
+`Volo.Abp.EntityFrameworkCore` is the most commonly used data-access module in ABP. It sits on top of Microsoft's EF Core 9 and layers in audit-property handling, soft-delete and multi-tenant query filters, distributed-event publishing, and a unit-of-work-aware `DbContext` provider — all while keeping the surface area you write almost identical to a vanilla EF Core `DbContext`. This page walks the package end to end: the `AbpDbContext<TDbContext>` base class, how `AbpDbContextOptions` registers per-context configuration, how `UnitOfWorkDbContextProvider<TDbContext>` materialises one instance per (UoW × connection string) pair, and how `EfCoreRepository<TDbContext, TEntity, TKey>` consumes all of it.
+
+## File inventory
+
+Files under `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/`:
+
+| File | Role |
+| --- | --- |
+| `AbpDbContext.cs` | Generic `AbpDbContext<TDbContext>` base class |
+| `IEfCoreDbContext.cs` / `IAbpEfCoreDbContext.cs` | UoW-friendly abstractions over `DbContext` |
+| `AbpDbContextOptions.cs` | Per-`TDbContext` configurer registry |
+| `AbpEntityFrameworkCoreModule.cs` | Module class; registers `UnitOfWorkDbContextProvider<>` |
+| `AbpEfCoreDbContextInitializationContext.cs` | DTO passed to provider-specific init |
+| `IDbContextProvider.cs` | Get-or-create `TDbContext` for the current UoW |
+| `DbContextExtensions.cs` / `DbContextHelper.cs` | Reflection helpers used by the model builder |
+| `EfCoreDatabaseProvider.cs` | Enum (SqlServer, MySql, PostgreSql, Oracle, Sqlite, …) |
+| `EfCoreDbContextTypeProvider.cs` / `IEfCoreDbContextTypeProvider.cs` | Resolves replaced-DbContext targets |
+| `EfCoreAsyncQueryableProvider.cs` | Plugs `ToListAsync` / `FirstOrDefaultAsync` into ABP's queryable extensions |
+| `EntityTypeBuilderExtensions.cs` | `ConfigureByConvention` and friends |
+| `QueryFilterExpressionHelper.cs` | Combines soft-delete and multi-tenant predicates |
+| `DependencyInjection/AbpDbContextConfigurationContext.cs` | Holds `DbContextOptionsBuilder` during configuration |
+| `DependencyInjection/AbpDbContextRegistrationOptions.cs` | Fluent options consumed by `AddAbpDbContext<>` |
+| `DependencyInjection/DbContextOptionsFactory.cs` | Builds `DbContextOptions<TDbContext>` per request |
+| `DependencyInjection/EfCoreRepositoryRegistrar.cs` | Auto-registers default repositories |
+| `DependencyInjection/AbpEntityOptions.cs` | Per-entity options (default query strategy, etc.) |
+| `Design/AbpDesignTimeDbContextBase.cs` | Base class for `IDesignTimeDbContextFactory<TDbContext>` |
+| `DistributedEvents/DbContextEventOutbox.cs` / `DbContextEventInbox.cs` | Persistent outbox/inbox tables |
+| `EntityHistory/EntityHistoryHelper.cs` | Materialises `EntityChangeInfo` from change tracker |
+| `Migrations/EfCoreDatabaseMigrationEventHandlerBase.cs` / `EfCoreRuntimeDatabaseMigratorBase.cs` | Multi-tenant runtime migrations |
+| `Modeling/AbpEntityTypeBuilderExtensions.cs` / `AbpModelBuilderConfigurationOptions.cs` | Convention configuration |
+| `ValueConverters/AbpDateTimeValueConverter.cs` / `AbpJsonValueConverter.cs` / `ExtraPropertiesValueConverter.cs` | Built-in converters |
+| `ValueComparers/ExtraPropertyDictionaryValueComparer.cs` | EF change-tracking comparer for `IHasExtraProperties` |
+
+Files under `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Domain/Repositories/EntityFrameworkCore/`:
+
+| File | Role |
+| --- | --- |
+| `EfCoreRepository.cs` | `EfCoreRepository<TDbContext, TEntity>` and `EfCoreRepository<TDbContext, TEntity, TKey>` |
+| `IEfCoreRepository.cs` | Public contract exposing `DbContext` / `DbSet<TEntity>` |
+| `IEfCoreBulkOperationProvider.cs` | Hook for third-party bulk-update libraries |
+
+Files under `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Uow/EntityFrameworkCore/`:
+
+| File | Role |
+| --- | --- |
+| `UnitOfWorkDbContextProvider.cs` | Default `IDbContextProvider<TDbContext>` |
+| `EfCoreDatabaseApi.cs` | `IDatabaseApi` adapter holding the `IEfCoreDbContext` |
+| `EfCoreTransactionApi.cs` | `ITransactionApi` adapter wrapping `IDbContextTransaction` |
+
+## The module
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpEntityFrameworkCoreModule.cs
+[DependsOn(typeof(AbpDddDomainModule))]
+public class AbpEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.PreConfigure(abpDbContextConfigurationContext =>
+            {
+                abpDbContextConfigurationContext.DbContextOptions
+                    .ConfigureWarnings(warnings =>
+                    {
+                        warnings.Ignore(CoreEventId.LazyLoadOnDisposedContextWarning);
+                    });
+            });
+        });
+
+        context.Services.TryAddTransient(typeof(IDbContextProvider<>), typeof(UnitOfWorkDbContextProvider<>));
+        context.Services.AddTransient(typeof(IDbContextEventOutbox<>), typeof(DbContextEventOutbox<>));
+        context.Services.AddTransient(typeof(IDbContextEventInbox<>), typeof(DbContextEventInbox<>));
+    }
+}
+```
+
+Three things happen here. First, `IDbContextProvider<>` is bound to `UnitOfWorkDbContextProvider<>` so every `IDbContextProvider<MyDbContext>` resolves the same instance type. Second, the [distributed-events outbox/inbox](/events/distributed-event-bus) DbSets get wired. Third, a default warning suppression is registered as a *pre*-configure action — it runs *before* any provider-specific `UseSqlServer()` so the suppression is in place when the relational provider asserts.
+
+## `AbpDbContext<TDbContext>`
+
+`AbpDbContext<TDbContext>` is the base class every solution-template DbContext inherits from. The class declaration shows what ABP needs from a "regular" `DbContext`:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs
+public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext, ITransientDependency
+    where TDbContext : DbContext
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected virtual Guid? CurrentTenantId => CurrentTenant?.Id;
+
+    protected virtual bool IsMultiTenantFilterEnabled => DataFilter?.IsEnabled<IMultiTenant>() ?? false;
+
+    protected virtual bool IsSoftDeleteFilterEnabled => DataFilter?.IsEnabled<ISoftDelete>() ?? false;
+
+    public ICurrentTenant CurrentTenant => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+
+    public IGuidGenerator GuidGenerator => LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+
+    public IDataFilter DataFilter => LazyServiceProvider.LazyGetRequiredService<IDataFilter>();
+
+    // ... AuditPropertySetter, EntityChangeEventHelper, IClock, LocalEventBus, DistributedEventBus ...
+}
+```
+
+The class is `ITransientDependency` so each unit of work gets its own instance, but the dependencies it actually uses (`ICurrentTenant`, `IDataFilter`, `IGuidGenerator`, …) are pulled lazily via [`IAbpLazyServiceProvider`](/di/lazy-service-provider) so the constructor stays a single `DbContextOptions<TDbContext>` argument — exactly the shape EF Core requires.
+
+### `OnModelCreating`
+
+`OnModelCreating` reflects across the model and applies three universal configurations to every entity type:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    base.OnModelCreating(modelBuilder);
+
+    TrySetDatabaseProvider(modelBuilder);
+
+    foreach (var entityType in modelBuilder.Model.GetEntityTypes())
+    {
+        ConfigureBasePropertiesMethodInfo
+            .MakeGenericMethod(entityType.ClrType)
+            .Invoke(this, new object[] { modelBuilder, entityType });
+
+        ConfigureValueConverterMethodInfo
+            .MakeGenericMethod(entityType.ClrType)
+            .Invoke(this, new object[] { modelBuilder, entityType });
+
+        ConfigureValueGeneratedMethodInfo
+            .MakeGenericMethod(entityType.ClrType)
+            .Invoke(this, new object[] { modelBuilder, entityType });
+    }
+}
+```
+
+- `ConfigureBaseProperties<TEntity>` applies `ConfigureByConvention` (sets ABP base column conventions) and installs **global query filters** for `ISoftDelete` and `IMultiTenant`.
+- `ConfigureValueConverter<TEntity>` injects `AbpDateTimeValueConverter` so every `DateTime`/`DateTime?` column passes through `IClock.Normalize` on read and write.
+- `ConfigureValueGenerated<TEntity>` sets `ValueGeneratedNever()` on `IEntity<Guid>.Id` so ABP — not the database — generates GUIDs via `IGuidGenerator`.
+
+The global filter logic is the crucial part:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs
+protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntity>()
+    where TEntity : class
+{
+    Expression<Func<TEntity, bool>>? expression = null;
+
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    {
+        expression = e => !IsSoftDeleteFilterEnabled || !EF.Property<bool>(e, "IsDeleted");
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+    {
+        Expression<Func<TEntity, bool>> multiTenantFilter = e => !IsMultiTenantFilterEnabled || EF.Property<Guid>(e, "TenantId") == CurrentTenantId;
+        expression = expression == null ? multiTenantFilter : QueryFilterExpressionHelper.CombineExpressions(expression, multiTenantFilter);
+    }
+
+    return expression;
+}
+```
+
+The predicate short-circuits when the corresponding filter is disabled, which is why `using (_dataFilter.Disable<ISoftDelete>())` instantly returns deleted rows without re-translating the query (see [`IDataFilter`](/data/abp-data#data-filters)).
+
+### `SaveChangesAsync`
+
+`SaveChangesAsync` is where ABP attaches every cross-cutting concern. The simplified shape is:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs
+public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+{
+    try
+    {
+        var auditLog = AuditingManager?.Current?.Log;
+        List<EntityChangeInfo>? entityChangeList = null;
+        if (auditLog != null)
+        {
+            entityChangeList = EntityHistoryHelper.CreateChangeList(ChangeTracker.Entries().ToList());
+        }
+
+        HandlePropertiesBeforeSave();
+
+        var eventReport = CreateEventReport();
+
+        var result = await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+
+        PublishEntityEvents(eventReport);
+```
+
+`HandlePropertiesBeforeSave` walks the change tracker and sets `IGuidGenerator.Create()` ids on new entities, audit stamps via `IAuditPropertySetter`, soft-delete flags, and concurrency stamps. Any `DbUpdateConcurrencyException` is re-thrown as `AbpDbConcurrencyException`. Domain events queued on `IGeneratesDomainEvents` aggregates flow through `LocalEventBus` and `DistributedEventBus` *after* the SQL has committed, which is what makes the [outbox pattern](/events/distributed-event-bus) work.
+
+### Database-provider detection
+
+`GetDatabaseProviderOrNull` lets the model builder install provider-specific conventions (e.g. case-insensitive collations on PostgreSQL):
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs
+protected virtual EfCoreDatabaseProvider? GetDatabaseProviderOrNull(ModelBuilder modelBuilder)
+{
+    switch (Database.ProviderName)
+    {
+        case "Microsoft.EntityFrameworkCore.SqlServer":
+            return EfCoreDatabaseProvider.SqlServer;
+        case "Npgsql.EntityFrameworkCore.PostgreSQL":
+            return EfCoreDatabaseProvider.PostgreSql;
+        case "Pomelo.EntityFrameworkCore.MySql":
+            return EfCoreDatabaseProvider.MySql;
+        case "Oracle.EntityFrameworkCore":
+        case "Devart.Data.Oracle.Entity.EFCore":
+            return EfCoreDatabaseProvider.Oracle;
+        case "Microsoft.EntityFrameworkCore.Sqlite":
+            return EfCoreDatabaseProvider.Sqlite;
+        case "Microsoft.EntityFrameworkCore.InMemory":
+            return EfCoreDatabaseProvider.InMemory;
+        case "FirebirdSql.EntityFrameworkCore.Firebird":
+            return EfCoreDatabaseProvider.Firebird;
+        case "Microsoft.EntityFrameworkCore.Cosmos":
+            return EfCoreDatabaseProvider.Cosmos;
+        default:
+            return null;
+    }
+}
+```
+
+## `AbpDbContextOptions`
+
+`AbpDbContextOptions` is *not* `DbContextOptions<TDbContext>`. It is an options bag where modules register *configurers*: callbacks that get a `DbContextOptionsBuilder` plus the resolved connection string. The provider extension methods (`UseSqlServer`, `UseNpgsql`, …) push into this registry.
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContextOptions.cs
+public class AbpDbContextOptions
+{
+    internal List<Action<AbpDbContextConfigurationContext>> DefaultPreConfigureActions { get; }
+    internal Action<AbpDbContextConfigurationContext>? DefaultConfigureAction { get; set; }
+    internal Dictionary<Type, List<object>> PreConfigureActions { get; }
+    internal Dictionary<Type, object> ConfigureActions { get; }
+    internal Dictionary<MultiTenantDbContextType, Type> DbContextReplacements { get; }
+
+    public void PreConfigure([NotNull] Action<AbpDbContextConfigurationContext> action) { /* ... */ }
+
+    public void Configure([NotNull] Action<AbpDbContextConfigurationContext> action) { /* ... */ }
+
+    public void PreConfigure<TDbContext>([NotNull] Action<AbpDbContextConfigurationContext<TDbContext>> action)
+        where TDbContext : AbpDbContext<TDbContext> { /* ... */ }
+
+    public void Configure<TDbContext>([NotNull] Action<AbpDbContextConfigurationContext<TDbContext>> action)
+        where TDbContext : AbpDbContext<TDbContext> { /* ... */ }
+}
+```
+
+There are four "slots":
+
+| Slot | Applied to | Use case |
+| --- | --- | --- |
+| `DefaultPreConfigureActions` | every DbContext | Universal pre-config (e.g. EF warning suppression) |
+| `DefaultConfigureAction` | every DbContext | Default provider, e.g. `options.UseSqlServer()` |
+| `PreConfigureActions[TDbContext]` | one DbContext | Per-context pre-config |
+| `ConfigureActions[TDbContext]` | one DbContext | Per-context provider override |
+
+Hosts almost always use the default slot — they pick one database provider for the whole solution:
+
+```csharp HostModule.cs
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseSqlServer();
+});
+```
+
+### `AbpDbContextConfigurationContext`
+
+The configurer receives an `AbpDbContextConfigurationContext` holding the resolved connection string plus a pre-seeded `DbContextOptionsBuilder` already wired to the host's `ILoggerFactory`:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/DependencyInjection/AbpDbContextConfigurationContext.cs
+public class AbpDbContextConfigurationContext : IServiceProviderAccessor
+{
+    public IServiceProvider ServiceProvider { get; }
+
+    public string ConnectionString { get; }
+
+    public string? ConnectionStringName { get; }
+
+    public DbConnection? ExistingConnection { get; }
+
+    public DbContextOptionsBuilder DbContextOptions { get; protected set; }
+
+    public AbpDbContextConfigurationContext(
+        [NotNull] string connectionString,
+        [NotNull] IServiceProvider serviceProvider,
+        string? connectionStringName,
+        DbConnection? existingConnection)
+    {
+        ConnectionString = connectionString;
+        ServiceProvider = serviceProvider;
+        ConnectionStringName = connectionStringName;
+        ExistingConnection = existingConnection;
+
+        DbContextOptions = new DbContextOptionsBuilder()
+            .UseLoggerFactory(serviceProvider.GetRequiredService<ILoggerFactory>())
+            .UseApplicationServiceProvider(serviceProvider);
+    }
+}
+```
+
+`ExistingConnection` is non-null when the active unit of work *already* opened a `DbConnection` for an earlier `DbContext` on the same connection string. The provider extension method (e.g. `UseSqlServer`) checks this first and re-uses the connection so a single transaction can span several `DbContext` types.
+
+## Registering a DbContext
+
+`AddAbpDbContext<TDbContext>` is the gateway every `*EntityFrameworkCoreModule` calls inside `ConfigureServices`:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Microsoft/Extensions/DependencyInjection/AbpEfCoreServiceCollectionExtensions.cs
+public static IServiceCollection AddAbpDbContext<TDbContext>(
+    this IServiceCollection services,
+    Action<IAbpDbContextRegistrationOptionsBuilder>? optionsBuilder = null)
+    where TDbContext : AbpDbContext<TDbContext>
+{
+    services.AddMemoryCache();
+
+    var options = new AbpDbContextRegistrationOptions(typeof(TDbContext), services);
+
+    var replacedMultiTenantDbContextTypes = typeof(TDbContext).GetCustomAttributes<ReplaceDbContextAttribute>(true)
+        .SelectMany(x => x.ReplacedDbContextTypes).ToList();
+
+    foreach (var dbContextType in replacedMultiTenantDbContextTypes)
+    {
+        options.ReplaceDbContext(dbContextType.Type, multiTenancySides: dbContextType.MultiTenancySide);
+    }
+
+    optionsBuilder?.Invoke(options);
+
+    services.TryAddTransient(DbContextOptionsFactory.Create<TDbContext>);
+
+    foreach (var entry in options.ReplacedDbContextTypes)
+    {
+        var originalDbContextType = entry.Key.Type;
+        var targetDbContextType = entry.Value ?? typeof(TDbContext);
+
+        services.Replace(ServiceDescriptor.Transient(originalDbContextType, sp =>
+        {
+            var dbContextType = sp.GetRequiredService<IEfCoreDbContextTypeProvider>().GetDbContextType(originalDbContextType);
+            return sp.GetRequiredService(dbContextType);
+        }));
+
+        services.Configure<AbpDbContextOptions>(opts =>
+        {
+            var multiTenantDbContextType = new MultiTenantDbContextType(originalDbContextType, entry.Key.MultiTenancySide);
+            opts.DbContextReplacements[multiTenantDbContextType] = targetDbContextType;
+        });
+    }
+
+    new EfCoreRepositoryRegistrar(options).AddRepositories();
+
+    return services;
+}
+```
+
+Three responsibilities surface here:
+
+1. `TryAddTransient(DbContextOptionsFactory.Create<TDbContext>)` — every `IServiceProvider.GetRequiredService<DbContextOptions<TDbContext>>()` call triggers the factory, which runs the configurers stored in `AbpDbContextOptions`.
+2. `[ReplaceDbContext]` handling — a derived `BookStoreDbContext` can replace `IdentityDbContext` by attribute; the service is rewired to dispatch through `IEfCoreDbContextTypeProvider`.
+3. `EfCoreRepositoryRegistrar.AddRepositories()` — every entity declared on `TDbContext` via `[ReplaceDbContext]` *or* via the `options.AddRepository<,>()` fluent API is registered as `IRepository<TEntity, TKey>`, `IBasicRepository<TEntity, TKey>`, and a few more closed generics so consumers can inject any abstraction shape.
+
+## `UnitOfWorkDbContextProvider<TDbContext>`
+
+This is the engine that ties everything together. When an `EfCoreRepository<,,>` needs a `DbContext`, it calls `IDbContextProvider<TDbContext>.GetDbContextAsync()`:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Uow/EntityFrameworkCore/UnitOfWorkDbContextProvider.cs
+public virtual async Task<TDbContext> GetDbContextAsync()
+{
+    var unitOfWork = UnitOfWorkManager.Current;
+    if (unitOfWork == null)
+    {
+        throw new AbpException("A DbContext can only be created inside a unit of work!");
+    }
+
+    var targetDbContextType = EfCoreDbContextTypeProvider.GetDbContextType(typeof(TDbContext));
+    var connectionStringName = ConnectionStringNameAttribute.GetConnStringName(targetDbContextType);
+    var connectionString = await ResolveConnectionStringAsync(connectionStringName);
+
+    var dbContextKey = $"{targetDbContextType.FullName}_{connectionString}";
+
+    var databaseApi = unitOfWork.FindDatabaseApi(dbContextKey);
+
+    if (databaseApi == null)
+    {
+        databaseApi = new EfCoreDatabaseApi(
+            await CreateDbContextAsync(unitOfWork, connectionStringName, connectionString)
+        );
+
+        unitOfWork.AddDatabaseApi(dbContextKey, databaseApi);
+    }
+
+    return (TDbContext)((EfCoreDatabaseApi)databaseApi).DbContext;
+}
+```
+
+The `dbContextKey` is `{TypeFullName}_{ResolvedConnectionString}` — so two `BookStoreDbContext` instances under the *same* UoW but different per-tenant connection strings coexist without stomping on each other.
+
+### Transactional vs non-transactional UoW
+
+`CreateDbContextAsync` chooses between two paths depending on `unitOfWork.Options.IsTransactional`. Inside a transactional UoW, a relational provider opens an `IDbContextTransaction` so multiple `DbContext`s under the same UoW share the connection:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Uow/EntityFrameworkCore/UnitOfWorkDbContextProvider.cs
+if (activeTransaction == null)
+{
+    var dbContext = unitOfWork.ServiceProvider.GetRequiredService<TDbContext>();
+
+    try
+    {
+        var dbtransaction = unitOfWork.Options.IsolationLevel.HasValue
+            ? dbContext.Database.BeginTransaction(unitOfWork.Options.IsolationLevel.Value)
+            : dbContext.Database.BeginTransaction();
+
+        unitOfWork.AddTransactionApi(
+            transactionApiKey,
+            new EfCoreTransactionApi(
+                dbtransaction,
+                dbContext,
+                CancellationTokenProvider
+            )
+        );
+    }
+    catch (Exception e) when (e is InvalidOperationException || e is NotSupportedException)
+    {
+        Logger.LogWarning(TransactionsNotSupportedWarningMessage);
+
+        return dbContext;
+    }
+
+    return dbContext;
+}
+```
+
+When a transaction is already active for that connection string, `DbContextCreationContext.Current.ExistingConnection` is wired so `UseSqlServer` (etc.) reuses the open connection and the new DbContext calls `UseTransaction` on the existing `IDbContextTransaction`.
+
+### The `IDatabaseApi` adapter
+
+The UoW infrastructure is provider-agnostic — it stores opaque `IDatabaseApi` slots. `EfCoreDatabaseApi` is the adapter that lets the UoW call `SaveChangesAsync` on an arbitrary `IEfCoreDbContext`:
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Uow/EntityFrameworkCore/EfCoreDatabaseApi.cs
+public class EfCoreDatabaseApi : IDatabaseApi, ISupportsSavingChanges
+{
+    public IEfCoreDbContext DbContext { get; }
+
+    public EfCoreDatabaseApi(IEfCoreDbContext dbContext)
+    {
+        DbContext = dbContext;
+    }
+
+    public Task SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        return DbContext.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+This is why calling `await uow.CompleteAsync()` automatically flushes every `DbContext` materialised under that UoW — the manager just iterates over its `IDatabaseApi` slots and calls `SaveChangesAsync` on each one.
+
+## `EfCoreRepository<TDbContext, TEntity, TKey>`
+
+The repository is intentionally thin — most behaviour lives on `RepositoryBase<TEntity>` (in `Volo.Abp.Ddd.Domain`). It contributes EF-Core-specific operations and the `DbContext` accessor.
+
+```csharp framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Domain/Repositories/EntityFrameworkCore/EfCoreRepository.cs
+public class EfCoreRepository<TDbContext, TEntity> : RepositoryBase<TEntity>, IEfCoreRepository<TEntity>
+    where TDbContext : IEfCoreDbContext
+    where TEntity : class, IEntity
+{
+    protected virtual Task<TDbContext> GetDbContextAsync()
+    {
+        // Multi-tenancy unaware entities should always use the host connection string
+        if (!EntityHelper.IsMultiTenant<TEntity>())
+        {
+            using (CurrentTenant.Change(null))
+            {
+                return _dbContextProvider.GetDbContextAsync();
+            }
+        }
+
+        return _dbContextProvider.GetDbContextAsync();
+    }
+
+    protected async Task<DbSet<TEntity>> GetDbSetAsync()
+    {
+        return (await GetDbContextAsync()).Set<TEntity>();
+    }
+
+    protected async Task<IDbConnection> GetDbConnectionAsync()
+    {
+        return (await GetDbContextAsync()).Database.GetDbConnection();
+    }
+}
+```
+
+The `EntityHelper.IsMultiTenant<TEntity>()` check is what guarantees that a non-tenant entity (e.g. host-side `Tenant` itself) always resolves the *host's* connection string, even inside a tenant scope. The `CurrentTenant.Change(null)` call is a stack-local override, not a thread-static one, so it auto-restores via `using`.
+
+The `TKey`-typed variant (`EfCoreRepository<TDbContext, TEntity, TKey>`) inherits from this and adds the primary-key lookup helpers (`GetAsync(TKey)`, `FindAsync(TKey)`) that the `IRepository<TEntity, TKey>` contract requires.
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application Service
+    participant Repo as EfCoreRepository&lt;Book,Guid&gt;
+    participant Prov as UnitOfWorkDbContextProvider&lt;BookStoreDbContext&gt;
+    participant Res as IConnectionStringResolver
+    participant UoW as IUnitOfWork
+    participant Factory as DbContextOptionsFactory
+    participant Ctx as BookStoreDbContext
+
+    App->>Repo: await _bookRepo.InsertAsync(book)
+    Repo->>Prov: GetDbContextAsync()
+    Prov->>UoW: UnitOfWorkManager.Current
+    Prov->>Res: ResolveAsync("BookStore")
+    Res-->>Prov: connection string
+    Prov->>UoW: FindDatabaseApi(key)
+    alt not cached
+        Prov->>Factory: DbContextOptions&lt;BookStoreDbContext&gt;
+        Factory-->>Prov: options (with UseSqlServer)
+        Prov->>Ctx: new BookStoreDbContext(options)
+        Prov->>UoW: AddDatabaseApi(key, EfCoreDatabaseApi(ctx))
+    end
+    Prov-->>Repo: BookStoreDbContext
+    Repo->>Ctx: Set&lt;Book&gt;().AddAsync(book)
+    App->>UoW: CompleteAsync()
+    UoW->>Ctx: SaveChangesAsync()
+```
+
+## Connecting the dots
+
+<CardGroup cols={2}>
+  <Card title="SQL Server" href="/data/ef-core-sqlserver">`UseSqlServer` configurer details.</Card>
+  <Card title="PostgreSQL" href="/data/ef-core-postgresql">`UseNpgsql` configurer details.</Card>
+  <Card title="MySQL" href="/data/ef-core-mysql">Pomelo-based `UseMySQL`.</Card>
+  <Card title="Oracle" href="/data/ef-core-oracle">ODP.NET vs Devart comparison.</Card>
+  <Card title="SQLite" href="/data/ef-core-sqlite">`UseSqlite` configurer details.</Card>
+  <Card title="Database Migration" href="/data/database-migration">How `DbMigrator` drives `Database.Migrate()`.</Card>
+  <Card title="Unit of Work" href="/uow">The transaction model that `UnitOfWorkDbContextProvider` participates in.</Card>
+  <Card title="Repositories" href="/ddd/repositories">DDD repository contracts that `EfCoreRepository` implements.</Card>
+</CardGroup>

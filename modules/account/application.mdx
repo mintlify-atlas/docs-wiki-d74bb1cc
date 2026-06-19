@@ -1,0 +1,529 @@
+---
+title: "Account Application Services: AccountAppService and Profile"
+sidebarTitle: "Application"
+description: "Inside Volo.Abp.Account.Application: AccountAppService, ProfileAppService, DynamicClaimsAppService, AccountEmailer and the application module wiring."
+---
+
+`Volo.Abp.Account.Application` is the *server-side* heart of the module. It
+contains the three application services that implement the contracts
+defined in `Volo.Abp.Account.Application.Contracts` (`IAccountAppService`,
+`IProfileAppService`, `IDynamicClaimsAppService`), the email pipeline used
+by **Forgot Password**, and the application module class that registers
+AutoMapper profiles, the embedded virtual files (email templates, the
+auto-mapper profile resource) and a reset-password URL into
+`AppUrlOptions`. This page walks through each piece, with the actual
+constructor signatures, method bodies and configuration calls from
+[`modules/account/src/Volo.Abp.Account.Application`](https://github.com/abpframework/abp/tree/dev/modules/account/src/Volo.Abp.Account.Application).
+
+The Application package never references ASP.NET Core directly; it depends
+on `AbpIdentityApplicationModule` for `IdentityUserManager` /
+`IIdentityRoleRepository` and on `AbpEmailingModule` for `IEmailSender`.
+That separation is what lets the same services run inside both an MVC
+monolith and a tiered auth server.
+
+## File inventory
+
+| File | Role |
+| --- | --- |
+| `Volo/Abp/Account/AbpAccountApplicationModule.cs` | Module class — DI, VFS, AutoMapper, `AppUrlOptions` |
+| `Volo/Abp/Account/AbpAccountApplicationModuleAutoMapperProfile.cs` | AutoMapper profile (Identity ↔ Account DTOs) |
+| `Volo/Abp/Account/AccountAppService.cs` | Register, send/verify reset code, reset password |
+| `Volo/Abp/Account/ProfileAppService.cs` | Get/update profile, change password |
+| `Volo/Abp/Account/DynamicClaimsAppService.cs` | Refresh current user's dynamic claims cache |
+| `Volo/Abp/Account/AccountUrlNames.cs` | `PasswordReset` URL-name constant |
+| `Volo/Abp/Account/Emailing/IAccountEmailer.cs` | Contract for sending password-reset email |
+| `Volo/Abp/Account/Emailing/AccountEmailer.cs` | Default implementation using `ITemplateRenderer` |
+| `Volo/Abp/Account/Emailing/AppUrlProviderAccountExtensions.cs` | `IAppUrlProvider` extension for the reset URL |
+| `Volo/Abp/Account/Emailing/Templates/AccountEmailTemplateDefinitionProvider.cs` | Registers the password-reset template |
+| `Volo/Abp/Account/Emailing/Templates/AccountEmailTemplates.cs` | Template name constants |
+| `Volo/Abp/Account/Emailing/Templates/PasswordResetLink.tpl` | Mustache-style email body |
+| `Volo/Abp/Account/Settings/AccountSettingDefinitionProvider.cs` | `IsSelfRegistrationEnabled`, `EnableLocalLogin` |
+
+## `AbpAccountApplicationModule`
+
+The module class is small but worth reading line by line because it tells
+you exactly what gets configured by `[DependsOn(typeof(AbpAccountApplicationModule))]`:
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/AbpAccountApplicationModule.cs
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpIdentityApplicationModule),
+    typeof(AbpUiNavigationModule),
+    typeof(AbpEmailingModule)
+)]
+public class AbpAccountApplicationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountApplicationModule>();
+        });
+
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddProfile<AbpAccountApplicationModuleAutoMapperProfile>(validate: true);
+        });
+
+        Configure<AppUrlOptions>(options =>
+        {
+            options.Applications["MVC"].Urls[AccountUrlNames.PasswordReset]
+                = "Account/ResetPassword";
+        });
+    }
+}
+```
+
+Three things to call out:
+
+1. **`AbpIdentityApplicationModule` is the only non-trivial dependency.**
+   That is where `IdentityUserManager`, `IIdentityRoleRepository` and
+   `IdentitySecurityLogManager` come from — they are constructor-injected
+   into `AccountAppService` and `ProfileAppService`.
+2. **AutoMapper profile validation is on.** The module passes
+   `validate: true` to `AddProfile`, which means an unmapped destination
+   member will throw at startup. If you extend `RegisterDto`, you must add
+   `MapExtraProperties()` to the matching mapping in your own profile.
+3. **`AppUrlOptions["MVC"]`.** The Account module assumes there is at
+   minimum an application named `"MVC"` whose `Urls` dictionary contains
+   the `AccountUrlNames.PasswordReset` entry. The same `AppUrlOptions` are
+   read by the `AccountEmailer` to build the reset link.
+
+<Note>
+`AbpAccountApplicationContractsModule` (the `[DependsOn]` above) handles
+the localization wiring — it registers the `AccountResource` and maps the
+`Volo.Account` exception code namespace to it. That is what lets
+`UserFriendlyException`s thrown inside the app services be translated
+client-side without any extra work.
+</Note>
+
+## `AccountAppService`
+
+The class implements `IAccountAppService` and is the entry point for
+**Register**, **Forgot password**, **Verify reset token**, and **Reset
+password**.
+
+### Constructor and protected dependencies
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/AccountAppService.cs
+public class AccountAppService : ApplicationService, IAccountAppService
+{
+    protected IIdentityRoleRepository RoleRepository { get; }
+    protected IdentityUserManager UserManager { get; }
+    protected IAccountEmailer AccountEmailer { get; }
+    protected IdentitySecurityLogManager IdentitySecurityLogManager { get; }
+    protected IOptions<IdentityOptions> IdentityOptions { get; }
+
+    public AccountAppService(
+        IdentityUserManager userManager,
+        IIdentityRoleRepository roleRepository,
+        IAccountEmailer accountEmailer,
+        IdentitySecurityLogManager identitySecurityLogManager,
+        IOptions<IdentityOptions> identityOptions)
+    {
+        RoleRepository = roleRepository;
+        AccountEmailer = accountEmailer;
+        IdentitySecurityLogManager = identitySecurityLogManager;
+        UserManager = userManager;
+        IdentityOptions = identityOptions;
+
+        LocalizationResource = typeof(AccountResource);
+    }
+    // ...
+}
+```
+
+Every dependency is `protected` — that is intentional. Subclassing
+`AccountAppService` is the supported way to customise behaviour (override
+`RegisterAsync` to set a default tenant, hook a captcha, etc.) and the
+ABP framework will pick the subclass automatically because the service is
+registered via convention.
+
+### `RegisterAsync(RegisterDto)`
+
+Self-registration. It validates the setting,
+sets `IdentityOptions` for the current scope, creates the `IdentityUser`,
+adds the default roles and maps the result back to `IdentityUserDto`.
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/AccountAppService.cs
+public virtual async Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+{
+    await CheckSelfRegistrationAsync();
+
+    await IdentityOptions.SetAsync();
+
+    var user = new IdentityUser(GuidGenerator.Create(), input.UserName,
+        input.EmailAddress, CurrentTenant.Id);
+
+    input.MapExtraPropertiesTo(user);
+
+    (await UserManager.CreateAsync(user, input.Password)).CheckErrors();
+
+    await UserManager.SetEmailAsync(user, input.EmailAddress);
+    await UserManager.AddDefaultRolesAsync(user);
+
+    return ObjectMapper.Map<IdentityUser, IdentityUserDto>(user);
+}
+```
+
+`CheckSelfRegistrationAsync` reads `AccountSettingNames.IsSelfRegistrationEnabled`
+from the setting provider and throws `UserFriendlyException` with the
+localised `SelfRegistrationDisabledMessage` if the setting is false.
+
+`input.MapExtraPropertiesTo(user)` is what carries through any extra
+fields you've added to `RegisterDto` via `ObjectExtensionManager`.
+
+### Password reset trio
+
+The forgot-password flow is three calls: `SendPasswordResetCodeAsync` →
+(user clicks the email link) → `VerifyPasswordResetTokenAsync` →
+`ResetPasswordAsync`. The actual implementations are:
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/AccountAppService.cs
+public virtual async Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+{
+    var user = await GetUserByEmailAsync(input.Email);
+    var resetToken = await UserManager.GeneratePasswordResetTokenAsync(user);
+    await AccountEmailer.SendPasswordResetLinkAsync(
+        user, resetToken, input.AppName, input.ReturnUrl, input.ReturnUrlHash);
+}
+
+public virtual async Task<bool> VerifyPasswordResetTokenAsync(
+    VerifyPasswordResetTokenInput input)
+{
+    var user = await UserManager.GetByIdAsync(input.UserId);
+    return await UserManager.VerifyUserTokenAsync(
+        user,
+        UserManager.Options.Tokens.PasswordResetTokenProvider,
+        UserManager<IdentityUser>.ResetPasswordTokenPurpose,
+        input.ResetToken);
+}
+
+public virtual async Task ResetPasswordAsync(ResetPasswordDto input)
+{
+    await IdentityOptions.SetAsync();
+
+    var user = await UserManager.GetByIdAsync(input.UserId);
+    (await UserManager.ResetPasswordAsync(
+        user, input.ResetToken, input.Password)).CheckErrors();
+
+    await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext
+    {
+        Identity = IdentitySecurityLogIdentityConsts.Identity,
+        Action = IdentitySecurityLogActionConsts.ChangePassword
+    });
+}
+```
+
+`VerifyPasswordResetTokenAsync` uses the same constants ASP.NET Core
+Identity uses internally (`ResetPasswordTokenPurpose`), so the token
+generated by `UserManager.GeneratePasswordResetTokenAsync` round-trips
+correctly. The successful `ResetPasswordAsync` writes a
+`ChangePassword` entry into the
+[Identity security log](/modules/identity/application).
+
+### DTO shapes
+
+The contracts live in `Volo.Abp.Account.Application.Contracts`. The four
+DTOs used by `AccountAppService` are:
+
+| DTO | Required fields | Notes |
+| --- | --- | --- |
+| `RegisterDto` | `UserName`, `EmailAddress`, `Password`, `AppName` | Extends `ExtensibleObject`. `AppName` selects which `AppUrlOptions["..."]` entry to use for any follow-up URL. |
+| `SendPasswordResetCodeDto` | `Email`, `AppName`, optional `ReturnUrl`/`ReturnUrlHash` | The two return URL fields are appended to the reset link so the user lands back on the page they came from. |
+| `VerifyPasswordResetTokenInput` | `UserId`, `ResetToken` | Used by the Razor page on GET to short-circuit a stale link. |
+| `ResetPasswordDto` | `UserId`, `ResetToken`, `Password` | `[DisableAuditing]` on `Password` keeps it out of the audit log. |
+
+## `ProfileAppService`
+
+Decorated with `[Authorize]` — every endpoint requires an authenticated
+user — and inherits from `IdentityAppServiceBase` so it shares the
+localization resource with the Identity module.
+
+### Implementation
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/ProfileAppService.cs
+[Authorize]
+public class ProfileAppService : IdentityAppServiceBase, IProfileAppService
+{
+    protected IdentityUserManager UserManager { get; }
+    protected IOptions<IdentityOptions> IdentityOptions { get; }
+
+    public ProfileAppService(
+        IdentityUserManager userManager,
+        IOptions<IdentityOptions> identityOptions)
+    {
+        UserManager = userManager;
+        IdentityOptions = identityOptions;
+    }
+
+    public virtual async Task<ProfileDto> GetAsync()
+    {
+        var currentUser = await UserManager.GetByIdAsync(CurrentUser.GetId());
+        return ObjectMapper.Map<IdentityUser, ProfileDto>(currentUser);
+    }
+    // ...
+}
+```
+
+### `UpdateAsync(UpdateProfileDto)`
+
+The update method is the longest because it respects two separate
+"is allowed to change" settings from the
+[Identity module](/modules/identity/application):
+
+* `IdentitySettingNames.User.IsUserNameUpdateEnabled`
+* `IdentitySettingNames.User.IsEmailUpdateEnabled`
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/ProfileAppService.cs
+public virtual async Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+{
+    await IdentityOptions.SetAsync();
+
+    var user = await UserManager.GetByIdAsync(CurrentUser.GetId());
+
+    user.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+
+    if (!string.Equals(user.UserName, input.UserName,
+        StringComparison.InvariantCultureIgnoreCase))
+    {
+        if (await SettingProvider.IsTrueAsync(
+            IdentitySettingNames.User.IsUserNameUpdateEnabled))
+        {
+            (await UserManager.SetUserNameAsync(user, input.UserName)).CheckErrors();
+        }
+    }
+
+    if (!string.Equals(user.Email, input.Email,
+        StringComparison.InvariantCultureIgnoreCase))
+    {
+        if (await SettingProvider.IsTrueAsync(
+            IdentitySettingNames.User.IsEmailUpdateEnabled))
+        {
+            (await UserManager.SetEmailAsync(user, input.Email)).CheckErrors();
+        }
+    }
+
+    if (!string.Equals(user.PhoneNumber, input.PhoneNumber,
+        StringComparison.InvariantCultureIgnoreCase))
+    {
+        (await UserManager.SetPhoneNumberAsync(user, input.PhoneNumber)).CheckErrors();
+    }
+
+    user.Name = input.Name;
+    user.Surname = input.Surname;
+
+    input.MapExtraPropertiesTo(user);
+
+    (await UserManager.UpdateAsync(user)).CheckErrors();
+
+    await CurrentUnitOfWork.SaveChangesAsync();
+
+    return ObjectMapper.Map<IdentityUser, ProfileDto>(user);
+}
+```
+
+Phone number changes are unconditional — there is no equivalent
+`IsPhoneNumberUpdateEnabled` setting in the Identity module today. If you
+need to lock phone changes you must override `UpdateAsync`.
+
+### `ChangePasswordAsync(ChangePasswordInput)`
+
+Has a special branch for external users (users created from an external
+login provider): they don't have a local password hash, and they get an
+`AddPasswordAsync` instead of a `ChangePasswordAsync`:
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/ProfileAppService.cs
+public virtual async Task ChangePasswordAsync(ChangePasswordInput input)
+{
+    await IdentityOptions.SetAsync();
+
+    var currentUser = await UserManager.GetByIdAsync(CurrentUser.GetId());
+
+    if (currentUser.IsExternal)
+    {
+        throw new BusinessException(
+            code: IdentityErrorCodes.ExternalUserPasswordChange);
+    }
+
+    if (currentUser.PasswordHash == null)
+    {
+        (await UserManager.AddPasswordAsync(
+            currentUser, input.NewPassword)).CheckErrors();
+        return;
+    }
+
+    (await UserManager.ChangePasswordAsync(
+        currentUser, input.CurrentPassword, input.NewPassword)).CheckErrors();
+}
+```
+
+`ChangePasswordInput` additionally implements `IValidatableObject` so the
+`NewPasswordSameAsOld` check is enforced **before** the service is even
+called — the validation runs in the controller pipeline.
+
+## `DynamicClaimsAppService`
+
+A small service that clears the cached dynamic claims for the current user
+and rebuilds them. It is used after an admin updates a user's roles or
+permissions on a long-lived session and you need the new claims to take
+effect without re-login.
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/DynamicClaimsAppService.cs
+[Authorize]
+public class DynamicClaimsAppService : IdentityAppServiceBase, IDynamicClaimsAppService
+{
+    protected IdentityDynamicClaimsPrincipalContributorCache
+        IdentityDynamicClaimsPrincipalContributorCache { get; }
+    protected IAbpClaimsPrincipalFactory AbpClaimsPrincipalFactory { get; }
+    protected ICurrentPrincipalAccessor PrincipalAccessor { get; }
+
+    public virtual async Task RefreshAsync()
+    {
+        await IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(
+            CurrentUser.GetId(), CurrentUser.TenantId);
+        await AbpClaimsPrincipalFactory.CreateDynamicAsync(
+            PrincipalAccessor.Principal);
+    }
+}
+```
+
+The cache itself comes from the Identity module — see the
+[Identity application page](/modules/identity/application) for the
+underlying `IdentityDynamicClaimsPrincipalContributor`.
+
+## Email pipeline
+
+`AccountEmailer` is registered as `ITransientDependency` and consumed by
+`AccountAppService.SendPasswordResetCodeAsync`. The interface is the same
+shape as the call site:
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/Emailing/IAccountEmailer.cs
+public interface IAccountEmailer
+{
+    Task SendPasswordResetLinkAsync(
+        IdentityUser user,
+        string resetToken,
+        string appName,
+        string returnUrl = null,
+        string returnUrlHash = null
+    );
+}
+```
+
+Internally `AccountEmailer` resolves the link via
+`IAppUrlProvider.GetPasswordResetUrlAsync(appName)`, which is the
+extension method registered in `AppUrlProviderAccountExtensions`:
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/Emailing/AppUrlProviderAccountExtensions.cs
+public static Task<string> GetPasswordResetUrlAsync(
+    this IAppUrlProvider appUrlProvider, string appName)
+{
+    return appUrlProvider.GetUrlAsync(appName, AccountUrlNames.PasswordReset);
+}
+```
+
+Because the URL is keyed by `appName`, you can wire different apps (an MVC
+host and a Blazor host on a separate domain) to point at different reset
+landing pages. If your application defines additional `AppUrlOptions`
+entries — e.g. `"BlazorWasm"` — you must also push the
+`AccountUrlNames.PasswordReset` URL into them.
+
+The template is `PasswordResetLink.tpl`, registered by
+`AccountEmailTemplateDefinitionProvider` under the name
+`AccountEmailTemplates.PasswordResetLink`.
+
+## Settings reference
+
+```csharp account/src/Volo.Abp.Account.Application/Volo/Abp/Account/Settings/AccountSettingDefinitionProvider.cs
+public class AccountSettingDefinitionProvider : SettingDefinitionProvider
+{
+    public override void Define(ISettingDefinitionContext context)
+    {
+        context.Add(
+            new SettingDefinition(
+                AccountSettingNames.IsSelfRegistrationEnabled,
+                "true",
+                L("DisplayName:Abp.Account.IsSelfRegistrationEnabled"),
+                L("Description:Abp.Account.IsSelfRegistrationEnabled"),
+                isVisibleToClients: true)
+        );
+
+        context.Add(
+            new SettingDefinition(
+                AccountSettingNames.EnableLocalLogin,
+                "true",
+                L("DisplayName:Abp.Account.EnableLocalLogin"),
+                L("Description:Abp.Account.EnableLocalLogin"),
+                isVisibleToClients: true)
+        );
+    }
+}
+```
+
+| Setting name | Default | Read by |
+| --- | --- | --- |
+| `Abp.Account.IsSelfRegistrationEnabled` | `"true"` | `AccountAppService.CheckSelfRegistrationAsync`, `RegisterModel` |
+| `Abp.Account.EnableLocalLogin` | `"true"` | `LoginModel` (`Volo.Abp.Account.Web`), the Login API controller |
+
+Both settings are flagged `isVisibleToClients: true`, which means they are
+served via the public settings endpoint and can be read by Blazor / SPA
+clients to gate the matching UI.
+
+<Tip>
+To disable self-registration for a specific tenant at runtime, write the
+setting with the `Tenant` provider:
+`await SettingManager.SetForCurrentTenantAsync(AccountSettingNames.IsSelfRegistrationEnabled, "false");`
+</Tip>
+
+## AutoMapper profile
+
+`AbpAccountApplicationModuleAutoMapperProfile` defines the mappings between
+the Identity domain entity and the Account DTOs. Notably:
+
+* `IdentityUser → ProfileDto` — with `MapExtraProperties()`.
+* `IdentityUser → IdentityUserDto` — used as the return type of
+  `RegisterAsync`. (The actual `IdentityUserDto` mapping is defined by
+  the Identity module itself; the Account profile just re-exposes it.)
+
+Because the profile is registered with `validate: true`, missing
+extension-property mappings will fail fast at application startup.
+
+## Customising the application layer
+
+<AccordionGroup>
+  <Accordion title="Add a captcha check to Register">
+    Subclass `AccountAppService` and override `RegisterAsync`. Verify the
+    captcha token (injected via constructor) before calling
+    `base.RegisterAsync(input)`. Don't decorate your subclass with
+    `[ExposeServices]` — the framework already replaces the interface
+    binding for the most-derived registered class.
+  </Accordion>
+  <Accordion title="Plug a different email transport">
+    Implement `IAccountEmailer` and register it as
+    `ITransientDependency` — it will replace the default `AccountEmailer`
+    because the interface is registered as a single service.
+  </Accordion>
+  <Accordion title="Allow phone-number updates only for verified phones">
+    Override `ProfileAppService.UpdateAsync`. Wrap the
+    `SetPhoneNumberAsync` call in a check against
+    `user.PhoneNumberConfirmed`.
+  </Accordion>
+  <Accordion title="Refresh dynamic claims after a permission grant">
+    Call `IDynamicClaimsAppService.RefreshAsync()` from the admin UI after
+    you've assigned new permissions. The user's next request will pick up
+    the updated claims without a re-login.
+  </Accordion>
+</AccordionGroup>
+
+## Where to go next
+
+* [HTTP API & client](/modules/account/http-api) — the controllers that
+  expose `IAccountAppService` and `IProfileAppService` over `/api/account`,
+  plus the static client proxies generated for the
+  [HttpApi.Client](/modules/account/http-api) package.
+* [Web Razor Pages](/modules/account/web) — the MVC pages that call these
+  services.
+* [Identity module application layer](/modules/identity/application) — the
+  `IdentityUserManager` and security log services that everything here
+  delegates to.

@@ -1,0 +1,489 @@
+---
+title: "PowerShell Build and Publish Scripts for the ABP Repository"
+sidebarTitle: "Build scripts"
+description: "Reference for the PowerShell scripts under build/ and npm/ that drive dotnet build and npm/Lerna/Nx publishing — common.ps1, build-all.ps1, test-all.ps1, publish-mvc.ps1, publish-ng.ps1, preview-publish.ps1, delete-bin-obj.ps1."
+---
+
+The ABP source tree ships with two folders of PowerShell glue: `build/` at the repository root for dotnet (`build-all.ps1`, `build-all-release.ps1`, `test-all.ps1`, `common.ps1`) and `npm/` for the JavaScript side (`preview-publish.ps1`, `publish-mvc.ps1`, `publish-ng.ps1`). A single `delete-bin-obj.ps1` at the root rounds out the toolkit. None of these scripts ship on NuGet or npm — they are the developer-machine and CI entry points used to compile every solution in the repo, run their tests, and push the matching NuGet, npm and Angular versions.
+
+This page is a reference for every script: what file it lives in, what it does line by line, and how it composes with the others.
+
+## Inventory
+
+<Files>
+```
+abp/
+├── build/
+│   ├── common.ps1           ← shared solution-path list, dot-sourced by the others
+│   ├── build-all.ps1        ← dotnet build all solutions (Debug)
+│   ├── build-all-release.ps1← dotnet build all solutions (Release, /maxcpucount)
+│   └── test-all.ps1         ← dotnet test --no-build --no-restore (XPlat Code Coverage)
+├── delete-bin-obj.ps1       ← purges bin/ and obj/ everywhere except node_modules
+└── npm/
+    ├── publish-utils.js     ← reads <Version> from common.props
+    ├── preview-publish.ps1  ← entry point: runs publish-mvc.ps1 + publish-ng.ps1
+    ├── publish-mvc.ps1      ← Lerna packs publish (packs/*)
+    └── publish-ng.ps1       ← Nx Angular libraries publish (ng-packs/packages/*)
+```
+</Files>
+
+## `build/common.ps1` — the solution list
+
+This is dot-sourced by `build-all.ps1`, `build-all-release.ps1` and `test-all.ps1`. It captures the absolute root folder and produces the array `$solutionPaths` that the calling script iterates.
+
+```powershell build/common.ps1
+$full = $args[0]
+
+# COMMON PATHS
+$rootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+# List of solutions used only in development mode
+$solutionPaths = @(
+        "../framework",
+        "../modules/basic-theme",
+        "../modules/users",
+        "../modules/permission-management",
+        "../modules/setting-management",
+        "../modules/feature-management",
+        "../modules/identity",
+        "../modules/identityserver",
+        "../modules/openiddict",
+        "../modules/tenant-management",
+        "../modules/audit-logging",
+        "../modules/background-jobs",
+        "../modules/account",
+        "../modules/cms-kit",
+        "../modules/blob-storing-database"
+    )
+
+if ($full -eq "-f")
+{
+    # List of additional solutions required for full build
+    $solutionPaths += (
+        "../modules/client-simulation",
+        "../modules/virtual-file-explorer",
+        "../modules/docs",
+        "../modules/blogging",
+        "../templates/module/aspnet-core",
+        "../templates/app/aspnet-core",
+        "../templates/console",
+        "../templates/wpf",
+        "../templates/app-nolayers/aspnet-core",
+        "../abp_io/AbpIoLocalization",
+        "../source-code"
+    )
+}else{
+    Write-host ""
+    Write-host ":::::::::::::: !!! You are in development mode !!! ::::::::::::::" `
+        -ForegroundColor red -BackgroundColor  yellow
+    Write-host ""
+}
+```
+
+Two modes:
+
+| Mode | Trigger | Solutions covered |
+| --- | --- | --- |
+| **Development** (default) | run with no argument | 15 core solutions — `framework/` and the maintained `modules/*` |
+| **Full** | run with `-f` | adds `templates/*`, `abp_io/AbpIoLocalization`, `source-code/` and remaining modules |
+
+Calling `. ".\common.ps1" -f` from another script is what unlocks the full build set. The development-mode banner is intentionally loud so contributors don't accidentally publish a half-built tree.
+
+<Warning>
+`Set-Location $rootFolder` is called between iterations by the consuming scripts — `common.ps1` itself captures `$rootFolder` exactly once at the top so the absolute path stays stable.
+</Warning>
+
+## `build/build-all.ps1` — Debug build
+
+Dot-sources `common.ps1` with the same `-f` it received, installs the wasm/MAUI workloads, then iterates `$solutionPaths` and runs `dotnet build` in each directory:
+
+```powershell build/build-all.ps1
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Build all solutions
+
+Write-Host $solutionPaths
+
+dotnet workload install wasm-tools
+dotnet workload install maui-tizen
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Two workloads are installed unconditionally:
+
+- `wasm-tools` — needed by the Blazor WebAssembly templates.
+- `maui-tizen` — needed by the MAUI templates.
+
+The script aborts as soon as any solution fails, restoring the root directory before exiting.
+
+## `build/build-all-release.ps1` — Release build
+
+Identical loop but with `--configuration Release -- /maxcpucount`, and it forces `-f` so every solution is included:
+
+```powershell build/build-all-release.ps1
+. ".\common.ps1" -f
+
+# Build all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+This is the canonical release-build entry point — CI uses it before invoking the NuGet pack/push steps that live outside this folder.
+
+## `build/test-all.ps1` — run every test project
+
+Pairs with whichever `build-all` was last run because it relies on `--no-build --no-restore`. Tests emit XPlat coverage:
+
+```powershell build/test-all.ps1
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Test all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+The collector emits Cobertura files into each test project's `TestResults/<guid>/coverage.cobertura.xml`; CI uploads them to Codecov via `codecov.yml` at the repository root.
+
+## `delete-bin-obj.ps1` — clean slate
+
+A one-shot purge of `bin/` and `obj/` everywhere except inside `node_modules`. Useful when a stale incremental build trips up `lerna version` or `nx run-many`:
+
+```powershell delete-bin-obj.ps1
+Clear-Host
+Write-Host "Deleting all BIN and OBJ folders..." -ForegroundColor Cyan
+Get-ChildItem -Path . -Include bin,obj -Recurse -Directory | ForEach-Object {
+    if ($_.FullName -notmatch "\\node_modules\\") {
+        Write-Host "Deleting:" $_.FullName -ForegroundColor Yellow
+        Remove-Item $_.FullName -Recurse -Force
+    } else {
+        Write-Host "Skipping:" $_.FullName -ForegroundColor Magenta
+    }
+}
+
+Write-Host "BIN and OBJ folders have been successfully deleted." -ForegroundColor Green
+```
+
+Run it from the repository root before kicking off `build-all-release.ps1` if you want a guaranteed clean compile.
+
+## `npm/publish-mvc.ps1` — Lerna packs
+
+Publishes everything under `npm/packs/*` to npmjs.org (or whatever registry you point it at). Composition:
+
+```powershell npm/publish-mvc.ps1
+param(
+  [string]$Version,
+  [string]$Registry
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if (-Not $Version) {
+  $Version = $NextVersion;
+}
+
+if (-Not $Registry) {
+  $Registry = "https://registry.npmjs.org";
+}
+
+$PacksPublishCommand = "npm run lerna -- exec 'npm publish --registry $Registry'"
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true";
+
+if ($IsPrerelease) {
+  $PacksPublishCommand = $PacksPublishCommand.Substring(0, $PacksPublishCommand.Length - 1) + " --tag next'"
+}
+
+$commands = (
+  "npm run lerna -- version $Version --yes --no-commit-hooks --no-git-tag-version --no-push --force-publish",
+  "yarn replace-with-tilde",
+  "cd scripts",
+  "yarn install",
+  "yarn validate-versions --compareVersion $Version --path ../packs",
+  "cd ..",
+  $PacksPublishCommand
+)
+
+foreach ($command in $commands) {
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Host $command
+  Invoke-Expression $command
+  if ($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+  $timer.Stop()
+  $total = $timer.Elapsed
+  Write-Output "-------------------------"
+  Write-Output "$command command took $total (Hours:Minutes:Seconds.Milliseconds)"
+  Write-Output "-------------------------"
+}
+```
+
+Step-by-step:
+
+<Steps>
+<Step title="yarn install">
+Installs the Lerna/ncu/glob/semver dependencies declared in `npm/package.json`.
+</Step>
+<Step title="Resolve $Version">
+`node publish-utils.js --nextVersion` returns `<Version>` from the root `common.props`. Pass `-Version 8.0.3-rc.1` to override.
+</Step>
+<Step title="Resolve $Registry">
+Defaults to `https://registry.npmjs.org`. Pass `-Registry http://localhost:4873` to push into a local Verdaccio.
+</Step>
+<Step title="Detect pre-release">
+`publish-utils.js --prerelease --customVersion $Version` echoes `true` when semver parsing finds a pre-release tag. If so the final `npm publish` gets `--tag next` appended.
+</Step>
+<Step title="lerna version">
+`lerna version $Version --force-publish` bumps every `packs/*/package.json` and every internal `@abp/*` range to the new version. `--no-git-tag-version --no-push --no-commit-hooks` keeps the script idempotent.
+</Step>
+<Step title="replace-with-tilde">
+[`replace-with-tilde.js`](/npm/abp-tooling#replace-with-tilde-js) rewrites every `@abp/*` range from `^` to `~`.
+</Step>
+<Step title="validate-versions">
+[`scripts/validate-versions.ts`](/npm/abp-tooling#scripts-validate-versions-ts) reads every `packs/*/package.json` and fails the build if any package or any inter-package dependency does not match `$Version`.
+</Step>
+<Step title="lerna exec npm publish">
+Lerna iterates every pack in topological order and runs `npm publish --registry $Registry [--tag next]`.
+</Step>
+</Steps>
+
+Per-command timing is printed via `System.Diagnostics.Stopwatch`, making the produced log easy to triage when a publish hangs.
+
+## `npm/publish-ng.ps1` — Nx Angular libraries
+
+The Angular side is more involved because Nx does the actual publish (via `npm/ng-packs/scripts/publish.ts`) rather than Lerna:
+
+```powershell npm/publish-ng.ps1
+param(
+  [string]$Version,
+  [string]$Registry
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if (-Not $Version)  { $Version  = $NextVersion; }
+if (-Not $Registry) { $Registry = "https://registry.npmjs.org"; }
+
+$UpdateNgPacksCommand    = "yarn update-version $Version"
+$NgPacksPublishCommand   = "npm run publish-packages -- --nextVersion $Version --skipGit --registry $Registry --skipVersionValidation"
+$UpdateGulpCommand       = "yarn update-gulp --registry $Registry"
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true";
+
+if ($IsPrerelease) {
+  $UpdateGulpCommand    += " --prerelease"
+  $UpdateNgPacksCommand += " --prerelease"
+}
+
+$commands = (
+  "cd ng-packs",
+  "yarn install",
+  $UpdateNgPacksCommand,
+  "cd scripts",
+  "yarn install",
+  $NgPacksPublishCommand,
+  "cd ../../",
+  "cd scripts",
+  "yarn remove-lock-files",
+  "cd ..",
+  $UpdateGulpCommand
+)
+
+foreach ($command in $commands) {
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Host $command
+  Invoke-Expression $command
+  if ($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+  $timer.Stop()
+  $total = $timer.Elapsed
+  Write-Output "-------------------------"
+  Write-Output "$command command took $total (Hours:Minutes:Seconds.Milliseconds)"
+  Write-Output "-------------------------"
+}
+```
+
+Step-by-step:
+
+<Steps>
+<Step title="yarn install at npm/">
+Same as MVC.
+</Step>
+<Step title="cd ng-packs && yarn install">
+Installs the Nx workspace.
+</Step>
+<Step title="yarn update-version $Version">
+Triggers the `@abp/nx.generators:update-version` Nx generator which bumps every `packages/*/package.json` and every inter-`@abp/ng.*` range.
+</Step>
+<Step title="cd scripts && yarn install && publish-packages">
+Runs `npm/ng-packs/scripts/publish.ts` (`publish-packages` is its yarn alias). The TS script swaps `lerna.publish.json` ↔ `lerna.json`, runs `nx run-many --target=build --prod`, builds the schematics, then `lerna exec npm publish --registry $Registry`. See [`/npm/abp-tooling`](/npm/abp-tooling#nx-side-counterparts).
+</Step>
+<Step title="cd ../../scripts && yarn remove-lock-files">
+[`scripts/remove-lock-files.ts`](/npm/abp-tooling#scripts-remove-lock-files-ts) deletes `yarn.lock` and `package-lock.json` from `templates/app/angular`, `templates/app/react-native` and `templates/module/angular` so that `dotnet new` consumers pull the freshly published `@abp/ng.*` ranges.
+</Step>
+<Step title="yarn update-gulp --registry">
+[`update-gulp.js`](/npm/abp-tooling#update-gulp-js) walks every `.csproj` + `gulpfile.js` pair in the repository, runs `ncu` to bump `@abp/*` deps and re-runs `yarn gulp` so each project's `wwwroot/libs/` matches the new version.
+</Step>
+</Steps>
+
+## `npm/preview-publish.ps1` — one-shot wrapper
+
+The single entry point developers actually invoke: it runs `publish-mvc.ps1` and then `publish-ng.ps1`, passing the same `$Version` / `$Registry` through:
+
+```powershell npm/preview-publish.ps1
+param(
+  [string]$Version,
+  [string]$Registry
+)
+$commands = (
+  ".\publish-mvc.ps1 $Version $Registry",
+  ".\publish-ng.ps1 $Version $Registry"
+);
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if(-Not $Version) {
+  $Version = $NextVersion;
+}
+
+if(-Not $Registry) {
+  exit
+}
+
+foreach ($command in $commands) {
+  Write-Host $command
+  Invoke-Expression $command
+  if($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+}
+```
+
+<Note>
+`preview-publish.ps1` is the only script that **requires** `$Registry`. Calling it without a registry exits silently — a guard rail against accidentally pushing a preview to `registry.npmjs.org`.
+</Note>
+
+## Putting it together — a release run
+
+A canonical release uses the scripts in this order (run from the repository root, then from `npm/`):
+
+```bash
+# 1. Clean previous artefacts
+pwsh ./delete-bin-obj.ps1
+
+# 2. Build & test every solution in release
+cd build
+pwsh ./build-all-release.ps1
+pwsh ./test-all.ps1 -f
+
+# 3. Publish JavaScript & TypeScript artefacts
+cd ../npm
+pwsh ./preview-publish.ps1 -Version 8.0.2 -Registry https://registry.npmjs.org
+```
+
+## Composition diagram
+
+```mermaid
+flowchart TD
+  subgraph .NET
+    DB[delete-bin-obj.ps1]
+    CP[build/common.ps1]
+    BA[build/build-all.ps1]
+    BAR[build/build-all-release.ps1]
+    TA[build/test-all.ps1]
+    DB --> BAR
+    BAR -. dot-source .-> CP
+    BA  -. dot-source .-> CP
+    TA  -. dot-source .-> CP
+    BAR --> TA
+  end
+
+  subgraph npm
+    PU[publish-utils.js]
+    PP[preview-publish.ps1]
+    PM[publish-mvc.ps1]
+    PN[publish-ng.ps1]
+    PP --> PM
+    PP --> PN
+    PM --> PU
+    PN --> PU
+    PM --> LERNA[lerna]
+    PM --> RWT[replace-with-tilde.js]
+    PM --> VV[scripts/validate-versions.ts]
+    PN --> NX[ng-packs/scripts/publish.ts]
+    PN --> RLF[scripts/remove-lock-files.ts]
+    PN --> UG[update-gulp.js]
+  end
+
+  CP -. reads ../framework, ../modules/*, ../templates/* .-> SOL[(solutions)]
+  PU -. reads ../common.props .-> CP_PROPS[(common.props)]
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+<Card title="npm workspace overview" icon="folder-tree" href="/npm/overview">
+The top-down map of `npm/` that frames everything on this page.
+</Card>
+<Card title="ABP npm tooling" icon="screwdriver-wrench" href="/npm/abp-tooling">
+The Node and TypeScript scripts those PowerShell entry points invoke.
+</Card>
+<Card title="Source-code tooling" icon="hammer" href="/source-code-tooling">
+The .NET props files (`common.props`, `Directory.Build.props`, `configureawait.props`) read by the build pipeline.
+</Card>
+<Card title="MVC UI packs" icon="cubes" href="/npm/aspnetcore-mvc-ui-packages">
+The `@abp/*` packs that `publish-mvc.ps1` ships and `update-gulp.js` refreshes.
+</Card>
+</CardGroup>

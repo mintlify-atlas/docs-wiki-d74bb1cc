@@ -1,0 +1,574 @@
+---
+title: "AutoMapper Integration: Profiles, Options, and Validation"
+sidebarTitle: "AutoMapper"
+description: "AbpAutoMapperModule, AbpAutoMapperOptions, IAbpAutoMapperConfigurationContext, AddMaps, AddProfile, and AutoMapper profile validation in ABP."
+---
+
+`Volo.Abp.AutoMapper` is the package that plugs AutoMapper into ABP's object
+mapping seam. Referencing it does three things: it replaces the
+"not implemented" `IAutoObjectMappingProvider` with one that delegates to
+AutoMapper, it builds a single AutoMapper `IConfigurationProvider` from every
+profile your modules contribute, and it surfaces an
+`IMapperAccessor` so other framework subsystems (auditing, object extending,
+dynamic proxies) can reach the underlying `IMapper` without leaking the
+implementation type. This page walks the module's `ConfigureServices`,
+the `AbpAutoMapperOptions` API for registering profiles, and the validation
+toggle that catches missing destination members at startup.
+
+The seam that AutoMapper replaces is described on the
+[Object Mapping Overview](/mapping/overview) page. The `MapExtraProperties`
+helper that interacts with object extending lives in this package too — see
+[Object Extending](/mapping/object-extending).
+
+## File inventory
+
+All paths are relative to `framework/src/Volo.Abp.AutoMapper/`.
+
+| File | Purpose |
+| ---- | ------- |
+| `Volo/Abp/AutoMapper/AbpAutoMapperModule.cs` | Module that builds the `IConfigurationProvider`, registers `IMapper`, `IMapperAccessor`, and replaces the auto provider. |
+| `Volo/Abp/AutoMapper/AbpAutoMapperOptions.cs` | Options class exposing `AddMaps<TModule>`, `AddProfile<TProfile>`, and the `ValidatingProfiles` type list. |
+| `Volo/Abp/AutoMapper/IAbpAutoMapperConfigurationContext.cs` | Context handed to every configurator: `IMapperConfigurationExpression` + `IServiceProvider`. |
+| `Volo/Abp/AutoMapper/AbpAutoMapperConfigurationContext.cs` | Default `IAbpAutoMapperConfigurationContext` implementation. |
+| `Volo/Abp/AutoMapper/IMapperAccessor.cs` | Single-property abstraction over `IMapper`. |
+| `Volo/Abp/AutoMapper/MapperAccessor.cs` | Internal `IMapperAccessor` implementation, settable for test scenarios. |
+| `Volo/Abp/AutoMapper/AutoMapperAutoObjectMappingProvider.cs` | `IAutoObjectMappingProvider` that forwards to `MapperAccessor.Mapper`. Has a `<TContext>` variant. |
+| `Volo/Abp/AutoMapper/AbpAutoMapperConventionalRegistrar.cs` | Conventional registrar that registers AutoMapper value resolvers, type converters, and mapping actions as transient. |
+| `Volo/Abp/AutoMapper/AutoMapperExpressionExtensions.cs` | `IMappingExpression<,>` extensions to ignore audit, soft-delete, and concurrency properties. |
+| `Microsoft/Extensions/DependencyInjection/AbpAutoMapperServiceCollectionExtensions.cs` | `AddAutoMapperObjectMapper()` replacement helpers. |
+| `Volo/Abp/ObjectMapping/AbpAutoMapperObjectMapperExtensions.cs` | `GetMapper()` extension exposing the raw `IMapper` when needed. |
+| `AutoMapper/AbpAutoMapperExtensibleObjectExtensions.cs` | `MapExtraProperties`/`IgnoreExtraProperties` `IMappingExpression` extensions. |
+
+## Module wiring
+
+`AbpAutoMapperModule` depends on `AbpObjectMappingModule`,
+`AbpObjectExtendingModule`, and `AbpAuditingModule`, and registers all of
+the AutoMapper-side services in `ConfigureServices`:
+
+```csharp
+// AbpAutoMapperModule.cs
+[DependsOn(
+    typeof(AbpObjectMappingModule),
+    typeof(AbpObjectExtendingModule),
+    typeof(AbpAuditingModule)
+)]
+public class AbpAutoMapperModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpAutoMapperConventionalRegistrar());
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAutoMapperObjectMapper();
+
+        context.Services.AddSingleton<IConfigurationProvider>(sp =>
+        {
+            using (var scope = sp.CreateScope())
+            {
+                var options = scope.ServiceProvider
+                    .GetRequiredService<IOptions<AbpAutoMapperOptions>>().Value;
+
+                var mapperConfigurationExpression = sp
+                    .GetRequiredService<IOptions<MapperConfigurationExpression>>().Value;
+                var autoMapperConfigurationContext = new AbpAutoMapperConfigurationContext(
+                    mapperConfigurationExpression, scope.ServiceProvider);
+
+                foreach (var configurator in options.Configurators)
+                {
+                    configurator(autoMapperConfigurationContext);
+                }
+                var mapperConfiguration = new MapperConfiguration(mapperConfigurationExpression);
+
+                foreach (var profileType in options.ValidatingProfiles)
+                {
+                    mapperConfiguration.Internal().AssertConfigurationIsValid(
+                        ((Profile)Activator.CreateInstance(profileType)).ProfileName);
+                }
+
+                return mapperConfiguration;
+            }
+        });
+
+        context.Services.AddTransient<IMapper>(sp =>
+            sp.GetRequiredService<IConfigurationProvider>().CreateMapper(sp.GetService));
+
+        context.Services.AddTransient<MapperAccessor>(sp => new MapperAccessor()
+        {
+            Mapper = sp.GetRequiredService<IMapper>()
+        });
+        context.Services.AddTransient<IMapperAccessor>(provider =>
+            provider.GetRequiredService<MapperAccessor>());
+    }
+}
+```
+
+The structure deserves a closer look:
+
+<Steps>
+<Step title="`AddAutoMapperObjectMapper()` replaces the auto provider">
+This is the swap that makes ABP delegate to AutoMapper. Without it,
+`DefaultObjectMapper`'s `AutoObjectMappingProvider` is still the
+`NotImplementedAutoObjectMappingProvider` from the overview page.
+
+```csharp
+// AbpAutoMapperServiceCollectionExtensions.cs
+public static IServiceCollection AddAutoMapperObjectMapper(this IServiceCollection services)
+{
+    return services.Replace(
+        ServiceDescriptor.Transient<IAutoObjectMappingProvider, AutoMapperAutoObjectMappingProvider>()
+    );
+}
+
+public static IServiceCollection AddAutoMapperObjectMapper<TContext>(this IServiceCollection services)
+{
+    return services.Replace(
+        ServiceDescriptor.Transient<IAutoObjectMappingProvider<TContext>, AutoMapperAutoObjectMappingProvider<TContext>>()
+    );
+}
+```
+
+The `<TContext>` overload is what lets a module build a private mapper
+isolated from the global one — call it once with the module's marker type
+and configure `AbpAutoMapperOptions` separately for that context.
+</Step>
+<Step title="The singleton `IConfigurationProvider` materialises every profile">
+AutoMapper's configuration is expensive to build and intentionally immutable
+at runtime — so it is registered as a *singleton*. Inside the factory, ABP:
+
+1. Reads the live `AbpAutoMapperOptions` (`.Configurators` and
+   `.ValidatingProfiles`).
+2. Builds an `AbpAutoMapperConfigurationContext` that wraps the same
+   `MapperConfigurationExpression` AutoMapper would use.
+3. Replays every `Action<IAbpAutoMapperConfigurationContext>` registered
+   through `AddMaps`/`AddProfile`/manual configurators.
+4. Materialises a `MapperConfiguration` from the now-populated expression.
+5. Runs `AssertConfigurationIsValid` for every profile in
+   `ValidatingProfiles` — see [Profile validation](#profile-validation).
+</Step>
+<Step title="`IMapper` is transient, scope-aware">
+AutoMapper's recommended pattern is "configuration is singleton, mapper is
+short-lived" because `IMapper` carries a scoped service factory for value
+resolvers. ABP follows it:
+
+```csharp
+context.Services.AddTransient<IMapper>(sp =>
+    sp.GetRequiredService<IConfigurationProvider>().CreateMapper(sp.GetService));
+```
+
+Passing `sp.GetService` lets AutoMapper resolve any `IValueResolver<,,>`,
+`ITypeConverter<,>`, `IValueConverter<,>`, or `IMappingAction<,>` from DI —
+which is exactly what the conventional registrar registers.
+</Step>
+<Step title="`IMapperAccessor` exposes `IMapper` without leaking it">
+`IMapperAccessor` is a one-property abstraction:
+
+```csharp
+// IMapperAccessor.cs
+public interface IMapperAccessor
+{
+    IMapper Mapper { get; }
+}
+
+// MapperAccessor.cs
+internal class MapperAccessor : IMapperAccessor
+{
+    public IMapper Mapper { get; set; } = default!;
+}
+```
+
+`AutoMapperAutoObjectMappingProvider` depends on `IMapperAccessor` rather
+than on `IMapper` so that test code can swap the accessor without rebuilding
+configuration. The same accessor is consumed by
+`AbpAutoMapperObjectMapperExtensions.GetMapper()`, which lets framework code
+reach the raw `IMapper` (for example for `ProjectTo` queries) without taking
+an AutoMapper dependency through `IObjectMapper` itself.
+</Step>
+</Steps>
+
+## The configuration context
+
+Every configurator receives an `IAbpAutoMapperConfigurationContext`:
+
+```csharp
+// IAbpAutoMapperConfigurationContext.cs
+public interface IAbpAutoMapperConfigurationContext
+{
+    IMapperConfigurationExpression MapperConfiguration { get; }
+    IServiceProvider ServiceProvider { get; }
+}
+```
+
+`MapperConfiguration` is the same `IMapperConfigurationExpression` that
+plain AutoMapper users see — call `CreateMap<,>`, `AddProfile<>`, `AddMaps`,
+etc., directly on it. `ServiceProvider` is the *configuration-time* scoped
+provider; use it for resolver registration but **not** for caching long-lived
+references, because the scope is disposed once the configuration is built.
+
+## Registering profiles
+
+The expected entry point in any module is `Configure<AbpAutoMapperOptions>`,
+called from `ConfigureServices`:
+
+```csharp
+public class MyModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddMaps<MyModule>();
+            // or, for a single profile:
+            // options.AddProfile<MyProfile>(validate: true);
+        });
+    }
+}
+```
+
+### `AddMaps<TModule>`
+
+`AddMaps` is the bulk registration helper: pass any type from your module's
+assembly, and every `Profile` subclass in that assembly is wired up.
+
+```csharp
+// AbpAutoMapperOptions.cs
+public void AddMaps<TModule>(bool validate = false)
+{
+    var assembly = typeof(TModule).Assembly;
+
+    Configurators.Add(context =>
+    {
+        context.MapperConfiguration.AddMaps(assembly);
+    });
+
+    if (validate)
+    {
+        var profileTypes = assembly
+            .DefinedTypes
+            .Where(type => typeof(Profile).IsAssignableFrom(type)
+                && !type.IsAbstract && !type.IsGenericType);
+
+        foreach (var profileType in profileTypes)
+        {
+            ValidatingProfiles.Add(profileType);
+        }
+    }
+}
+```
+
+A few observations:
+
+- The configurator stores a closure over the assembly and runs once when
+  the `IConfigurationProvider` factory builds, not at module-config time.
+  This is what lets options from later modules still influence the
+  configuration.
+- The `validate` flag does not change AutoMapper's behaviour — it just adds
+  every non-abstract, non-generic `Profile` in the assembly to
+  `ValidatingProfiles` so they get asserted during startup. Failing
+  validation will throw out of `ConfigureServices` the first time
+  `IConfigurationProvider` is resolved.
+
+### `AddProfile<TProfile>`
+
+For finer control, register one profile at a time:
+
+```csharp
+// AbpAutoMapperOptions.cs
+public void AddProfile<TProfile>(bool validate = false)
+    where TProfile : Profile, new()
+{
+    Configurators.Add(context =>
+    {
+        context.MapperConfiguration.AddProfile<TProfile>();
+    });
+
+    if (validate)
+    {
+        ValidateProfile(typeof(TProfile));
+    }
+}
+```
+
+The `new()` constraint is enforced by AutoMapper itself —
+`AddProfile<TProfile>` calls `new TProfile()` internally — so this method
+cannot wire up profiles that need DI in their constructor.
+
+### Manual configurators
+
+`Configurators` is a `List<Action<IAbpAutoMapperConfigurationContext>>`, so
+you can append arbitrary code:
+
+```csharp
+Configure<AbpAutoMapperOptions>(options =>
+{
+    options.Configurators.Add(ctx =>
+    {
+        ctx.MapperConfiguration.CreateMap<Book, BookDto>()
+            .ForMember(d => d.AuthorName, m => m.MapFrom(s => s.Author.Name));
+    });
+});
+```
+
+This is the right place to register cross-module overrides, or to consume
+`ctx.ServiceProvider` to look up settings that influence the mapping.
+
+## Profile validation
+
+`AbpAutoMapperOptions.ValidatingProfiles` is an `ITypeList<Profile>`. Every
+type in it is validated when the configuration is built:
+
+```csharp
+// AbpAutoMapperModule.cs (inside the IConfigurationProvider factory)
+foreach (var profileType in options.ValidatingProfiles)
+{
+    mapperConfiguration.Internal().AssertConfigurationIsValid(
+        ((Profile)Activator.CreateInstance(profileType)).ProfileName);
+}
+```
+
+`AssertConfigurationIsValid` is AutoMapper's "every destination property is
+either mapped, ignored, or has a matching source member" check. By scoping
+it to the profile's `ProfileName`, ABP avoids the all-or-nothing trap where
+adding a single un-validated profile would force you to either validate the
+entire app or none of it.
+
+<Tabs>
+<Tab title="Validation off (default)">
+```csharp
+Configure<AbpAutoMapperOptions>(options =>
+{
+    options.AddMaps<MyModule>(); // validate: false (default)
+});
+```
+
+Profiles compile but unmatched destination members silently keep their
+default values. Use for module assemblies that contain partial profiles
+or for legacy code.
+</Tab>
+<Tab title="Validation on for one module">
+```csharp
+Configure<AbpAutoMapperOptions>(options =>
+{
+    options.AddMaps<MyModule>(validate: true);
+});
+```
+
+Every `Profile` in `MyModule`'s assembly is asserted at startup. Missing
+mappings throw `AutoMapperConfigurationException`. Use this for your own
+modules where every DTO mapping should be exhaustive.
+</Tab>
+<Tab title="Per-profile toggle">
+```csharp
+Configure<AbpAutoMapperOptions>(options =>
+{
+    options.AddProfile<BookProfile>(validate: true);
+    options.AddProfile<LegacyProfile>(validate: false);
+});
+
+// or, after-the-fact:
+options.ValidateProfile<BookProfile>();             // add
+options.ValidateProfile<LegacyProfile>(false);      // remove
+```
+
+Use when one profile in an assembly is stable enough to validate but
+others are not.
+</Tab>
+</Tabs>
+
+The toggle helpers are pure list operations:
+
+```csharp
+// AbpAutoMapperOptions.cs
+public void ValidateProfile(Type profileType, bool validate = true)
+{
+    if (validate)
+    {
+        ValidatingProfiles.AddIfNotContains(profileType);
+    }
+    else
+    {
+        ValidatingProfiles.Remove(profileType);
+    }
+}
+```
+
+## Resolution end-to-end
+
+Once the module has registered everything, an `IObjectMapper.Map<,>` call
+walks the following services. (Compare the in-process flow with the
+[Overview](/mapping/overview) page's flowchart.)
+
+```mermaid
+flowchart LR
+    A[IObjectMapper] --> B[DefaultObjectMapper]
+    B -- no specific mapper --> C[IAutoObjectMappingProvider]
+    C -.replaced by.-> D[AutoMapperAutoObjectMappingProvider]
+    D --> E[IMapperAccessor.Mapper]
+    E --> F[IMapper]
+    F --> G[IConfigurationProvider singleton]
+    G --> H[Profiles from AddMaps / AddProfile]
+```
+
+The provider itself is a one-liner over the accessor:
+
+```csharp
+// AutoMapperAutoObjectMappingProvider.cs
+public class AutoMapperAutoObjectMappingProvider : IAutoObjectMappingProvider
+{
+    public IMapperAccessor MapperAccessor { get; }
+
+    public AutoMapperAutoObjectMappingProvider(IMapperAccessor mapperAccessor)
+    {
+        MapperAccessor = mapperAccessor;
+    }
+
+    public virtual TDestination Map<TSource, TDestination>(object source)
+    {
+        return MapperAccessor.Mapper.Map<TDestination>(source);
+    }
+
+    public virtual TDestination Map<TSource, TDestination>(TSource source, TDestination destination)
+    {
+        return MapperAccessor.Mapper.Map(source, destination);
+    }
+}
+```
+
+Notice that the first overload uses AutoMapper's runtime-resolved
+`Map<TDestination>(object)` — it ignores `TSource` and dispatches on the
+runtime type of `source`. This is what lets `ApplicationService.Map<S, D>`
+do the right thing even when `source` is a proxied subclass of `TSource`.
+
+## The conventional registrar
+
+`AbpAutoMapperConventionalRegistrar` ensures that classes implementing
+AutoMapper's open generic plug-in interfaces are registered as transient
+services so the `sp.GetService` factory passed to `IMapper` can resolve
+them:
+
+```csharp
+// AbpAutoMapperConventionalRegistrar.cs
+public class AbpAutoMapperConventionalRegistrar : DefaultConventionalRegistrar
+{
+    protected readonly Type[] OpenTypes = {
+        typeof(IValueResolver<,,>),
+        typeof(IMemberValueResolver<,,,>),
+        typeof(ITypeConverter<,>),
+        typeof(IValueConverter<,>),
+        typeof(IMappingAction<,>)
+    };
+
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+    {
+        return !type.GetInterfaces().Any(x => x.IsGenericType
+                && OpenTypes.Contains(x.GetGenericTypeDefinition()))
+            || base.IsConventionalRegistrationDisabled(type);
+    }
+
+    protected override ServiceLifetime? GetDefaultLifeTimeOrNull(Type type)
+    {
+        return ServiceLifetime.Transient;
+    }
+}
+```
+
+This means you can implement
+`IValueResolver<MyEntity, MyDto, string>`, inject any service into its
+constructor, and reference it from a profile with
+`.ForMember(d => d.Foo, m => m.MapFrom<MyResolver>())` without any extra
+registration.
+
+## Helper extensions on `IMappingExpression`
+
+`AutoMapperExpressionExtensions` provides shortcuts to ignore destination
+properties that belong to ABP's audit / soft-delete / concurrency
+infrastructure. They are valuable when mapping an *incoming* DTO into a
+domain entity, where you must not let the client overwrite audit fields.
+
+```csharp
+// AutoMapperExpressionExtensions.cs
+public static IMappingExpression<TSource, TDestination> IgnoreFullAuditedObjectProperties<TSource, TDestination>(
+    this IMappingExpression<TSource, TDestination> mappingExpression)
+    where TDestination : IFullAuditedObject
+{
+    return mappingExpression
+        .IgnoreAuditedObjectProperties()
+        .IgnoreDeletionAuditedObjectProperties();
+}
+```
+
+The chain composes:
+
+| Extension | Ignored members |
+| --------- | --------------- |
+| `IgnoreHasCreationTimeProperties` | `CreationTime` |
+| `IgnoreMayHaveCreatorProperties` | `CreatorId` (and `Creator` in the `<TUser>` overload) |
+| `IgnoreCreationAuditedObjectProperties` | the two above combined |
+| `IgnoreHasModificationTimeProperties` | `LastModificationTime` |
+| `IgnoreModificationAuditedObjectProperties` | `LastModificationTime`, `LastModifierId` (+ `LastModifier`) |
+| `IgnoreAuditedObjectProperties` | creation + modification |
+| `IgnoreSoftDeleteProperties` | `IsDeleted` |
+| `IgnoreHasDeletionTimeProperties` | `IsDeleted`, `DeletionTime` |
+| `IgnoreDeletionAuditedObjectProperties` | `IsDeleted`, `DeletionTime`, `DeleterId` (+ `Deleter`) |
+| `IgnoreFullAuditedObjectProperties` | all of the above |
+
+A typical inbound profile:
+
+```csharp
+public class CreateBookDtoProfile : Profile
+{
+    public CreateBookDtoProfile()
+    {
+        CreateMap<CreateBookDto, Book>()
+            .IgnoreFullAuditedObjectProperties()
+            .Ignore(x => x.Id);
+    }
+}
+```
+
+## Getting at the raw `IMapper`
+
+Inside framework code (or when you want `ProjectTo` against `IQueryable`),
+`GetMapper` peels off `IObjectMapper` to reach the AutoMapper instance:
+
+```csharp
+// AbpAutoMapperObjectMapperExtensions.cs
+public static IMapper GetMapper(this IObjectMapper objectMapper)
+{
+    return objectMapper.AutoObjectMappingProvider.GetMapper();
+}
+
+public static IMapper GetMapper(this IAutoObjectMappingProvider autoObjectMappingProvider)
+{
+    if (autoObjectMappingProvider is AutoMapperAutoObjectMappingProvider autoMapperAutoObjectMappingProvider)
+    {
+        return autoMapperAutoObjectMappingProvider.MapperAccessor.Mapper;
+    }
+
+    throw new AbpException(
+        $"Given object is not an instance of {typeof(AutoMapperAutoObjectMappingProvider).AssemblyQualifiedName}. " +
+        $"The type of the given object it {autoObjectMappingProvider.GetType().AssemblyQualifiedName}");
+}
+```
+
+The throw is intentional: if you call `GetMapper()` from a project that
+swapped the provider for a non-AutoMapper implementation, you find out at
+the call site instead of dispatching to a stub.
+
+<Warning>
+Using `GetMapper()` couples your code to AutoMapper. Prefer `IObjectMapper`
+in application/domain code and reserve `GetMapper()` for infrastructure
+(LINQ projections, advanced configuration introspection).
+</Warning>
+
+## Related pages
+
+- [Object Mapping Overview](/mapping/overview) — the upstream
+  `IObjectMapper` contract and `DefaultObjectMapper` resolution.
+- [Object Extending](/mapping/object-extending) — `MapExtraProperties`
+  bridges this module to `Volo.Abp.ObjectExtending`.
+- [Application Services](/ddd/application-services) — the most common
+  consumer of `IObjectMapper.Map<,>`.
+- [DTOs](/ddd/data-transfer-objects) — typical sources and destinations
+  of the profiles registered here.

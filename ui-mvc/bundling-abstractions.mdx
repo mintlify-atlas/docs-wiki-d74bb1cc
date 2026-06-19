@@ -1,0 +1,407 @@
+---
+title: "ABP bundling abstractions: options, configs, contributors"
+sidebarTitle: "Bundling abstractions"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions: configuration model for ABP bundling — AbpBundlingOptions, BundleConfiguration, IBundleContributor."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions` is the small contract
+package shared by every component of ABP's bundling stack. It defines the
+mutable configuration model — `AbpBundlingOptions`,
+`BundleConfigurationCollection`, `BundleConfiguration` and the
+`IBundleContributor` interface — together with the value objects
+(`BundleFile`, `BundlingMode`) that flow through the runtime defined in
+[Bundling](/ui-mvc/bundling). Theme modules, third‑party packages and
+applications all reference this assembly so they can register contributors
+without pulling in the full bundler machinery.
+
+## Module entry point
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/AbpAspNetCoreMvcUiBundlingAbstractionsModule.cs"
+public class AbpAspNetCoreMvcUiBundlingAbstractionsModule : AbpModule
+{
+}
+```
+
+The module is deliberately empty: the package only contributes shared types
+that other modules' `[DependsOn]` graphs consume. The actual services that
+read this configuration live in
+`AbpAspNetCoreMvcUiBundlingModule` (see [Bundling](/ui-mvc/bundling)).
+
+## AbpBundlingOptions
+
+The root options object is the single entry point for configuring bundles.
+It exposes two collections — one for stylesheet bundles, one for script
+bundles — plus runtime flags like `BundlingMode` and the on‑disk folder
+where compiled bundles are written.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/AbpBundlingOptions.cs"
+public class AbpBundlingOptions
+{
+    public BundleConfigurationCollection StyleBundles  { get; }
+    public BundleConfigurationCollection ScriptBundles { get; }
+
+    public HashSet<string> MinificationIgnoredFiles { get; }
+
+    /// <summary>Default: "__bundles".</summary>
+    public string BundleFolderName { get; } = "__bundles";
+
+    /// <summary>Default: auto.</summary>
+    public BundlingMode Mode { get; set; } = BundlingMode.Auto;
+
+    public bool         DeferScriptsByDefault { get; set; }
+    public List<string> DeferScripts          { get; }
+
+    public bool         PreloadStylesByDefault { get; set; }
+    public List<string> PreloadStyles          { get; }
+
+    public AbpBundlingOptions()
+    {
+        StyleBundles   = new BundleConfigurationCollection();
+        ScriptBundles  = new BundleConfigurationCollection();
+        MinificationIgnoredFiles = new HashSet<string>();
+        DeferScriptsByDefault    = false;
+        DeferScripts             = new List<string>();
+        PreloadStylesByDefault   = false;
+        PreloadStyles            = new List<string>();
+    }
+}
+```
+
+| Property | Type | Purpose |
+| --- | --- | --- |
+| `StyleBundles` / `ScriptBundles` | `BundleConfigurationCollection` | Bundle definitions keyed by name |
+| `MinificationIgnoredFiles` | `HashSet<string>` | File paths that bypass minification (e.g. already‑minified third‑party libs that NUglify trips on) |
+| `BundleFolderName` | `string` | Sub‑folder under `wwwroot/` for materialised bundles |
+| `Mode` | `BundlingMode` | None / Bundle / BundleAndMinify / **Auto** |
+| `DeferScripts*` / `PreloadStyles*` | `bool` + `List<string>` | Default + per‑bundle defer/preload flags |
+
+### BundlingMode
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundlingMode.cs"
+public enum BundlingMode
+{
+    /// <summary>No bundling or minification.</summary>
+    None,
+
+    /// <summary>
+    /// Automatically determine the mode.
+    /// - Uses <see cref="None"/> for development time.
+    /// - Uses <see cref="BundleAndMinify"/> for other environments.
+    /// </summary>
+    Auto,
+
+    /// <summary>Bundled but not minified.</summary>
+    Bundle,
+
+    /// <summary>Bundled and minified.</summary>
+    BundleAndMinify
+}
+```
+
+## BundleConfiguration
+
+A single named bundle is described by `BundleConfiguration`. It carries the
+ordered contributor list and a list of "base" bundles whose contributors
+are prepended on each resolution pass.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleConfiguration.cs"
+public class BundleConfiguration
+{
+    public string Name { get; }
+    public BundleContributorCollection Contributors { get; }
+    public List<string>                BaseBundles  { get; }
+
+    public BundleConfiguration(string name)
+    {
+        Name         = name;
+        Contributors = new BundleContributorCollection();
+        BaseBundles  = new List<string>();
+    }
+}
+```
+
+Fluent helpers in `BundleConfigurationExtensions` make registration
+ergonomic:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleConfigurationExtensions.cs"
+public static BundleConfiguration AddFiles(this BundleConfiguration b, params string[] files);
+public static BundleConfiguration AddFiles(this BundleConfiguration b, params BundleFile[] files);
+public static BundleConfiguration AddExternalFiles(this BundleConfiguration b, params string[] files);
+public static BundleConfiguration AddContributors(this BundleConfiguration b, params IBundleContributor[] contributors);
+public static BundleConfiguration AddBaseBundles(this BundleConfiguration b, params string[] bundleNames);
+```
+
+Typical use inside a module:
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.ScriptBundles
+        .Add("MyApp.Global", bundle =>
+        {
+            bundle.AddBaseBundles(StandardBundles.Scripts.Global);
+            bundle.AddContributors(typeof(MyAppExtraScriptContributor));
+            bundle.AddFiles("/scripts/site.js");
+            bundle.AddExternalFiles("https://example.com/analytics.js");
+        });
+});
+```
+
+## BundleConfigurationCollection
+
+Bundles are stored in a thread‑safe collection keyed by name. The
+collection supports **lazy** bundles — bundles whose configuration arrives
+before the bundle is created, typically from theme components that wrap
+`abp-script-bundle name="MyPage"` markup.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleConfigurationCollection.cs"
+public class BundleConfigurationCollection
+{
+    public BundleConfigurationCollection Add(
+        string bundleName,
+        Action<BundleConfiguration>? configureAction = null);
+
+    public bool TryAdd(
+        string bundleName,
+        Action<BundleConfiguration>? configureAction = null,
+        bool overrideIfExists = false);
+
+    /// <summary>Configures an existing bundle (also works for lazy bundles).</summary>
+    public BundleConfigurationCollection Configure(
+        string bundleName, Action<BundleConfiguration> configureAction);
+
+    /// <summary>Configures every bundle, current and future.</summary>
+    public BundleConfigurationCollection ConfigureAll(Action<BundleConfiguration> configureAction);
+
+    public BundleConfiguration Get(string bundleName);
+}
+```
+
+The two interesting bits are:
+
+- **`Configure`** queues a configuration action against a `bundleName` that
+  may not exist yet. When the bundle is later created the queued actions
+  run automatically. This is how a downstream module can append files to
+  a bundle declared in a Razor template without race conditions.
+- **`ConfigureAll`** registers an action that runs for every bundle past or
+  present, useful for cross‑cutting concerns (e.g. adding a global RTL
+  contributor when `CultureHelper.IsRtl` flips).
+
+## BundleContributorCollection
+
+Inside a `BundleConfiguration`, contributors live in a
+`BundleContributorCollection` that respects `[DependsOn(...)]` between
+contributors. Adding `SharedThemeGlobalScriptContributor` pulls in jQuery,
+Bootstrap, Datatables, etc. transitively in the right order — no manual
+ordering needed.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleContributorCollection.cs"
+public class BundleContributorCollection
+{
+    public void Add(IBundleContributor contributor);
+    public void Add<TContributor>() where TContributor : IBundleContributor, new();
+    public void Add(Type contributorType);
+
+    public void Replace<TSourceContributor, TDestContributorType>(bool includeDependencies = false)
+        where TSourceContributor : IBundleContributor, new()
+        where TDestContributorType : IBundleContributor, new();
+    public void Replace(Type sourceContributorType, Type destContributorType, bool includeDependencies = false);
+
+    public void Remove<TContributor>(bool includeDependencies = false)
+        where TContributor : IBundleContributor, new();
+
+    public IReadOnlyList<IBundleContributor> GetAll();
+}
+```
+
+The collection walks `IDependedTypesProvider` attributes (the same
+mechanism used by `AbpModule`) so contributor authors get module‑style
+dependency resolution for free.
+
+## IBundleContributor
+
+Contributors are the unit of composition. A contributor knows how to add
+files to a `BundleConfigurationContext` and can optionally run pre‑/post‑
+phases or contribute *dynamic* resources (resources determined per request,
+typically per‑culture language packs).
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/IBundleContributor.cs"
+public interface IBundleContributor
+{
+    Task PreConfigureBundleAsync(BundleConfigurationContext context);
+    Task ConfigureBundleAsync(BundleConfigurationContext context);
+    Task PostConfigureBundleAsync(BundleConfigurationContext context);
+    Task ConfigureDynamicResourcesAsync(BundleConfigurationContext context);
+}
+```
+
+For the common case, derive from `BundleContributor` and override only the
+hooks you need:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleContributor.cs"
+public abstract class BundleContributor : IBundleContributor
+{
+    public virtual Task PreConfigureBundleAsync(BundleConfigurationContext context)
+    { PreConfigureBundle(context); return Task.CompletedTask; }
+    public virtual void PreConfigureBundle(BundleConfigurationContext context) { }
+
+    public virtual Task ConfigureBundleAsync(BundleConfigurationContext context)
+    { ConfigureBundle(context); return Task.CompletedTask; }
+    public virtual void ConfigureBundle(BundleConfigurationContext context) { }
+
+    public virtual Task PostConfigureBundleAsync(BundleConfigurationContext context)
+    { PostConfigureBundle(context); return Task.CompletedTask; }
+    public virtual void PostConfigureBundle(BundleConfigurationContext context) { }
+
+    public virtual Task ConfigureDynamicResourcesAsync(BundleConfigurationContext context)
+    { ConfigureDynamicResources(context); return Task.CompletedTask; }
+    public virtual void ConfigureDynamicResources(BundleConfigurationContext context) { }
+}
+```
+
+A minimal real contributor:
+
+```csharp
+[DependsOn(typeof(CoreScriptContributor))]
+public class JQueryScriptContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains("/libs/jquery/jquery.js");
+        context.Files.AddIfNotContains("/libs/abp/jquery/abp.jquery.js");
+    }
+}
+```
+
+`BundleFileContributor` provides a tiny shortcut for "add these literal
+files" contributors that don't need to look at the context.
+
+## BundleConfigurationContext
+
+The context object passed to every contributor exposes the running file
+list, the `IFileProvider` the bundler reads from, and the
+`IServiceProvider` for resolving framework services.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleConfigurationContext.cs"
+public class BundleConfigurationContext : IBundleConfigurationContext
+{
+    public List<BundleFile> Files { get; }
+    public IFileProvider    FileProvider { get; }
+    public IServiceProvider ServiceProvider { get; }
+    public IAbpLazyServiceProvider LazyServiceProvider { get; }
+
+    public BundleConfigurationContext(IServiceProvider serviceProvider, IFileProvider fileProvider)
+    {
+        Files               = new List<BundleFile>();
+        ServiceProvider     = serviceProvider;
+        LazyServiceProvider = ServiceProvider.GetRequiredService<IAbpLazyServiceProvider>();
+        FileProvider        = fileProvider;
+    }
+}
+```
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/IBundleConfigurationContext.cs"
+public interface IBundleConfigurationContext : IServiceProviderAccessor
+{
+    List<BundleFile> Files { get; }
+}
+```
+
+Dynamic resource contributors typically resolve options through
+`LazyServiceProvider`, look up the current culture, and pick the matching
+language file from disk:
+
+```csharp
+public override void ConfigureDynamicResources(BundleConfigurationContext context)
+{
+    var localizationOptions = context.LazyServiceProvider
+        .LazyGetRequiredService<IOptions<AbpLocalizationOptions>>().Value;
+
+    var fileName = localizationOptions.GetCurrentUICultureLanguageFilesMap(PackageName);
+    var filePath = $"/libs/bootstrap-datepicker/locales/bootstrap-datepicker.{fileName}.min.js";
+
+    if (context.FileProvider.GetFileInfo(filePath).Exists)
+    {
+        context.Files.AddIfNotContains(filePath);
+    }
+}
+```
+
+## BundleFile
+
+`BundleFile` is the value object representing a single file inside the
+context. It tracks whether the file is an absolute external URL —
+`https://` / `http://` — so the bundler can leave it untouched.
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleFile.cs"
+public class BundleFile : IEquatable<BundleFile>, IComparable<BundleFile>
+{
+    public string FileName     { get; }
+    public bool   IsExternalFile { get; }
+
+    public BundleFile(string fileName)
+    {
+        FileName = fileName;
+        IsExternalFile =
+            fileName.StartsWith("http://",  StringComparison.OrdinalIgnoreCase) ||
+            fileName.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public BundleFile(string fileName, bool isExternalFile) { /* ... */ }
+
+    public static implicit operator BundleFile(string fileName) => new BundleFile(fileName);
+
+    // Equality + comparison by FileName
+}
+```
+
+An implicit conversion from `string` keeps contributor code terse:
+`context.Files.AddIfNotContains("/libs/abp/core/abp.js")` works because the
+string is coerced into a `BundleFile` automatically.
+
+### ScriptBundleConfiguration?
+
+There is **no** separate `ScriptBundleConfiguration` or
+`StyleBundleConfiguration` type. The same `BundleConfiguration` is used for
+both — the only difference is which collection of `AbpBundlingOptions`
+holds it (`ScriptBundles` vs `StyleBundles`). The runtime picks the
+matching `IBundler` (`ScriptBundler` for `.js`, `StyleBundler` for `.css`)
+based on that, not on the configuration type.
+
+## File inventory — `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions`
+
+| File | Purpose |
+| --- | --- |
+| `AbpAspNetCoreMvcUiBundlingAbstractionsModule.cs` | Empty marker module |
+| `AbpBundlingOptions.cs` | Root options: bundles, mode, defer/preload defaults |
+| `BundleConfiguration.cs` | One named bundle (name + contributors + base bundles) |
+| `BundleConfigurationCollection.cs` | Thread‑safe collection with lazy/`Configure`/`ConfigureAll` semantics |
+| `BundleConfigurationExtensions.cs` | Fluent helpers: `AddFiles`, `AddExternalFiles`, `AddContributors`, `AddBaseBundles` |
+| `IBundleContributor.cs` | Contributor contract (4 phases) |
+| `BundleContributor.cs` | Convenience base with sync/async overrides |
+| `BundleFileContributor.cs` | "Add these literal files" base |
+| `BundleContributorCollection.cs` | Dependency‑aware contributor list with `Replace`/`Remove` |
+| `BundleContributorCollectionExtensions.cs` | `AddFiles`/`AddExternalFiles` shortcuts on the collection |
+| `BundleConfigurationContext.cs` / `IBundleConfigurationContext.cs` | Per‑bundle context passed to contributors |
+| `BundleFile.cs` | Value object with implicit string conversion + external detection |
+| `BundlingMode.cs` | None / Auto / Bundle / BundleAndMinify enum |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Bundling" href="/ui-mvc/bundling">
+    The runtime that consumes this model — BundleManager, IBundleCache,
+    bundlers, and the abp-script-bundle / abp-style-bundle tag helpers.
+  </Card>
+  <Card title="Packages &amp; tag helpers" href="/ui-mvc/packages-tag-helpers">
+    Real contributors for jQuery, Bootstrap, DataTables, Select2 and
+    friends — concrete uses of every type on this page.
+  </Card>
+  <Card title="Theme.Shared" href="/ui-mvc/theme-shared">
+    StandardBundles + SharedThemeGlobalScriptContributor /
+    SharedThemeGlobalStyleContributor.
+  </Card>
+  <Card title="Virtual File System" href="/vfs/overview">
+    The IFileProvider exposed on BundleConfigurationContext.
+  </Card>
+</CardGroup>

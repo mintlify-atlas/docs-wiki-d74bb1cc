@@ -1,0 +1,394 @@
+---
+title: "Permission Management Domain: Grant, Manager, Providers"
+sidebarTitle: "Domain"
+description: "Reference for PermissionGrant, IPermissionManager, PermissionStore, the IPermissionManagementProvider chain, and StaticPermissionSaver."
+---
+
+`Volo.Abp.PermissionManagement.Domain` is the heart of the module. It defines the only persisted entity (`PermissionGrant`), the `IPermissionManager` write surface, the cached `PermissionStore` that replaces the framework's `NullPermissionStore`, the pluggable `IPermissionManagementProvider` chain that knows how to read/write grants for *one kind of subject*, and the `StaticPermissionSaver` background job that pushes statically-defined permissions from C# providers into the database for cross-host discovery. This page walks each type with its real source signature and shows how they wire together in `AbpPermissionManagementDomainModule`.
+
+For the framework abstractions the types here implement (`IPermissionStore`, `IPermissionDefinitionManager`, `IPermissionChecker`), see [Permission System](/authz/permission-system). For the smaller overview that doubles as an authorization-stack entry point, see [Permission Management Module](/authz/permission-management-module).
+
+## File inventory
+
+The table below lists every type that lives in `Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/` together with what it does at runtime.
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpPermissionManagementDomainModule.cs` | module | `[DependsOn]` wiring, dynamic-store bootstrap, options defaults. |
+| `AbpPermissionManagementDbProperties.cs` | static | `DbTablePrefix`, `DbSchema`, `ConnectionStringName = "AbpPermissionManagement"`. |
+| `PermissionManagementOptions.cs` | options | `ManagementProviders`, `ProviderPolicies`, `SaveStaticPermissionsToDatabase`, `IsDynamicPermissionStoreEnabled`. |
+| `PermissionGrant.cs` | entity | The persisted grant row (`Id`, `TenantId`, `Name`, `ProviderName`, `ProviderKey`). |
+| `IPermissionGrantRepository.cs` | repo | `FindAsync`, `GetListAsync(provider/key)`, `GetListAsync(names, provider/key)`. |
+| `IPermissionManager.cs` / `PermissionManager.cs` | service | High-level read/write API used by the application layer. |
+| `PermissionStore.cs` | service | `IPermissionStore` impl backed by repo + cache. |
+| `PermissionGrantCacheItem.cs` | cache | DTO + cache-key formatter `pn:{0},pk:{1},n:{2}`. |
+| `PermissionGrantCacheItemInvalidator.cs` | event handler | Drops cache rows on `EntityChangedEventData<PermissionGrant>`. |
+| `IPermissionManagementProvider.cs` / `PermissionManagementProvider.cs` | strategy | One per "kind of subject"; concrete subclasses live in consuming modules. |
+| `PermissionWithGrantedProviders.cs` / `MultiplePermissionWithGrantedProviders.cs` | DTO | Result shape returned by `PermissionManager.GetAsync`. |
+| `PermissionValueProviderGrantInfo.cs` / `MultiplePermissionValueProviderGrantInfo.cs` | DTO | Per-provider grant info used inside `Check` calls. |
+| `PermissionValueProviderInfo.cs` | DTO | `(Name, Key)` pair for a "who granted it" row. |
+| `IStaticPermissionSaver.cs` / `StaticPermissionSaver.cs` | service | Pushes `PermissionDefinitionRecord`s into the DB and signals the dynamic cache. |
+| `IPermissionDefinitionSerializer.cs` / `PermissionDefinitionSerializer.cs` | service | Maps `PermissionDefinition` → `PermissionDefinitionRecord`. |
+| `IPermissionDefinitionRecordRepository.cs` / `IPermissionGroupDefinitionRecordRepository.cs` | repo | Persistence for *definition* records (the catalog table). |
+| `PermissionDefinitionRecord.cs` / `PermissionGroupDefinitionRecord.cs` | entity | Definition rows in the `Permissions` and `PermissionGroups` tables. |
+| `DynamicPermissionDefinitionStore.cs` / `DynamicPermissionDefinitionStoreInMemoryCache.cs` | store | Cross-host definition discovery via repository + memory cache. |
+| `IDynamicPermissionDefinitionStoreInMemoryCache.cs` | interface | Singleton cache surface used by the dynamic store. |
+| `PermissionFinder.cs` | service | Default `IPermissionFinder` that walks the local definition + grant tables. |
+| `PermissionDataSeeder.cs` / `PermissionDataSeedContributor.cs` | seed | Grants permissions to a provider/key during data seeding. |
+
+## Module class
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/AbpPermissionManagementDomainModule.cs
+[DependsOn(typeof(AbpAuthorizationModule))]
+[DependsOn(typeof(AbpDddDomainModule))]
+[DependsOn(typeof(AbpPermissionManagementDomainSharedModule))]
+[DependsOn(typeof(AbpCachingModule))]
+[DependsOn(typeof(AbpJsonModule))]
+public class AbpPermissionManagementDomainModule : AbpModule
+{
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private Task _initializeDynamicPermissionsTask;
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        if (context.Services.IsDataMigrationEnvironment())
+        {
+            Configure<PermissionManagementOptions>(options =>
+            {
+                options.SaveStaticPermissionsToDatabase = false;
+                options.IsDynamicPermissionStoreEnabled = false;
+            });
+        }
+    }
+
+    public override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        InitializeDynamicPermissions(context);
+        return Task.CompletedTask;
+    }
+}
+```
+
+`InitializeDynamicPermissions` launches a `Task.Run` that opens a scope, runs `StaticPermissionSaver.SaveAsync()` under a Polly retry policy, then pre-caches the dynamic store. The retry wrapper handles the common case where multiple application hosts boot at the same time and race for the distributed lock the saver takes internally.
+
+`AbpPermissionManagementDbProperties` exposes the connection-string name and table prefix used by both EF Core and MongoDB:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/AbpPermissionManagementDbProperties.cs
+public static class AbpPermissionManagementDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpPermissionManagement";
+}
+```
+
+## The `PermissionGrant` aggregate
+
+There is only one entity that admins edit through the management UI. Every other piece in this layer revolves around it.
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionGrant.cs
+public class PermissionGrant : Entity<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+
+    [NotNull]
+    public virtual string Name { get; protected set; }
+
+    [NotNull]
+    public virtual string ProviderName { get; protected set; }
+
+    [CanBeNull]
+    public virtual string ProviderKey { get; protected internal set; }
+
+    public PermissionGrant(
+        Guid id,
+        [NotNull] string name,
+        [NotNull] string providerName,
+        [CanBeNull] string providerKey,
+        Guid? tenantId = null)
+    {
+        Id = id;
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+        ProviderName = Check.NotNullOrWhiteSpace(providerName, nameof(providerName));
+        ProviderKey = providerKey;
+        TenantId = tenantId;
+    }
+}
+```
+
+Notes:
+
+- It is intentionally an entity, not an aggregate root. The TODO comment in source suggests this may change; for now the repository lives in this module.
+- `IMultiTenant` makes the grant tenant-scoped: a host-level admin and a tenant-level admin can grant the same permission to the same role independently.
+- `ProviderKey` is *nullable* in C# but the EF Core mapping marks it `IsRequired()` — most consumers prefer empty string over `null`, and providers like `GlobalSettingManagementProvider` use that distinction (see [Setting management domain](/modules/setting-management/domain) for the equivalent pattern).
+- Column lengths come from `PermissionDefinitionRecordConsts.MaxNameLength` (128) and `PermissionGrantConsts.MaxProviderNameLength` / `MaxProviderKeyLength` (64 each).
+
+The matching repository contract:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/IPermissionGrantRepository.cs
+public interface IPermissionGrantRepository : IBasicRepository<PermissionGrant, Guid>
+{
+    Task<PermissionGrant> FindAsync(string name, string providerName, string providerKey, CancellationToken cancellationToken = default);
+    Task<List<PermissionGrant>> GetListAsync(string providerName, string providerKey, CancellationToken cancellationToken = default);
+    Task<List<PermissionGrant>> GetListAsync(string[] names, string providerName, string providerKey, CancellationToken cancellationToken = default);
+}
+```
+
+EF Core and MongoDB implementations of this interface are documented in [Persistence](/modules/permission-management/persistence).
+
+## `IPermissionManager`: the write surface
+
+This is the API the management UI talks to. It is the only place that orchestrates *all* the management providers — every read returns "where did this grant come from?" and every write knows how to route to the right provider.
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/IPermissionManager.cs
+public interface IPermissionManager
+{
+    Task<PermissionWithGrantedProviders> GetAsync(string permissionName, string providerName, string providerKey);
+
+    Task<MultiplePermissionWithGrantedProviders> GetAsync(string[] permissionNames, string provideName, string providerKey);
+
+    Task<List<PermissionWithGrantedProviders>> GetAllAsync([NotNull] string providerName, [NotNull] string providerKey);
+
+    Task SetAsync(string permissionName, string providerName, string providerKey, bool isGranted);
+
+    Task<PermissionGrant> UpdateProviderKeyAsync(PermissionGrant permissionGrant, string providerKey);
+
+    Task DeleteAsync(string providerName, string providerKey);
+}
+```
+
+The default implementation `PermissionManager` is registered as `ISingletonDependency`. It composes:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionManager.cs
+public class PermissionManager : IPermissionManager, ISingletonDependency
+{
+    protected IPermissionGrantRepository PermissionGrantRepository { get; }
+    protected IPermissionDefinitionManager PermissionDefinitionManager { get; }
+    protected ISimpleStateCheckerManager<PermissionDefinition> SimpleStateCheckerManager { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+    protected IReadOnlyList<IPermissionManagementProvider> ManagementProviders => _lazyProviders.Value;
+    protected PermissionManagementOptions Options { get; }
+    protected IDistributedCache<PermissionGrantCacheItem> Cache { get; }
+    // ...
+}
+```
+
+A `Lazy<List<IPermissionManagementProvider>>` is built from `Options.ManagementProviders` and resolved through the root service provider, which means providers can themselves be transient or scoped without the singleton manager capturing scope state.
+
+### Get flow
+
+`GetAsync(name, providerName, providerKey)` resolves the `PermissionDefinition` from `IPermissionDefinitionManager` (returns `IsGranted = false` if the definition does not exist), then walks the management-provider list and asks each one whether it sees the grant. The composite result includes *every* provider that returned `true`, not just the first — the UI uses this to render "granted via role X" badges next to a user-level checkbox. See [Application](/modules/permission-management/application) for how the UI consumes that shape.
+
+### Set flow
+
+`SetAsync(name, providerName, providerKey, isGranted)` walks the provider list in reverse, finds the one whose `Name` matches the requested `providerName`, and asks it to write. Other providers are *not* invoked — granting at the role level only writes the `(role, X)` row; the user-level row is untouched.
+
+`UpdateProviderKeyAsync(grant, newProviderKey)` is the rename hook — for example, when an Identity role is renamed, the role permission management provider re-keys every existing `PermissionGrant` row under the new key in one batch.
+
+`DeleteAsync(providerName, providerKey)` removes *all* grants for a subject (used when a role or user is deleted).
+
+## `PermissionStore`: the read-side cache
+
+The framework checker resolves grants through `IPermissionStore`. The default `NullPermissionStore` always returns `false`; pulling in this module replaces it with `PermissionStore`:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionStore.cs
+public class PermissionStore : IPermissionStore, ITransientDependency
+{
+    protected IPermissionGrantRepository PermissionGrantRepository { get; }
+    protected IPermissionDefinitionManager PermissionDefinitionManager { get; }
+    protected IDistributedCache<PermissionGrantCacheItem> Cache { get; }
+
+    public virtual async Task<bool> IsGrantedAsync(string name, string providerName, string providerKey)
+    {
+        return (await GetCacheItemAsync(name, providerName, providerKey)).IsGranted;
+    }
+}
+```
+
+`GetCacheItemAsync` follows the classic ABP read-through pattern:
+
+1. Compute `pn:{providerName},pk:{providerKey},n:{name}` from `PermissionGrantCacheItem.CalculateCacheKey`.
+2. Hit `IDistributedCache<PermissionGrantCacheItem>`.
+3. On miss, ask `IPermissionDefinitionManager` for every permission name available for this provider, then ask `IPermissionGrantRepository.GetListAsync(names, providerName, providerKey)` for the subset that is granted. Both granted *and* not-granted entries are written to the cache so the second call avoids a second round trip.
+
+### Cache invalidation
+
+The matching `PermissionGrantCacheItemInvalidator` listens for `EntityChangedEventData<PermissionGrant>` on the local event bus and removes the affected key:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionGrantCacheItemInvalidator.cs
+public class PermissionGrantCacheItemInvalidator :
+    ILocalEventHandler<EntityChangedEventData<PermissionGrant>>,
+    ITransientDependency
+{
+    public virtual async Task HandleEventAsync(EntityChangedEventData<PermissionGrant> eventData)
+    {
+        var cacheKey = CalculateCacheKey(
+            eventData.Entity.Name,
+            eventData.Entity.ProviderName,
+            eventData.Entity.ProviderKey);
+        // ...
+    }
+}
+```
+
+That is enough for a single-process host. For a fleet of hosts behind a Redis distributed cache, the cache is shared and the entry vanishes from every node automatically.
+
+### Cache item shape
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionGrantCacheItem.cs
+[Serializable]
+public class PermissionGrantCacheItem
+{
+    private const string CacheKeyFormat = "pn:{0},pk:{1},n:{2}";
+
+    public bool IsGranted { get; set; }
+
+    public static string CalculateCacheKey(string name, string providerName, string providerKey)
+        => string.Format(CacheKeyFormat, providerName, providerKey, name);
+}
+```
+
+The key format is also used by the invalidator and by debugging logs.
+
+## `IPermissionManagementProvider` — one per kind of subject
+
+The provider chain is what makes the module pluggable. Each implementation owns one `Name` (matching the framework-side `IPermissionValueProvider.Name`) and writes a single shape of row.
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/IPermissionManagementProvider.cs
+public interface IPermissionManagementProvider : ISingletonDependency
+{
+    string Name { get; }
+
+    Task<PermissionValueProviderGrantInfo> CheckAsync([NotNull] string name, [NotNull] string providerName, [NotNull] string providerKey);
+    Task<MultiplePermissionValueProviderGrantInfo> CheckAsync([NotNull] string[] names, [NotNull] string providerName, [NotNull] string providerKey);
+    Task SetAsync([NotNull] string name, [NotNull] string providerKey, bool isGranted);
+}
+```
+
+### The abstract base class
+
+`PermissionManagementProvider` implements 90% of the contract against `IPermissionGrantRepository`:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionManagementProvider.cs
+public abstract class PermissionManagementProvider : IPermissionManagementProvider
+{
+    public abstract string Name { get; }
+
+    protected IPermissionGrantRepository PermissionGrantRepository { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public virtual async Task<MultiplePermissionValueProviderGrantInfo> CheckAsync(
+        string[] names, string providerName, string providerKey)
+    {
+        var multiplePermissionValueProviderGrantInfo = new MultiplePermissionValueProviderGrantInfo(names);
+        if (providerName != Name)
+        {
+            return multiplePermissionValueProviderGrantInfo;
+        }
+
+        var permissionGrants = await PermissionGrantRepository.GetListAsync(names, providerName, providerKey);
+
+        foreach (var permissionName in names)
+        {
+            var isGrant = permissionGrants.Any(x => x.Name == permissionName);
+            multiplePermissionValueProviderGrantInfo.Result[permissionName] =
+                new PermissionValueProviderGrantInfo(isGrant, providerKey);
+        }
+
+        return multiplePermissionValueProviderGrantInfo;
+    }
+
+    public virtual Task SetAsync(string name, string providerKey, bool isGranted)
+        => isGranted ? GrantAsync(name, providerKey) : RevokeAsync(name, providerKey);
+}
+```
+
+Concrete subclasses only need to declare `Name` and (optionally) override `GrantAsync` / `RevokeAsync` if they want side effects. Examples (live outside this module):
+
+| Provider | `Name` | Shipped in |
+| --- | --- | --- |
+| `UserPermissionManagementProvider` | `"U"` | `Volo.Abp.PermissionManagement.Domain.Identity` |
+| `RolePermissionManagementProvider` | `"R"` | `Volo.Abp.PermissionManagement.Domain.Identity` |
+| `ClientPermissionManagementProvider` | `"C"` | `Volo.Abp.PermissionManagement.Domain.OpenIddict` |
+
+To add a new subject kind — for example a "team" or "device group" — write a `PermissionDefinitionProvider` (framework) and a `PermissionManagementProvider` subclass, then register both in `PermissionManagementOptions.ManagementProviders` and the framework's `AbpPermissionOptions.ValueProviders`. The UI picks the new tab up automatically because `PermissionAppService.GetAsync` filters group permissions by `Providers.Contains(providerName)`.
+
+## `StaticPermissionSaver` and the dynamic store
+
+Permissions declared in C# only live in *that* host's `IStaticPermissionDefinitionStore`. For multi-host setups (microservices) you need every host to see every permission so its own UI can render checkboxes for it. The module solves this with two cooperating pieces:
+
+1. `StaticPermissionSaver` runs at startup, serializes the local `PermissionDefinition`s into `PermissionDefinitionRecord` rows, and pushes them through `IPermissionDefinitionRecordRepository`/`IPermissionGroupDefinitionRecordRepository`.
+2. `DynamicPermissionDefinitionStore` reads those records and merges them into `IPermissionDefinitionManager` alongside the local static store.
+
+The saver constructor shows the contract:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/StaticPermissionSaver.cs
+public class StaticPermissionSaver : IStaticPermissionSaver, ITransientDependency
+{
+    protected IStaticPermissionDefinitionStore StaticStore { get; }
+    protected IPermissionGroupDefinitionRecordRepository PermissionGroupRepository { get; }
+    protected IPermissionDefinitionRecordRepository PermissionRepository { get; }
+    protected IPermissionDefinitionSerializer PermissionSerializer { get; }
+    protected IDistributedCache Cache { get; }
+    protected IApplicationInfoAccessor ApplicationInfoAccessor { get; }
+    protected IAbpDistributedLock DistributedLock { get; }
+    protected AbpPermissionOptions PermissionOptions { get; }
+    protected ICancellationTokenProvider CancellationTokenProvider { get; }
+    protected AbpDistributedCacheOptions CacheOptions { get; }
+    protected IUnitOfWorkManager UnitOfWorkManager { get; }
+}
+```
+
+Key behaviours:
+
+- **`IAbpDistributedLock`** prevents two hosts from racing on the same write. Whichever host wins the lock pushes the diff; everyone else short-circuits.
+- **`IApplicationInfoAccessor.ApplicationName`** is used as a hash key so each application only updates its *own* slice of the catalog. Two applications can each define `"Books.Authors.Edit"` without trampling each other.
+- **`IDistributedCache`** stores the last-pushed hash so a no-op startup is a single cache read.
+- **`SaveStaticPermissionsToDatabase = false`** in `PermissionManagementOptions` disables the whole job — handy for read-only nodes or migration runners.
+
+The dynamic side is gated by `IsDynamicPermissionStoreEnabled`. Once enabled, `DynamicPermissionDefinitionStore` plus `DynamicPermissionDefinitionStoreInMemoryCache` keep an in-memory snapshot of every definition record and refresh it on a TTL.
+
+## Definition records
+
+The catalog tables are owned by this module even though they describe data the framework also knows about:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionDefinitionRecord.cs
+public class PermissionDefinitionRecord : BasicAggregateRoot<Guid>
+{
+    public virtual string GroupName { get; protected set; }
+    public virtual string Name { get; protected set; }
+    public virtual string ParentName { get; protected set; }
+    public virtual string DisplayName { get; protected set; }
+    public virtual bool IsEnabled { get; set; }
+    public virtual MultiTenancySides MultiTenancySide { get; set; }
+    public virtual string Providers { get; protected set; }
+    public virtual string StateCheckers { get; protected set; }
+    // + ExtraProperties dictionary
+}
+```
+
+`Providers` and `StateCheckers` are stored as comma-joined strings; the dynamic store splits them when it builds the in-memory `PermissionDefinition`. Lengths are configurable via `PermissionDefinitionRecordConsts`.
+
+## Options
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionManagementOptions.cs
+public class PermissionManagementOptions
+{
+    public ITypeList<IPermissionManagementProvider> ManagementProviders { get; }
+    public Dictionary<string, string> ProviderPolicies { get; }
+    public bool SaveStaticPermissionsToDatabase { get; set; } = true;
+    public bool IsDynamicPermissionStoreEnabled { get; set; }
+}
+```
+
+`ProviderPolicies` is the small but important map that protects `PermissionAppService.UpdateAsync`. The Identity module adds `("R", IdentityPermissions.Roles.ManagePermissions)` and `("U", IdentityPermissions.Users.ManagePermissions)`; the OpenIddict module adds `("C", AbpOpenIddictPermissions.Applications.ManagePermissions)`. Without an entry here, the app service throws — defence in depth.
+
+## Cross-references
+
+- The framework abstractions you implement here (`IPermissionStore`, `IPermissionDefinitionManager`, value providers) are documented at [Permission System](/authz/permission-system).
+- The persistence side (DbContext, mappings, MongoDB collections) is in [Persistence](/modules/permission-management/persistence).
+- The `IPermissionManager` consumer in the app layer is in [Application](/modules/permission-management/application).
+- The matching pattern for *settings* — same caching, same provider chain, same dynamic store — is documented at [Setting management domain](/modules/setting-management/domain).
+- The Identity module that registers the two main concrete management providers is documented at [Identity module overview](/modules/identity/overview).

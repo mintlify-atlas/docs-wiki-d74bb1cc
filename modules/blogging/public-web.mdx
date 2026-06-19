@@ -1,0 +1,368 @@
+---
+title: "Volo.Blogging Public Web: Reader Pages and Services"
+sidebarTitle: "Public web"
+description: "How Volo.Blogging.Web exposes the reader experience: route conventions, the Index / Posts / Detail / Edit / New pages, and PostAppService."
+---
+
+`Volo.Blogging.Web` is the public reader UI of the Volo.Blogging module.
+It wires up a small set of Razor Pages, gives them human-friendly URLs via
+custom route conventions, and binds them to `IPostAppService`,
+`IBlogAppService`, `ICommentAppService`, and `ITagAppService` from
+`Volo.Blogging.Application`. This page walks through the published URL
+surface, the page models, and the application services they call.
+
+## Reader URL surface
+
+The route prefix is configurable through `BloggingUrlOptions.RoutePrefix`
+(empty by default). With the default prefix, the following URLs are
+served:
+
+| URL | Razor page | Page model role |
+| --- | --- | --- |
+| `/Blogs` | `/Blogs/Index.cshtml` | Lists all `Blog`s; if there is exactly one, redirects to it |
+| `/{blogShortName}` | `/Blogs/Posts/Index.cshtml` | Lists posts for the blog, plus popular tags |
+| `/{blogShortName}/{postUrl}` | `/Blogs/Posts/Detail.cshtml` | Renders a single post with comments and latest posts |
+| `/{blogShortName}/posts/new` | `/Blogs/Posts/New.cshtml` | Creates a new post (authoring, authorized) |
+| `/{blogShortName}/posts/{postId}/edit` | `/Blogs/Posts/Edit.cshtml` | Edits an existing post |
+| `/members/{userName}` | `/Members/Index.cshtml` | Profile page for a `BlogUser` |
+
+The `{blogShortName:blogNameConstraint}` segment is matched by a custom
+`BloggingRouteConstraint` so that prefixes such as `bundles` or other
+framework reserved paths cannot collide with a blog name. The exact set of
+blocked prefixes is set via `BloggingUrlOptions.IgnoredPaths`:
+
+```csharp Volo.Blogging.Web/BloggingWebModule.cs
+Configure<BloggingUrlOptions>(options =>
+{
+    var bundlingOptions = context.Services
+        .GetRequiredService<IOptions<AbpBundlingOptions>>().Value;
+    if (bundlingOptions.Mode != BundlingMode.None)
+    {
+        options.IgnoredPaths.Add(bundlingOptions.BundleFolderName);
+    }
+
+    options.IgnoredPaths.AddRange(new[]
+    {
+        "error", "ApplicationConfigurationScript", "ServiceProxyScript",
+        "Languages/Switch", "ApplicationLocalizationScript"
+    });
+});
+
+Configure<RazorPagesOptions>(options =>
+{
+    var urlOptions = context.Services
+        .GetRequiredServiceLazy<IOptions<BloggingUrlOptions>>()
+        .Value.Value;
+    var routePrefix = urlOptions.RoutePrefix;
+
+    options.Conventions.AddPageRoute("/Blogs/Posts/Index",
+        routePrefix + "{blogShortName:blogNameConstraint}");
+    options.Conventions.AddPageRoute("/Blogs/Posts/Detail",
+        routePrefix + "{blogShortName:blogNameConstraint}/{postUrl}");
+    options.Conventions.AddPageRoute("/Blogs/Posts/Edit",
+        routePrefix + "{blogShortName}/posts/{postId}/edit");
+    options.Conventions.AddPageRoute("/Blogs/Posts/New",
+        routePrefix + "{blogShortName}/posts/new");
+    options.Conventions.AddPageRoute("/Members/Index",
+        routePrefix + "members/{userName}");
+});
+```
+
+## Page inventory
+
+| File | Page model | Notes |
+| --- | --- | --- |
+| `Pages/Blogs/Index.cshtml(.cs)` | `Volo.Blogging.Pages.Blog.IndexModel` | Multi-blog landing; single-blog redirect |
+| `Pages/Blogs/Posts/Index.cshtml(.cs)` | `Volo.Blogging.Pages.Blog.Posts.IndexModel` | Blog home + popular tags |
+| `Pages/Blogs/Posts/Detail.cshtml(.cs)` | `Volo.Blogging.Pages.Blog.Posts.DetailModel` | Article + comments + latest posts |
+| `Pages/Blogs/Posts/New.cshtml(.cs)` | `Volo.Blogging.Pages.Blog.Posts.NewModel` | Create post form |
+| `Pages/Blogs/Posts/Edit.cshtml(.cs)` | `Volo.Blogging.Pages.Blog.Posts.EditModel` | Edit post form |
+| `Pages/Members/Index.cshtml(.cs)` | `Volo.Blogging.Pages.Members.IndexModel` | Profile view |
+| `Pages/Blogs/BloggingPageModel.cs` | base page model | Sets localization resource |
+| `Pages/Blogs/Shared/Helpers/BlogNameControlHelper.cs` | helper | Rejects reserved file-format names |
+| `Areas/Blog/Controllers/PostsController.cs` | MVC controller | AJAX endpoints for the reader UI |
+| `Areas/Blog/Controllers/CommentsController.cs` | MVC controller | AJAX endpoints for replies / new comments |
+| `Areas/Blog/Helpers/TagHelpers/GravatarTagHelper.cs` | Razor tag helper | Renders Gravatar for an email |
+| `Bundling/Prismjs*BundleContributorBloggingExtension.cs` | bundle contributors | Add blogging-specific Prism languages |
+
+## Index page
+
+The blogs index lists every published blog. If there is only one blog
+configured (the typical case), it redirects straight to that blog's home
+page:
+
+```csharp Volo.Blogging.Web/Pages/Blogs/Index.cshtml.cs
+public class IndexModel : AbpPageModel
+{
+    private readonly IBlogAppService _blogAppService;
+
+    public IReadOnlyList<BlogDto> Blogs { get; private set; }
+
+    public IndexModel(IBlogAppService blogAppService) =>
+        _blogAppService = blogAppService;
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        var result = await _blogAppService.GetListAsync();
+
+        if (result.Items.Count == 1)
+        {
+            var blog = result.Items[0];
+            return RedirectToPage("./Posts/Index",
+                new { blogShortName = blog.ShortName });
+        }
+
+        Blogs = result.Items;
+        return Page();
+    }
+}
+```
+
+The corresponding `IBlogAppService` exposes just three reads — the
+service is intentionally thin:
+
+```csharp Volo.Blogging.Application/Volo/Blogging/Blogs/BlogAppService.cs
+public virtual async Task<ListResultDto<BlogDto>> GetListAsync()      { /* ... */ }
+public virtual async Task<BlogDto> GetByShortNameAsync(string shortName) { /* ... */ }
+public virtual async Task<BlogDto> GetAsync(Guid id)                  { /* ... */ }
+```
+
+## Posts index page
+
+`Posts/Index.cshtml.cs` is the blog home page. It binds the
+`{blogShortName}` route value, resolves the blog, fetches posts (optionally
+filtered by `TagName`), and pulls popular tags:
+
+```csharp Volo.Blogging.Web/Pages/Blogs/Posts/Index.cshtml.cs
+public class IndexModel : BloggingPageModel
+{
+    private readonly IPostAppService _postAppService;
+    private readonly IBlogAppService _blogAppService;
+    private readonly ITagAppService _tagAppService;
+
+    [BindProperty(SupportsGet = true)] public string BlogShortName { get; set; }
+    [BindProperty(SupportsGet = true)] public string TagName { get; set; }
+
+    public BlogDto Blog { get; set; }
+    public IReadOnlyList<PostWithDetailsDto> Posts { get; set; }
+    public IReadOnlyList<TagDto> PopularTags { get; set; }
+
+    public IndexModel(IPostAppService postAppService,
+                      IBlogAppService blogAppService,
+                      ITagAppService tagAppService)
+    {
+        _postAppService = postAppService;
+        _blogAppService = blogAppService;
+        _tagAppService = tagAppService;
+    }
+
+    public virtual async Task<ActionResult> OnGetAsync()
+    {
+        if (BlogNameControlHelper.IsProhibitedFileFormatName(BlogShortName))
+            return NotFound();
+
+        try
+        {
+            Blog = await _blogAppService.GetByShortNameAsync(BlogShortName);
+        }
+        catch (EntityNotFoundException)
+        {
+            return RedirectToPage("/Blogs/Index");
+        }
+
+        Posts = (await _postAppService.GetListByBlogIdAndTagNameAsync(
+                    Blog.Id, TagName)).Items;
+        PopularTags = await _tagAppService.GetPopularTagsAsync(Blog.Id,
+            new GetPopularTagsInput { ResultCount = 10, MinimumPostCount = 2 });
+
+        return Page();
+    }
+}
+```
+
+Two protections are baked in:
+
+1. `BlogNameControlHelper.IsProhibitedFileFormatName(BlogShortName)`
+   blocks any short name that ends in a known file extension, so requests
+   to e.g. `/site.css` cannot reach the dynamic route.
+2. An `EntityNotFoundException` from `GetByShortNameAsync` redirects to
+   the blogs index rather than 404'ing — useful when configurations
+   change blog short names.
+
+## Detail page
+
+`/Blogs/Posts/Detail` is the most feature-rich page: it loads the post,
+its comments (hierarchically), the blog, the related-posts list, and the
+latest posts for the side rail. It also accepts a posted comment via
+`OnPostNewCommentAsync` (not shown here for brevity).
+
+```csharp Volo.Blogging.Web/Pages/Blogs/Posts/Detail.cshtml.cs
+public class DetailModel : BloggingPageModel
+{
+    private readonly IPostAppService _postAppService;
+    private readonly IBlogAppService _blogAppService;
+    private readonly ICommentAppService _commentAppService;
+
+    [BindProperty(SupportsGet = true)] public string BlogShortName { get; set; }
+    [BindProperty(SupportsGet = true)] public string PostUrl { get; set; }
+    [BindProperty(SupportsGet = true)] public string TagName { get; set; }
+
+    [BindProperty] public PostDetailsViewModel NewComment { get; set; }
+    [HiddenInput] public Guid FocusCommentId { get; set; }
+
+    public PostWithDetailsDto Post { get; set; }
+    public IReadOnlyList<CommentWithRepliesDto> CommentsWithReplies { get; set; }
+    public BlogDto Blog { get; set; }
+    public List<PostWithDetailsDto> PostsList { get; set; }
+    public IReadOnlyList<PostWithDetailsDto> LatestPosts { get; set; }
+    public int CommentCount { get; set; }
+
+    public DetailModel(IPostAppService postAppService,
+                       IBlogAppService blogAppService,
+                       ICommentAppService commentAppService)
+    {
+        _postAppService = postAppService;
+        _blogAppService = blogAppService;
+        _commentAppService = commentAppService;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        if (BlogNameControlHelper.IsProhibitedFileFormatName(BlogShortName))
+            return NotFound();
+        // ... loads Blog by short name, Post by URL, comments, related lists.
+    }
+}
+```
+
+Loading the post by URL goes through `IPostAppService.GetForReadingAsync`,
+which simultaneously increments the post's read counter and returns the
+detail DTO — so every detail page view counts as a read.
+
+## Public application services
+
+The public `Volo.Blogging.Application` package exposes four services that
+the pages above depend on:
+
+### IPostAppService
+
+```csharp Volo.Blogging.Application/Volo/Blogging/Posts/PostAppService.cs
+public virtual async Task<ListResultDto<PostWithDetailsDto>> GetListByBlogIdAndTagNameAsync(Guid id, string tagName);
+public virtual async Task<ListResultDto<PostWithDetailsDto>> GetTimeOrderedListAsync(Guid blogId);
+public virtual async Task<PostWithDetailsDto> GetForReadingAsync(GetPostInput input);
+public virtual async Task<PostWithDetailsDto> GetAsync(Guid id);
+public virtual async Task DeleteAsync(Guid id);
+public virtual async Task<PostWithDetailsDto> UpdateAsync(Guid id, UpdatePostDto input);
+public virtual async Task<List<PostWithDetailsDto>> GetListByUserIdAsync(Guid userId);
+public virtual async Task<List<PostWithDetailsDto>> GetLatestBlogPostsAsync(Guid blogId, int count);
+public virtual async Task<PostWithDetailsDto> CreateAsync(CreatePostDto input);
+```
+
+Mutation methods (`Create`, `Update`, `Delete`) honour the
+`BloggingUpdatePolicy` and `BloggingDeletePolicy` policies registered by
+`BloggingApplicationModule`. The handlers (`PostAuthorizationHandler`,
+`CommentAuthorizationHandler`) live alongside the services and check that
+the current user is the author of the entity being mutated.
+
+### ICommentAppService
+
+```csharp Volo.Blogging.Application/Volo/Blogging/Comments/CommentAppService.cs
+public virtual async Task<List<CommentWithRepliesDto>>
+    GetHierarchicalListOfPostAsync(Guid postId);
+public virtual async Task<CommentWithDetailsDto> CreateAsync(CreateCommentDto input);
+public virtual async Task<CommentWithDetailsDto> UpdateAsync(Guid id, UpdateCommentDto input);
+public virtual async Task DeleteAsync(Guid id);
+```
+
+Comments are returned as a flattened tree (`CommentWithRepliesDto`), which
+the detail page renders recursively.
+
+### ITagAppService
+
+`TagAppService` exposes per-blog tag queries — including the
+`GetPopularTagsAsync` call used by the blog home page to render the tag
+cloud.
+
+### IFileAppService
+
+`FileAppService` is the upload endpoint for cover images. It is backed by
+the ABP BLOB storing infrastructure through a dedicated
+`BloggingFileContainer`. When the application is hosted with the
+[database BLOB provider](/blobs/database-provider), uploaded images live
+as `DatabaseBlob` rows; with another provider, they live wherever that
+provider stores them.
+
+## Web module wiring recap
+
+```csharp Volo.Blogging.Web/BloggingWebModule.cs
+[DependsOn(
+    typeof(BloggingApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcUiBootstrapModule),
+    typeof(AbpAspNetCoreMvcUiBundlingModule),
+    typeof(AbpAutoMapperModule)
+)]
+public class BloggingWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<BloggingWebModule>();
+        });
+
+        Configure<AbpBundleContributorOptions>(options =>
+        {
+            options.Extensions<PrismjsStyleBundleContributor>()
+                .Add<PrismjsStyleBundleContributorBloggingExtension>();
+            options.Extensions<PrismjsScriptBundleContributor>()
+                .Add<PrismjsScriptBundleContributorBloggingExtension>();
+        });
+
+        Configure<RouteOptions>(options =>
+        {
+            options.ConstraintMap.Add("blogNameConstraint",
+                typeof(BloggingRouteConstraint));
+        });
+
+        // (RazorPagesOptions and BloggingUrlOptions shown above)
+
+        Configure<DynamicJavaScriptProxyOptions>(options =>
+        {
+            options.DisableModule(BloggingRemoteServiceConsts.ModuleName);
+        });
+
+        Configure<AbpAspNetCoreMvcOptions>(options =>
+        {
+            options.ConventionalControllers
+                   .FormBodyBindingIgnoredTypes.Add(typeof(FileUploadInputDto));
+        });
+    }
+}
+```
+
+Highlights for hosting:
+
+* `Configure<RouteOptions>` registers the `blogNameConstraint`. If you
+  forget this, the route conventions above won't match anything.
+* The `FileUploadInputDto` is excluded from `[FromBody]` binding so that
+  multipart upload requests work with the cover-image endpoint.
+* `DynamicJavaScriptProxyOptions.DisableModule(...)` keeps the public
+  module out of the JS proxy generator — the reader pages talk to the
+  services in-process.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Domain" icon="cube" href="/modules/blogging/domain">
+    The aggregates and repositories that the public services read from.
+  </Card>
+  <Card title="Admin surface" icon="user-shield" href="/modules/blogging/admin">
+    Blog container management and cache eviction.
+  </Card>
+</CardGroup>
+
+* [Basic theme](/themes/basic-theme-module) — the layout the public pages
+  render inside.
+* [Database BLOB provider](/blobs/database-provider) — for storing
+  uploaded cover images in the database.
+* [CMS Kit module](/modules/cms-kit) — the modern unified replacement.

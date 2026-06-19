@@ -1,0 +1,340 @@
+---
+title: "ABP Auto API Controllers: Application Services as REST Endpoints"
+sidebarTitle: "Auto API controllers"
+description: "How AbpConventionalControllerOptions exposes IRemoteService application services as ASP.NET Core controllers without writing routes or DTO wrappers."
+---
+
+ABP's auto-API feature lets a plain application service class become a
+discoverable REST controller by adding it to an
+`AbpConventionalControllerOptions` registration. There is no
+`Microsoft.AspNetCore.Mvc.Controller` subclass, no `[Route]` attribute and
+no extra DTO wrapping &mdash; the controller is fabricated from your
+`IRemoteService` interface and the framework's URL conventions. This page
+explains the moving parts that make it work, anchored in
+`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/`.
+
+## File inventory
+
+| File | Role |
+| --- | --- |
+| `AbpConventionalControllerOptions.cs` | Top-level options bag with `ConventionalControllerSettings` |
+| `ConventionalControllerSetting.cs` | Per-assembly registration (root path, predicate, normalizers) |
+| `ConventionalControllerSettingList.cs` | Lookup by controller `Type` |
+| `AbpConventionalControllerFeatureProvider.cs` | Tells MVC that a non-`Controller` type is a controller |
+| `AbpConventionalApiControllerSpecification.cs` | Marks the resulting controllers as API controllers |
+| `AbpServiceConvention.cs` | Rewrites the `ApplicationModel` (covered in [API conventions](/web/api-conventions)) |
+
+## Who counts as a conventional controller?
+
+The base requirement is `IRemoteService` (defined in `Volo.Abp.Application`).
+`ConventionalControllerSetting.Initialize()` enumerates the configured
+assembly looking for matching types:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalControllerSetting.cs"
+public void Initialize()
+{
+    var types = Assembly.GetTypes()
+        .Where(IsRemoteService)
+        .Where(IsPreferredApplicationServiceType)
+        .WhereIf(TypePredicate != null, TypePredicate!);
+
+    foreach (var type in types)
+    {
+        ControllerTypes.Add(type);
+    }
+}
+
+private static bool IsRemoteService(Type type)
+{
+    if (!type.IsPublic || type.IsAbstract || type.IsGenericType) return false;
+
+    var remoteServiceAttr = ReflectionHelper.GetSingleAttributeOrDefault<RemoteServiceAttribute>(type);
+    if (remoteServiceAttr != null && !remoteServiceAttr.IsEnabledFor(type)) return false;
+
+    if (typeof(IRemoteService).IsAssignableFrom(type)) return true;
+
+    return false;
+}
+```
+
+Every `IApplicationService` inherits `IRemoteService` transitively, so any
+public, non-abstract, non-generic `ApplicationService` in the assembly is a
+candidate.
+
+## Adding an assembly
+
+A module exposes its application services with a single call:
+
+```csharp title="MyApplicationContractsModule.cs"
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpAspNetCoreMvcOptions>(options =>
+    {
+        options.ConventionalControllers
+            .Create(typeof(MyApplicationModule).Assembly, opts =>
+            {
+                opts.RootPath = "shop";
+                opts.RemoteServiceName = "Shop";
+                opts.ApplicationServiceTypes = ApplicationServiceTypes.ApplicationServices;
+            });
+    });
+}
+```
+
+The `Create` helper builds a `ConventionalControllerSetting`, lets you
+mutate it, then calls `Initialize` so the candidate list is locked in:
+
+```csharp title="AbpConventionalControllerOptions.cs"
+public AbpConventionalControllerOptions Create(
+    Assembly assembly,
+    Action<ConventionalControllerSetting>? optionsAction = null)
+{
+    var setting = new ConventionalControllerSetting(
+        assembly,
+        ModuleApiDescriptionModel.DefaultRootPath,
+        ModuleApiDescriptionModel.DefaultRemoteServiceName
+    );
+
+    optionsAction?.Invoke(setting);
+    setting.Initialize();
+    ConventionalControllerSettings.Add(setting);
+    return this;
+}
+```
+
+## How MVC sees the controllers
+
+ASP.NET Core MVC only treats a type as a controller if its
+`ControllerFeatureProvider` says so. ABP plugs in its own:
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/AbpConventionalControllerFeatureProvider.cs"
+public class AbpConventionalControllerFeatureProvider : ControllerFeatureProvider
+{
+    private readonly IAbpApplication _application;
+
+    public AbpConventionalControllerFeatureProvider(IAbpApplication application)
+    {
+        _application = application;
+    }
+
+    protected override bool IsController(TypeInfo typeInfo)
+    {
+        if (_application.ServiceProvider == null) return false;
+
+        var configuration = _application.ServiceProvider
+            .GetRequiredService<IOptions<AbpAspNetCoreMvcOptions>>().Value
+            .ConventionalControllers
+            .ConventionalControllerSettings
+            .GetSettingOrNull(typeInfo.AsType());
+
+        return configuration != null;
+    }
+}
+```
+
+It is added during `AbpAspNetCoreMvcModule.ConfigureServices`:
+
+```csharp title="AbpAspNetCoreMvcModule.cs (excerpt)"
+var partManager = context.Services.GetSingletonInstance<ApplicationPartManager>();
+var application = context.Services.GetSingletonInstance<IAbpApplication>();
+
+partManager.FeatureProviders.Add(new AbpConventionalControllerFeatureProvider(application));
+partManager.ApplicationParts.AddIfNotContains(typeof(AbpAspNetCoreMvcModule).Assembly);
+```
+
+And the assemblies registered through `Create(...)` are merged into MVC's
+`ApplicationParts` later, in `OnApplicationInitialization`:
+
+```csharp title="AbpAspNetCoreMvcModule.cs (excerpt)"
+var controllerAssemblies = context
+    .ServiceProvider
+    .GetRequiredService<IOptions<AbpAspNetCoreMvcOptions>>()
+    .Value
+    .ConventionalControllers
+    .ConventionalControllerSettings
+    .Select(s => s.Assembly)
+    .Distinct();
+
+AddToApplicationParts(partManager, controllerAssemblies);
+```
+
+This is what tells MVC's discovery to look inside your contracts/application
+assembly even though no `IRemoteService` class lives next to a normal
+`Controller` type.
+
+## API-flagging the controller
+
+Once MVC accepts the type, ABP marks it as an API controller so MVC knows
+to apply API conventions (validation responses, JSON binding by default,
+no view discovery):
+
+```csharp title="framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/AbpConventionalApiControllerSpecification.cs"
+public class AbpConventionalApiControllerSpecification : IApiControllerSpecification
+{
+    private readonly AbpAspNetCoreMvcOptions _options;
+
+    public AbpConventionalApiControllerSpecification(IOptions<AbpAspNetCoreMvcOptions> options)
+    {
+        _options = options.Value;
+    }
+
+    public bool IsSatisfiedBy(ControllerModel controller)
+    {
+        var configuration = _options
+            .ConventionalControllers
+            .ConventionalControllerSettings
+            .GetSettingOrNull(controller.ControllerType.AsType());
+
+        return configuration != null;
+    }
+}
+```
+
+## Form-body bound types and ignored suffixes
+
+`AbpConventionalControllerOptions` exposes a handful of knobs that change
+the binding behaviour:
+
+```csharp title="AbpConventionalControllerOptions.cs"
+public class AbpConventionalControllerOptions
+{
+    public ConventionalControllerSettingList ConventionalControllerSettings { get; }
+    public List<Type> FormBodyBindingIgnoredTypes { get; }
+
+    public bool UseV3UrlStyle { get; set; }
+    public string[] IgnoredUrlSuffixesInControllerNames { get; set; } = new[] { "Integration" };
+
+    public AbpConventionalControllerOptions()
+    {
+        ConventionalControllerSettings = new ConventionalControllerSettingList();
+        FormBodyBindingIgnoredTypes = new List<Type>
+        {
+            typeof(IFormFile),
+            typeof(IRemoteStreamContent)
+        };
+    }
+}
+```
+
+`FormBodyBindingIgnoredTypes` is consumed by `AbpServiceConvention.CanUseFormBodyBinding`
+to keep file uploads out of the JSON body. See
+[Content formatters](/web/content-formatters) for the matching model binder
+that turns these parameters back into streams.
+
+`IgnoredUrlSuffixesInControllerNames` strips noise from controller names
+&mdash; an `IntegrationAppService` would otherwise leak the `Integration`
+suffix into the URL.
+
+## ConventionalControllerSetting reference
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `RootPath` | `"app"` | Inserted between `/api/` and the controller name |
+| `RemoteServiceName` | `"Default"` | Module key in `ApplicationApiDescriptionModel.Modules` |
+| `UseV3UrlStyle` | `null` | Falls back to legacy URL casing when set |
+| `TypePredicate` | `null` | Additional type filter (e.g. opt-in marker interface) |
+| `ApplicationServiceTypes` | `All` | Limit to regular vs integration services |
+| `ControllerModelConfigurer` | `null` | Hand-tune the `ControllerModel` after discovery |
+| `UrlControllerNameNormalizer` | `null` | Rewrite the controller URL segment |
+| `UrlActionNameNormalizer` | `null` | Rewrite the action URL segment |
+| `ApiVersions` / `ApiVersionConfigurer` | `[]` / `null` | Apply [API versioning](/web/api-versioning) |
+
+```csharp title="ConventionalControllerSetting.cs (excerpt)"
+public bool? UseV3UrlStyle { get; set; }
+
+[NotNull]
+public string RootPath { get; set; }
+
+public Func<Type, bool>? TypePredicate { get; set; }
+
+public ApplicationServiceTypes ApplicationServiceTypes { get; set; } = ApplicationServiceTypes.All;
+
+public Action<ControllerModel>? ControllerModelConfigurer { get; set; }
+
+public Func<UrlControllerNameNormalizerContext, string>? UrlControllerNameNormalizer { get; set; }
+public Func<UrlActionNameNormalizerContext, string>? UrlActionNameNormalizer { get; set; }
+
+public List<ApiVersion> ApiVersions { get; }
+public Action<ApiVersioningOptions>? ApiVersionConfigurer { get; set; }
+```
+
+## Example: a typed normalizer
+
+The hooks let you slot in custom URL casing without modifying every
+service:
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers
+        .Create(typeof(BookStoreApplicationModule).Assembly, c =>
+        {
+            c.RootPath = "shop";
+            c.UrlControllerNameNormalizer = ctx => ctx.ControllerName.ToKebabCase();
+            c.UrlActionNameNormalizer    = ctx => ctx.ActionNameInUrl.ToKebabCase();
+
+            // Remove a controller from auto-API but keep the service for in-process callers
+            c.TypePredicate = t => !t.Name.Contains("Internal");
+
+            // Tweak ControllerModel - e.g. add a class-level filter
+            c.ControllerModelConfigurer = controller =>
+            {
+                controller.Filters.Add(new ServiceFilterAttribute(typeof(MyTelemetryFilter)));
+            };
+        });
+});
+```
+
+## Resulting routes
+
+Once registered, every `IRemoteService` method receives a generated route
+through `ConventionalRouteBuilder`:
+
+| Method shape | Generated URL |
+| --- | --- |
+| `Task<BookDto> GetAsync(Guid id)` (`[HttpGet]`) | `GET /api/shop/book/{id}` |
+| `Task<List<BookDto>> GetListAsync(BookListInput input)` | `GET /api/shop/book` |
+| `Task<BookDto> CreateAsync(BookCreateDto input)` (`[HttpPost]`) | `POST /api/shop/book` |
+| `Task<BookDto> UpdateAsync(Guid id, BookUpdateDto input)` (`[HttpPut]`) | `PUT /api/shop/book/{id}` |
+| `Task DeleteAsync(Guid id)` (`[HttpDelete]`) | `DELETE /api/shop/book/{id}` |
+| Integration service variant | Same shape, prefixed with `/integration-api` |
+
+Override pieces of the URL with attributes (`[Route]`, `[HttpGet("...")]`,
+`[ControllerName]`, `[RemoteService(Name="...")]`) and the convention
+respects them &mdash; the algorithm only fills in the blanks.
+
+## Opting an individual class out
+
+Three escape hatches let you skip individual classes without changing the
+assembly registration:
+
+1. `[RemoteService(IsEnabled = false)]` &mdash; removed by `IsRemoteService`
+   in `ConventionalControllerSetting`.
+2. `AbpAspNetCoreMvcOptions.ControllersToRemove.Add(typeof(...))` &mdash;
+   honoured by `AbpServiceConvention.RemoveDuplicateControllers`.
+3. `[ReplaceControllers(typeof(OldController))]` &mdash; declares that
+   another controller replaces the one(s) listed.
+
+## Cross-cutting context inherited from `AbpControllerBase`
+
+Because the runtime controller is property-injected with
+`IAbpLazyServiceProvider`, every auto-API endpoint already has:
+
+<CardGroup cols={2}>
+  <Card title="Current user / tenant" href="/multitenancy" icon="user">
+    `CurrentUser`, `CurrentTenant` are ready inside the application service body.
+  </Card>
+  <Card title="Permissions" href="/authz" icon="shield-check">
+    `[Authorize]` on the service applies to the generated controller. `AuthorizationService` is available.
+  </Card>
+  <Card title="Auditing" href="/auditing" icon="clipboard-list">
+    `AbpAuditingMiddleware` records the auto-generated route and the resolved application-service method.
+  </Card>
+  <Card title="MVC controllers" href="/web/mvc-controllers" icon="code">
+    Detailed walkthrough of the lazy helpers exposed on the base class.
+  </Card>
+</CardGroup>
+
+For URL-formatting and per-action selection details, continue with
+[API conventions](/web/api-conventions). For the resulting JSON catalog,
+see [API explorer and models](/web/api-explorer-and-models).

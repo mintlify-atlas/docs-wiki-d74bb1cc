@@ -1,0 +1,445 @@
+---
+title: "ABP Repository Source-Code Tooling: MSBuild Props and dotnet Pipeline"
+sidebarTitle: "Source tooling"
+description: "Walkthrough of the .NET tooling at the root of abpframework/abp — common.props, Directory.Build.props, Directory.Packages.props, configureawait.props, global.json, and the build/ PowerShell scripts that drive dotnet build and dotnet test across every solution."
+---
+
+The ABP repository is a multi-solution .NET workspace: `framework/`, each `modules/*`, every `templates/*`, the `studio/` projects and the `source-code/` clone all carry their own `.sln`. To keep them in lockstep, every project inherits a small set of MSBuild props files placed at the repository root — `Directory.Build.props`, `Directory.Packages.props`, `common.props`, `common.test.props` and `configureawait.props` — pinning the C# language version, the package version, central package management, source-link, Fody's `ConfigureAwait` rewriter and the test-project switches. A `global.json` pins the dotnet SDK floor, a `NuGet.Config` clamps the package sources to nuget.org, and a `latest-versions.json` advertises the current public release to outside tooling. The PowerShell scripts under `build/` (covered in [`/npm/build-scripts`](/npm/build-scripts)) then drive `dotnet build` and `dotnet test` across the list of solutions.
+
+This page reads those files end-to-end so you can answer "where does property `X` come from?" without grepping every `.csproj`.
+
+## File inventory
+
+<Files>
+```
+abp/
+├── Directory.Build.props      ← repository-wide test marker + coverlet wire-up
+├── Directory.Packages.props   ← CPM: every PackageVersion in one place
+├── common.props               ← C# version, package metadata, source-link, NuGet.md, abppkg copy
+├── common.test.props          ← test-project tweaks (LangVersion, GenerateRuntimeConfig)
+├── configureawait.props       ← Fody ConfigureAwait — Release only
+├── global.json                ← SDK version + rollForward
+├── NuGet.Config               ← packageSources clamp
+├── NuGet.md                   ← Markdown packed inside every NuGet package
+├── latest-versions.json       ← public release advertisement
+├── codecov.yml                ← Codecov per-PR threshold
+├── delete-bin-obj.ps1
+└── build/
+    ├── common.ps1
+    ├── build-all.ps1
+    ├── build-all-release.ps1
+    └── test-all.ps1
+```
+</Files>
+
+## `common.props` — the canonical version & metadata
+
+Every framework, module and template `.csproj` imports `common.props` (directly via `<Import>` or transitively through the solution's local `Directory.Build.props`). It defines the version, language settings, package metadata, source-link and the `*.abppkg` / `*.abppkg.analyze.json` content rules:
+
+```xml common.props
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Version>8.0.2</Version>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <PackageIconUrl>https://abp.io/assets/abp_nupkg.png</PackageIconUrl>
+    <PackageProjectUrl>https://abp.io/</PackageProjectUrl>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/abpframework/abp/</RepositoryUrl>
+    <PackageReadmeFile>NuGet.md</PackageReadmeFile>
+    <PackageTags>aspnetcore boilerplate framework web best-practices angular maui blazor mvc csharp webapp</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Include symbol files (*.pdb) in the built .nupkg -->
+    <AllowedOutputExtensionsInPackageBuildOutputFolder>
+      $(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb
+    </AllowedOutputExtensionsInPackageBuildOutputFolder>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\NuGet.md" Pack="true" PackagePath="\"/>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UsingMicrosoftNETSdkWeb)' != 'true' AND '$(UsingMicrosoftNETSdkRazor)' != 'true'">
+    <None Remove="*.abppkg.analyze.json" />
+    <Content Include="*.abppkg.analyze.json">
+        <Pack>true</Pack>
+        <PackagePath>content\</PackagePath>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
+    <None Remove="*.abppkg" />
+    <Content Include="*.abppkg">
+        <Pack>true</Pack>
+        <PackagePath>content\</PackagePath>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="$(AssemblyName.EndsWith('HttpApi.Client'))">
+    <EmbeddedResource Include="**\*generate-proxy.json" />
+    <Content Remove="**\*generate-proxy.json" />
+  </ItemGroup>
+</Project>
+```
+
+Key effects per project:
+
+| Property / item | Effect |
+| --- | --- |
+| `<LangVersion>latest</LangVersion>` | Allows C# language features matching the installed SDK floor. |
+| `<Version>8.0.2</Version>` | The single source of version truth — read by `publish-utils.js` and stamped into every NuGet + npm artefact. |
+| `<NoWarn>CS1591;CS0436</NoWarn>` | Suppresses "missing XML comment" and "type conflicts with imported type" repository-wide. |
+| `<PackageReadmeFile>NuGet.md</PackageReadmeFile>` + `<None Include="..\..\NuGet.md">` | Embeds the shared `NuGet.md` into every `.nupkg`. |
+| `<PackageLicenseExpression>LGPL-3.0-only` | The repository ships under LGPL-3.0; consumers see it on nuget.org. |
+| `<PackageReference Include="Microsoft.SourceLink.GitHub">` | Adds Source Link so debuggers can step into ABP from a referencing project. |
+| `<Content Include="*.abppkg">` and `*.abppkg.analyze.json` | Packs ABP-specific metadata files into `content/` so `Volo.Abp.Cli` can read them post-install. The analyze JSON is excluded for SDK Web/Razor projects which already have their own `Content` rules. |
+| The `HttpApi.Client` condition | Embeds `*generate-proxy.json` into the assembly so `abp generate-proxy` can read it. |
+
+### Why `Version` lives here
+
+A single `<Version>` line at `common.props` is the linchpin of the whole release pipeline. `publish-utils.js` reads it for npm:
+
+```js npm/publish-utils.js (excerpt)
+function getVersion() {
+  if (program.customVersion) return program.customVersion;
+  const commonProps = fse.readFileSync('../common.props').toString();
+  const versionTag = '<Version>';
+  const versionEndTag = '</Version>';
+  const first = commonProps.indexOf(versionTag) + versionTag.length;
+  const last = commonProps.indexOf(versionEndTag);
+  return commonProps.substring(first, last);
+}
+```
+
+And `dotnet build` propagates it into `PackageVersion` for every NuGet artefact via MSBuild's standard `Version` → package version mapping. Changing one value cascades through both ecosystems.
+
+## `Directory.Build.props` — the implicit import
+
+This file lives at the repository root and is **automatically** picked up by MSBuild for every project below it. It is intentionally tiny — its only job is to detect test projects and add the coverlet collector:
+
+```xml Directory.Build.props
+<Project>
+  <PropertyGroup>
+    <IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test')) and ($(MSBuildProjectName.EndsWith('.Tests')) or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Condition="'$(IsTestProject)' == 'true'" Include="coverlet.collector">
+        <PrivateAssets>all</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>
+```
+
+`IsTestProject` is `true` when:
+
+1. the project path contains `test`, **and**
+2. the project name ends with `.Tests` or `.TestBase`.
+
+That dual check avoids classifying production assemblies that happen to live in a `tests/` neighbourhood, while still catching base classes like `Volo.Abp.AspNetCore.TestBase` that abstract common test scaffolding.
+
+When the condition is true, `coverlet.collector` is added with `PrivateAssets="all"` so it never leaks into downstream packages — its sole role is to feed `dotnet test --collect:"XPlat Code Coverage"` (see [`build/test-all.ps1`](/npm/build-scripts#build-test-all-ps1-run-every-test-project)).
+
+## `Directory.Packages.props` — central package management
+
+ABP uses Central Package Management (CPM): individual `.csproj` files declare `<PackageReference Include="…" />` without a version, and the version is resolved from this file:
+
+```xml Directory.Packages.props (excerpt)
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="AlibabaCloud.SDK.Dysmsapi20170525" Version="2.0.24" />
+    <PackageVersion Include="aliyun-net-sdk-sts" Version="3.1.2" />
+    <PackageVersion Include="Aliyun.OSS.SDK.NetCore" Version="2.13.0" />
+    <PackageVersion Include="AsyncKeyedLock" Version="6.2.2" />
+    <PackageVersion Include="Autofac" Version="8.0.0" />
+    <PackageVersion Include="Autofac.Extensions.DependencyInjection" Version="9.0.0" />
+    <PackageVersion Include="Autofac.Extras.DynamicProxy" Version="7.1.0" />
+    <PackageVersion Include="AutoMapper" Version="12.0.1" />
+    <PackageVersion Include="AWSSDK.S3" Version="3.7.300.2" />
+    <PackageVersion Include="AWSSDK.SecurityToken" Version="3.7.300.2" />
+    <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.17.0" />
+    <PackageVersion Include="Azure.Storage.Blobs" Version="12.19.1" />
+    <PackageVersion Include="Castle.Core" Version="5.1.1" />
+    <PackageVersion Include="Confluent.Kafka" Version="2.3.0" />
+    <PackageVersion Include="Dapper" Version="2.1.21" />
+    <PackageVersion Include="Dapr.AspNetCore" Version="1.12.0" />
+    <PackageVersion Include="Dapr.Client" Version="1.12.0" />
+    <PackageVersion Include="FluentValidation" Version="11.8.0" />
+    <PackageVersion Include="Hangfire.AspNetCore" Version="1.8.6" />
+    <PackageVersion Include="IdentityModel" Version="6.2.0" />
+    <PackageVersion Include="JetBrains.Annotations" Version="2023.3.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.0" />
+    <!-- … hundreds more — Microsoft.* OpenIddict, EF Core, RabbitMQ, MongoDB, Quartz … -->
+  </ItemGroup>
+</Project>
+```
+
+The benefit is obvious: bumping `Dapr.Client` from 1.12.0 to 1.13.0 is a one-line change here rather than dozens of edits across `Volo.Abp.Dapr`, `Volo.Abp.EventBus.Dapr`, etc. The downside is that adding a brand-new package requires a corresponding `<PackageVersion>` entry — `dotnet add package` will surface this if forgotten.
+
+<Tip>
+ABP's own `Volo.Abp.*` PackageReferences inside the repo use `<ProjectReference>` whenever a project is part of the same solution. CPM only kicks in for third-party dependencies, so cross-solution references (e.g. modules referencing `Volo.Abp.Core`) still resolve through `Directory.Packages.props` when the framework solution is not loaded.
+</Tip>
+
+## `configureawait.props` — `.ConfigureAwait(false)` rewriter
+
+Every project that imports `configureawait.props` gains Fody's `ConfigureAwait.Fody` weaver — but **only in Release**. This is what frees ABP from sprinkling `.ConfigureAwait(false)` on every `await`:
+
+```xml configureawait.props
+<Project>
+  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+      <PackageReference Include="ConfigureAwait.Fody" PrivateAssets="All" />
+      <PackageReference Include="Fody">
+        <PrivateAssets>All</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+      </PackageReference>
+  </ItemGroup>
+</Project>
+```
+
+The `Condition="'$(Configuration)' == 'Release'"` guard exists for a practical reason: Fody rewrites IL post-compile, which slows incremental Debug builds and confuses some debuggers. Release builds — the ones that ship — get the rewrite.
+
+Each module that opts in adds a `FodyWeavers.xml` next to its `.csproj` describing which weavers run. For example, `Volo.Abp.EventBus.Dapr.csproj` ships with `FodyWeavers.xml` + `FodyWeavers.xsd` adjacent — Fody picks them up automatically.
+
+## `common.test.props` — test-project tweaks
+
+Test projects opt in by importing `common.test.props`. It sets the same `LangVersion` and `NoWarn` as `common.props`, enables runtime config generation, and turns off the boilerplate assembly attributes that confuse xUnit's discoverer:
+
+```xml common.test.props
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+  </PropertyGroup>
+</Project>
+```
+
+Pairs with the `IsTestProject` rule in `Directory.Build.props` — together they ensure every `*.Tests` project gets coverlet + correct runtime config.
+
+## `global.json` — SDK floor
+
+```json global.json
+{
+  "sdk": {
+    "version": "8.0.100",
+    "rollForward": "latestFeature"
+  }
+}
+```
+
+`rollForward: "latestFeature"` means any 8.0.x with `x >= 100` is acceptable, but the SDK will refuse to fall back to 7.x. CI images that ship 8.0.404 still build the repo correctly; a machine with only 7.0.x installed fails fast.
+
+## `NuGet.Config` — locked-down sources
+
+```xml NuGet.Config
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+    <packageSources>
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    </packageSources>
+</configuration>
+```
+
+No `<clear/>` means user-level sources still apply, but this file ensures `nuget.org` is always present and avoids accidental dependencies on a developer's private feed.
+
+## `NuGet.md`, `latest-versions.json`, `codecov.yml`
+
+| File | What it does |
+| --- | --- |
+| `NuGet.md` | The Markdown README packed into **every** `.nupkg` via `<PackageReadmeFile>NuGet.md</PackageReadmeFile>` from `common.props`. |
+| `latest-versions.json` | A small JSON file consumed by the ABP CLI to discover the latest stable release. The structure is `[{ "version": "7.4.2", "releaseDate": "", "type": "stable", "message": "" }]`. |
+| `codecov.yml` | Tells Codecov to track the `dev` branch with a 1% threshold: `codecov: { branch: dev, require_ci_to_pass: yes, allow_coverage_offsets: true, status: { project: { default: { threshold: 1% } } } }`. |
+
+## `build/` — PowerShell pipeline
+
+All four scripts are covered in detail in [`/npm/build-scripts`](/npm/build-scripts); this section summarises the .NET-relevant parts.
+
+### `build/common.ps1`
+
+Captures `$rootFolder` once and produces `$solutionPaths` — 15 solutions in development mode, 26+ in `-f` (full) mode:
+
+```powershell build/common.ps1 (excerpt)
+$rootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+$solutionPaths = @(
+    "../framework",
+    "../modules/basic-theme",
+    "../modules/users",
+    "../modules/permission-management",
+    "../modules/setting-management",
+    "../modules/feature-management",
+    "../modules/identity",
+    "../modules/identityserver",
+    "../modules/openiddict",
+    "../modules/tenant-management",
+    "../modules/audit-logging",
+    "../modules/background-jobs",
+    "../modules/account",
+    "../modules/cms-kit",
+    "../modules/blob-storing-database"
+)
+
+if ($full -eq "-f") {
+    $solutionPaths += (
+        "../modules/client-simulation",
+        "../modules/virtual-file-explorer",
+        "../modules/docs",
+        "../modules/blogging",
+        "../templates/module/aspnet-core",
+        "../templates/app/aspnet-core",
+        "../templates/console",
+        "../templates/wpf",
+        "../templates/app-nolayers/aspnet-core",
+        "../abp_io/AbpIoLocalization",
+        "../source-code"
+    )
+}
+```
+
+### `build/build-all-release.ps1`
+
+```powershell build/build-all-release.ps1
+. ".\common.ps1" -f
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+`/maxcpucount` is what makes the release build sane on multi-core hardware — without it MSBuild runs one project at a time per solution.
+
+### `build/build-all.ps1`
+
+Debug variant with workload installs:
+
+```powershell build/build-all.ps1 (excerpt)
+dotnet workload install wasm-tools
+dotnet workload install maui-tizen
+```
+
+The two workloads are mandatory for the Blazor WebAssembly and MAUI templates respectively.
+
+### `build/test-all.ps1`
+
+```powershell build/test-all.ps1
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) { exit $LASTEXITCODE }
+}
+```
+
+The coverlet collector added by `Directory.Build.props` is what turns `--collect:"XPlat Code Coverage"` into Cobertura `coverage.cobertura.xml` files, which `codecov.yml` then ingests.
+
+### `delete-bin-obj.ps1`
+
+```powershell delete-bin-obj.ps1
+Clear-Host
+Write-Host "Deleting all BIN and OBJ folders..." -ForegroundColor Cyan
+Get-ChildItem -Path . -Include bin,obj -Recurse -Directory | ForEach-Object {
+    if ($_.FullName -notmatch "\\node_modules\\") {
+        Write-Host "Deleting:" $_.FullName -ForegroundColor Yellow
+        Remove-Item $_.FullName -Recurse -Force
+    } else {
+        Write-Host "Skipping:" $_.FullName -ForegroundColor Magenta
+    }
+}
+```
+
+The `node_modules` exclusion is important — without it the script would happily delete `bin/` directories inside, e.g., `@volo/ngx-lepton-x.lite`, breaking a freshly installed Angular workspace.
+
+## How property inheritance flows
+
+```mermaid
+flowchart TD
+  GLOBAL[global.json]:::cfg
+  NUGET[NuGet.Config]:::cfg
+  CPM[Directory.Packages.props]:::cpm
+  DBP[Directory.Build.props]:::msbuild
+  COM[common.props]:::msbuild
+  COMT[common.test.props]:::msbuild
+  CAW[configureawait.props]:::msbuild
+  NUGETMD[NuGet.md]:::asset
+
+  GLOBAL --> SDK[dotnet SDK 8.0.100 latestFeature]
+  NUGET --> RESTORE[dotnet restore]
+  CPM --> CSPROJ[*.csproj]
+  DBP -. implicit MSBuild import .-> CSPROJ
+  COM -. explicit Import .-> CSPROJ
+  COMT -. test projects .-> CSPROJ
+  CAW -. opt-in for Release .-> CSPROJ
+  NUGETMD -. packed into .-> NUPKG[*.nupkg]
+  COM -. PackageReadmeFile .-> NUPKG
+  COM -. SourceLink + .abppkg + .pdb .-> NUPKG
+
+  DBP --> COVER[coverlet.collector @ test projects]
+  COVER --> TEST[dotnet test --collect XPlat Code Coverage]
+  TEST --> CODECOV[codecov.yml threshold check]
+
+  subgraph build [build/]
+    CP[common.ps1]
+    BA[build-all.ps1]
+    BAR[build-all-release.ps1]
+    TA[test-all.ps1]
+    BA -. dot-source .-> CP
+    BAR -. dot-source .-> CP
+    TA  -. dot-source .-> CP
+  end
+
+  BAR --> NUPKG
+  TA  --> CODECOV
+
+  classDef cfg fill:#fef3c7,stroke:#f59e0b
+  classDef cpm fill:#dbeafe,stroke:#3b82f6
+  classDef msbuild fill:#dcfce7,stroke:#22c55e
+  classDef asset fill:#f5f5f5,stroke:#999
+```
+
+## Putting it all together
+
+A canonical "build the world" run, mapped to the files above:
+
+1. `global.json` → ensures `dotnet --version >= 8.0.100`.
+2. `pwsh build/build-all-release.ps1` → for each solution in `common.ps1`'s `$solutionPaths`, runs `dotnet build --configuration Release /maxcpucount`.
+3. Each project picks up `Directory.Build.props` (coverlet for test projects), then its local `common.props` import (LangVersion, Version, source-link, abppkg) and possibly `configureawait.props` (Fody — Release only).
+4. `dotnet pack` (run later or via CI) reads `<Version>8.0.2</Version>` from `common.props`, embeds `NuGet.md`, and produces `*.nupkg` artefacts with `.pdb` symbols included.
+5. `pwsh build/test-all.ps1 -f` → for each test project the coverlet collector emits `TestResults/<guid>/coverage.cobertura.xml`.
+6. CI uploads Cobertura to Codecov; `codecov.yml` enforces the per-PR 1% threshold against the `dev` branch.
+7. `pwsh npm/preview-publish.ps1 -Version 8.0.2 -Registry …` mirrors the same `<Version>` value through `publish-utils.js` into the npm side.
+
+## Related pages
+
+<CardGroup cols={2}>
+<Card title="Build & publish scripts" icon="terminal" href="/npm/build-scripts">
+PowerShell entry points (`build-all.ps1`, `test-all.ps1`, `preview-publish.ps1`) in detail.
+</Card>
+<Card title="npm workspace overview" icon="folder-tree" href="/npm/overview">
+How `publish-utils.js` reads `<Version>` from `common.props` for the npm pipeline.
+</Card>
+<Card title="ABP npm tooling" icon="screwdriver-wrench" href="/npm/abp-tooling">
+The TypeScript validators that enforce version consistency on the npm side.
+</Card>
+<Card title="Modularity overview" icon="cubes" href="/modularity/overview">
+What `.abppkg` and `.abppkg.analyze.json` files mean inside an ABP package.
+</Card>
+</CardGroup>

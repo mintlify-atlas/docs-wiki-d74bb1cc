@@ -1,0 +1,449 @@
+---
+title: "CMS Kit Pages: Slug-Addressed Content With Script and Style"
+sidebarTitle: "Pages"
+description: "Page aggregate inside CMS Kit, IPageRepository contract, PageManager domain service, home-page election, IPageAdminAppService and IPagePublicAppService surfaces, and the distributed cache."
+---
+
+The CMS Kit Pages feature is a thin content store for "about", "contact", landing, and similar slug‑addressed pages. A `Page` carries a title, a normalised slug, three free‑form text fields (`Content`, `Script`, `Style`), a home‑page flag, and standard ABP audit/version metadata — that's it. There is no draft state, no per‑page permissions, and no version history; the design intent is "a lightweight CMS that lets a non‑developer edit a Markdown blob behind a URL". This page walks the source under `Volo.CmsKit.Domain/Volo/CmsKit/Pages/`, lists every type and signature, and shows the public renderer (with its distributed cache) and the admin CRUD that drives the back‑office.
+
+<Info>
+Source folder: [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages). See [Overview](/modules/cms-kit/overview) for how Pages fits with the other CMS Kit features.
+</Info>
+
+## File inventory
+
+```text title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/"
+Page.cs
+PageManager.cs
+IPageRepository.cs
+PageCacheItem.cs
+PageSlugAlreadyExistsException.cs
+MultipleHomePageException.cs
+```
+
+| File | Type | Role |
+| --- | --- | --- |
+| `Page.cs` | `FullAuditedAggregateRoot<Guid>` | Aggregate: title, slug, content/script/style, IsHomePage flag |
+| `PageManager.cs` | `DomainService` | Slug uniqueness, home‑page election, single‑homepage invariant |
+| `IPageRepository.cs` | interface | List/filter, get by slug, list home pages |
+| `PageCacheItem.cs` | DTO | Distributed cache shape used by the public renderer |
+| `PageSlugAlreadyExistsException.cs` | `BusinessException` | Raised when `PageManager` detects a duplicate slug |
+| `MultipleHomePageException.cs` | `BusinessException` | Raised if multiple `IsHomePage = true` rows exist concurrently |
+
+## Domain model
+
+```mermaid
+erDiagram
+    PAGE {
+        Guid Id PK
+        string Title
+        string Slug
+        string Content
+        string Script
+        string Style
+        bool IsHomePage
+        int EntityVersion
+        Guid? TenantId
+    }
+```
+
+There is no relation to any other CMS Kit aggregate — pages are intentionally self‑contained. They *can* carry media, tags, and reactions through the generic `EntityType` mechanism (`PageConsts.EntityType = "Page"`), but those are joined at query time via the [media descriptor](/modules/cms-kit/media-descriptors), [tag](/modules/cms-kit/tags), and [reaction](/modules/cms-kit/reactions) stores rather than navigational properties.
+
+### `Page`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/Page.cs"
+public class Page : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntityVersion
+{
+    public virtual Guid?  TenantId      { get; protected set; }
+    public virtual string Title         { get; protected set; }
+    public virtual string Slug          { get; protected set; }
+    public virtual string Content       { get; protected set; }
+    public virtual string Script        { get; protected set; }
+    public virtual string Style         { get; protected set; }
+    public virtual bool   IsHomePage    { get; protected set; }
+    public virtual int    EntityVersion { get; protected set; }
+
+    internal Page(
+        Guid id,
+        [NotNull] string title,
+        [NotNull] string slug,
+        string content = null,
+        string script = null,
+        string style = null,
+        Guid? tenantId = null) : base(id)
+    {
+        TenantId = tenantId;
+        SetTitle(title);
+        SetSlug(slug);
+        SetContent(content);
+        SetScript(script);
+        SetStyle(style);
+    }
+
+    public virtual void SetTitle(string title) =>
+        Title = Check.NotNullOrEmpty(title, nameof(title), PageConsts.MaxTitleLength);
+
+    internal virtual void SetSlug(string slug) =>
+        Slug = SlugNormalizer.Normalize(
+            Check.NotNullOrEmpty(slug, nameof(slug), PageConsts.MaxSlugLength));
+
+    public virtual void SetContent(string content) =>
+        Content = Check.Length(content, nameof(content), PageConsts.MaxContentLength);
+
+    public virtual void SetScript(string script) =>
+        Script = Check.Length(script, nameof(script), PageConsts.MaxScriptLength);
+
+    public virtual void SetStyle(string style) =>
+        Style = Check.Length(style, nameof(style), PageConsts.MaxStyleLength);
+
+    internal void SetIsHomePage(bool isHomePage) => IsHomePage = isHomePage;
+}
+```
+
+A few non‑obvious choices:
+
+- `SetSlug` is `internal` because callers must go through `PageManager.SetSlugAsync`, which runs the uniqueness check.
+- `SetIsHomePage` is `internal` because the home‑page invariant (at most one) is enforced by the manager — direct callers must not flip the bit by hand.
+- `Content`, `Script`, and `Style` are free‑form strings. The admin UI surfaces them as three separate code editors and concatenates them client‑side at render time, which is why a page can include inline JS or CSS without a wrapper aggregate.
+- `Script` and `Style` are *raw* text — no sanitization runs in the domain. If you allow non‑trusted authors, sanitize before calling `SetScript` / `SetStyle`.
+- `EntityVersion` provides optimistic concurrency. Updates use `SetConcurrencyStampIfNotNull(input.ConcurrencyStamp)` in the admin app service.
+
+### `PageManager`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/PageManager.cs"
+public class PageManager : DomainService
+{
+    protected IPageRepository PageRepository { get; }
+
+    public virtual async Task<Page> CreateAsync(
+        [NotNull] string title,
+        [NotNull] string slug,
+        [CanBeNull] string content = null,
+        [CanBeNull] string script = null,
+        [CanBeNull] string style = null)
+    {
+        Check.NotNullOrEmpty(title, nameof(title));
+        Check.NotNullOrEmpty(slug, nameof(slug));
+
+        await CheckPageSlugAsync(slug);
+
+        return new Page(
+            GuidGenerator.Create(),
+            title, slug, content, script, style,
+            CurrentTenant.Id);
+    }
+
+    public virtual async Task SetSlugAsync(Page page, [NotNull] string newSlug)
+    {
+        if (page.Slug != newSlug)
+        {
+            await CheckPageSlugAsync(newSlug);
+            page.SetSlug(newSlug);
+        }
+    }
+
+    public virtual async Task SetHomePageAsync(Page page)
+    {
+        var homePage = await GetHomePageAsync();
+
+        if (!page.IsHomePage)
+        {
+            if (homePage != null)
+            {
+                homePage.SetIsHomePage(false);
+                await PageRepository.UpdateAsync(homePage);
+            }
+
+            homePage = await PageRepository.GetAsync(page.Id);
+        }
+
+        homePage.SetIsHomePage(!page.IsHomePage);
+        await PageRepository.UpdateAsync(homePage);
+    }
+
+    public virtual async Task<Page> GetHomePageAsync()
+    {
+        var currentHomePages = await PageRepository.GetListOfHomePagesAsync();
+
+        if (currentHomePages.Count > 1)
+        {
+            throw new BusinessException("There can be only one home page.");
+        }
+
+        return currentHomePages.FirstOrDefault();
+    }
+
+    protected virtual async Task CheckPageSlugAsync(string slug)
+    {
+        if (await PageRepository.ExistsAsync(slug))
+        {
+            throw new PageSlugAlreadyExistsException(slug);
+        }
+    }
+}
+```
+
+`SetHomePageAsync` deserves a closer look. The flow is:
+
+1. Find the current home page (if any).
+2. If the *target* page is not the home page, demote the current one.
+3. Toggle the target's `IsHomePage`.
+
+That last step uses `!page.IsHomePage`, which means calling `SetHomePageAsync` on the existing home page **un‑sets** it. So the operation is a toggle, not a set. The admin app service surfaces it as `SetAsHomePageAsync(id)` and expects callers to know that calling twice removes the flag.
+
+`GetHomePageAsync` actively *defends* the invariant — if two rows are flagged, it throws `BusinessException("There can be only one home page.")`. This is a guard, not a recovery: it should never trigger unless something has bypassed the manager.
+
+## `IPageRepository`
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/IPageRepository.cs"
+public interface IPageRepository : IBasicRepository<Page, Guid>
+{
+    Task<int> GetCountAsync(string filter = null, CancellationToken cancellationToken = default);
+
+    Task<List<Page>> GetListAsync(
+        string filter = null,
+        int maxResultCount = int.MaxValue,
+        int skipCount = 0,
+        string sorting = null,
+        CancellationToken cancellationToken = default);
+
+    Task<Page> GetBySlugAsync(string slug, CancellationToken cancellationToken = default);
+
+    Task<Page> FindBySlugAsync(string slug, CancellationToken cancellationToken = default);
+
+    Task<bool> ExistsAsync(string slug, CancellationToken cancellationToken = default);
+
+    Task<List<Page>> GetListOfHomePagesAsync(CancellationToken cancellationToken = default);
+}
+```
+
+| Method | Notes |
+| --- | --- |
+| `GetBySlugAsync` | Throws `EntityNotFoundException` if missing |
+| `FindBySlugAsync` | Returns `null` if missing — used by the public service |
+| `ExistsAsync(slug)` | Used by `PageManager.CheckPageSlugAsync` |
+| `GetListOfHomePagesAsync` | Returns *all* rows with `IsHomePage = true`; used by the home‑page invariant guard |
+
+EF Core implementation: `Volo.CmsKit.EntityFrameworkCore/Volo/CmsKit/Pages/EfCorePageRepository.cs`. MongoDB: `Volo.CmsKit.MongoDB/Volo/CmsKit/Pages/MongoPageRepository.cs`. Both add a unique index on `Slug`.
+
+## Admin app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Pages/IPageAdminAppService.cs"
+public interface IPageAdminAppService
+    : ICrudAppService<PageDto, PageDto, Guid, GetPagesInputDto, CreatePageInputDto, UpdatePageInputDto>
+{
+    Task SetAsHomePageAsync(Guid id);
+}
+```
+
+Implementation:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/Pages/PageAdminAppService.cs"
+[RequiresFeature(CmsKitFeatures.PageEnable)]
+[RequiresGlobalFeature(typeof(PagesFeature))]
+[Authorize(CmsKitAdminPermissions.Pages.Default)]
+public class PageAdminAppService : CmsKitAdminAppServiceBase, IPageAdminAppService
+{
+    protected IPageRepository PageRepository { get; }
+    protected PageManager PageManager { get; }
+    protected IDistributedCache<PageCacheItem> PageCache { get; }
+
+    [Authorize(CmsKitAdminPermissions.Pages.Create)]
+    public virtual async Task<PageDto> CreateAsync(CreatePageInputDto input)
+    {
+        var page = await PageManager.CreateAsync(input.Title, input.Slug, input.Content, input.Script, input.Style);
+        input.MapExtraPropertiesTo(page);
+        await PageRepository.InsertAsync(page);
+
+        await PageCache.RemoveAsync(PageCacheItem.GetKey(page.Slug));
+
+        return ObjectMapper.Map<Page, PageDto>(page);
+    }
+
+    [Authorize(CmsKitAdminPermissions.Pages.Update)]
+    public virtual async Task<PageDto> UpdateAsync(Guid id, UpdatePageInputDto input)
+    {
+        var page = await PageRepository.GetAsync(id);
+        if (page.IsHomePage)
+        {
+            await InvalidateDefaultHomePageCacheAsync(considerUow: true);
+        }
+
+        await PageCache.RemoveAsync(PageCacheItem.GetKey(page.Slug));
+
+        await PageManager.SetSlugAsync(page, input.Slug);
+        page.SetTitle(input.Title);
+        page.SetContent(input.Content);
+        page.SetScript(input.Script);
+        page.SetStyle(input.Style);
+        page.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+        input.MapExtraPropertiesTo(page);
+
+        await PageRepository.UpdateAsync(page);
+        return ObjectMapper.Map<Page, PageDto>(page);
+    }
+    // ...
+}
+```
+
+Permission map:
+
+| Permission | Method |
+| --- | --- |
+| `CmsKitAdminPermissions.Pages.Default` | Class‑level — required for any operation |
+| `CmsKitAdminPermissions.Pages.Create` | `CreateAsync` |
+| `CmsKitAdminPermissions.Pages.Update` | `UpdateAsync` |
+| `CmsKitAdminPermissions.Pages.Delete` | `DeleteAsync` |
+| `CmsKitAdminPermissions.Pages.SetAsHomePage` | `SetAsHomePageAsync` |
+
+`SetAsHomePage` is split from `Update` because choosing the landing page is a higher‑risk operation in many sites — a marketing role might be allowed to edit content but not to switch the landing.
+
+Cache invalidation matters on every write. The admin service removes the slug‑keyed cache entry on `Create`, `Update`, and `Delete`, plus calls `InvalidateDefaultHomePageCacheAsync` if the affected page was the home page. The next public render will re‑populate.
+
+## Public app service
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Pages/IPagePublicAppService.cs"
+public interface IPagePublicAppService : IApplicationService
+{
+    Task<PageDto> FindBySlugAsync([NotNull] string slug);
+    Task<bool> DoesSlugExistAsync([NotNull] string slug);
+    Task<PageDto> FindDefaultHomePageAsync();
+}
+```
+
+The implementation is heavily cached:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Pages/PagePublicAppService.cs"
+[RequiresFeature(CmsKitFeatures.PageEnable)]
+[RequiresGlobalFeature(typeof(PagesFeature))]
+public class PagePublicAppService : CmsKitPublicAppServiceBase, IPagePublicAppService
+{
+    protected IPageRepository PageRepository { get; }
+    protected PageManager PageManager { get; }
+    protected IDistributedCache<PageCacheItem> PageCache { get; }
+
+    public virtual async Task<PageDto> FindBySlugAsync(string slug)
+    {
+        var cachedPage = await FindAndCacheBySlugAsync(slug);
+
+        if (cachedPage == null)
+        {
+            return null;
+        }
+
+        return ObjectMapper.Map<PageCacheItem, PageDto>(cachedPage);
+    }
+
+    public virtual async Task<PageDto> FindDefaultHomePageAsync()
+    {
+        var pageCacheItem = await PageCache.GetAsync(
+            PageCacheItem.GetKey(PageConsts.DefaultHomePageCacheKey));
+        if (pageCacheItem is null)
+        {
+            var page = await PageManager.GetHomePageAsync();
+            if (page is null)
+            {
+                return null;
+            }
+
+            pageCacheItem = ObjectMapper.Map<Page, PageCacheItem>(page);
+
+            await PageCache.SetAsync(
+                PageCacheItem.GetKey(PageConsts.DefaultHomePageCacheKey),
+                pageCacheItem,
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpiration = DateTimeOffset.Now.AddHours(1)
+                });
+        }
+        // ...
+```
+
+Each slug becomes a cache entry with key `CmsPage_{slug}` (see `PageCacheItem.GetKey`), valid for one hour by default. The default home page lives under the special key `CmsPage_DefaultHomePage`. Cache entries are invalidated whenever the admin service runs `RemoveAsync` on the same key.
+
+`PageCacheItem` is deliberately separate from `PageDto` so that the cached representation does not change when the DTO surface evolves:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Pages/PageCacheItem.cs"
+public class PageCacheItem : ExtensibleObject
+{
+    public Guid   Id      { get; set; }
+    public string Title   { get; set; }
+    public string Slug    { get; set; }
+    public string Content { get; set; }
+    public string Script  { get; set; }
+    public string Style   { get; set; }
+
+    public static string GetKey(string slug) => $"CmsPage_{slug}";
+}
+```
+
+It derives from `ExtensibleObject` so additional properties carried by the [object extension manager](/mapping/object-extending) round‑trip through the cache.
+
+## Permissions
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Permissions/CmsKitAdminPermissions.cs"
+public static class Pages
+{
+    public const string Default       = GroupName + ".Pages";
+    public const string Create        = Default + ".Create";
+    public const string Update        = Default + ".Update";
+    public const string Delete        = Default + ".Delete";
+    public const string SetAsHomePage = Default + ".SetAsHomePage";
+}
+```
+
+There is no public permission for pages because anonymous users are expected to read pages by slug. See [Permission System](/authz/permission-system) for the wider picture.
+
+## Feature flags
+
+- **Global feature** `PagesFeature` — name `CmsKit.Pages`.
+- **Per‑tenant feature** `CmsKitFeatures.PageEnable`.
+
+Both must be on for any page endpoint to serve traffic. See [Admin / Public split](/modules/cms-kit/admin-public-split).
+
+## EF Core configuration
+
+```csharp
+options.AddRepository<Page, EfCorePageRepository>();
+```
+
+The EF entity builder defines a unique index on `Slug` (per tenant when multi‑tenancy is on) and a regular index on `IsHomePage` so `GetListOfHomePagesAsync` is fast. MongoDB uses an equivalent compound index.
+
+## Media, tags, and reactions
+
+Pages plug into the cross‑cutting features via their `EntityType` constant. `CmsKitAdminApplicationModule` wires them up only when the matching global features are on:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/CmsKitAdminApplicationModule.cs"
+if (GlobalFeatureManager.Instance.IsEnabled<PagesFeature>())
+{
+    options.EntityTypes.AddIfNotContains(
+        new MediaDescriptorDefinition(
+            PageConsts.EntityType,
+            createPolicies: new[] { CmsKitAdminPermissions.Pages.Create, CmsKitAdminPermissions.Pages.Update },
+            deletePolicies: new[]
+            {
+                CmsKitAdminPermissions.Pages.Create,
+                CmsKitAdminPermissions.Pages.Update,
+                CmsKitAdminPermissions.Pages.Delete
+            }));
+}
+```
+
+The same shape repeats for tags. To enable comments or reactions for pages, add a `CommentEntityTypeDefinition(PageConsts.EntityType)` or a `ReactionEntityTypeDefinition(PageConsts.EntityType, …)` from your application module — those are not wired up by default.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/modules/cms-kit/overview">
+    Where Pages sits in the package matrix.
+  </Card>
+  <Card title="Menus" icon="bars" href="/modules/cms-kit/menus">
+    Menu items can link to a `Page` by id and inherit its slug as the URL.
+  </Card>
+  <Card title="Media descriptors" icon="image" href="/modules/cms-kit/media-descriptors">
+    Page content can embed media stored as `MediaDescriptor`.
+  </Card>
+  <Card title="Admin / Public split" icon="layer-group" href="/modules/cms-kit/admin-public-split">
+    Why Pages has two app services with different gating.
+  </Card>
+</CardGroup>

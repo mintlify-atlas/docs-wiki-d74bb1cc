@@ -1,0 +1,568 @@
+---
+title: "CLI Source Code Store: Downloads, Cache and NuGet Index"
+sidebarTitle: "Source Code Store"
+description: "AbpIoSourceCodeStore resolves template, module and package zips from abp.io, caches under ~/.abp/templates, and powers the personalised nuget.abp.io feed."
+---
+
+Every command that needs *raw source code from `abp.io`* — `abp new`, `abp get-source`, `abp add-package --with-source-code`, `abp add-module`, `abp update` — funnels its download through one interface: `ISourceCodeStore`. The single implementation `AbpIoSourceCodeStore` knows three things only: a base URL (`CliUrls.WwwAbpIo`), a "type" string (`template`, `module`, `nugetPackage`, `npmPackage`), and the user's optional API key. It exposes one method, `GetAsync`, that returns a `TemplateFile` — a `byte[]` plus the resolved version. Caching, version negotiation, license-gated NuGet feeds and the `abp clear-download-cache` command all hang off that small surface. This page walks the entire download path, including the helper `AbpNuGetIndexUrlService` for the paid `nuget.abp.io` feed.
+
+<Info>
+The store sits one level beneath the builders described in [Project building and templates](/cli/project-building-and-templates). It is also reused by `ModuleProjectBuilder`, `NugetPackageProjectBuilder` and `NpmPackageProjectBuilder`, so understanding it once explains all four pathways.
+</Info>
+
+## Source layout
+
+<Card title="framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding" icon="folder" horizontal>
+The store and its supporting types live alongside the builders. Network plumbing (`CliHttpClientFactory`) is in `Http/`; the cache path is computed in `CliPaths.cs`.
+</Card>
+
+| File | Type | Responsibility |
+| --- | --- | --- |
+| `ProjectBuilding/ISourceCodeStore.cs` | interface | One method: `Task<TemplateFile> GetAsync(name, type, version, templateSource, includePreReleases, skipCache)`. |
+| `ProjectBuilding/AbpIoSourceCodeStore.cs` | service | The only implementation. Talks to `abp.io/api/download/...`, manages the on-disk cache, supports `-ts` for local sources. |
+| `ProjectBuilding/TemplateFile.cs` | DTO | `byte[] FileBytes`, `string Version`, `string LatestVersion`, `string RepositoryNugetVersion`. |
+| `ProjectBuilding/SourceCodeTypes.cs` | const class | The four type strings: `"template"`, `"module"`, `"nugetPackage"`, `"npmPackage"`. |
+| `ProjectBuilding/IRemoteServiceExceptionHandler.cs` / `RemoteServiceExceptionHandler.cs` | service | Turns non-2xx responses into `UserFriendlyException`s carrying the server's error message. |
+| `CliUrls.cs` | const class | `WwwAbpIo`, `NuGetRootPath`, and helpers like `GetNuGetServiceIndexUrl(apiKey)`. |
+| `CliPaths.cs` | const class | `TemplateCache => ~/.abp/templates`, `Log`, `AccessToken`, `ComputerId`. |
+| `Http/CliHttpClientFactory.cs` | factory | Wraps `IHttpClientFactory`, applies the stored OAuth token via `AddAbpAuthenticationToken`. |
+| `Commands/Services/AbpNuGetIndexUrlService.cs` | service | Reads the cached API key and returns the personalised `https://nuget.abp.io/<key>/v3/index.json` index URL. |
+| `Commands/ClearDownloadCacheCommand.cs` | command | `abp clear-download-cache` — deletes every `*.zip` in `CliPaths.TemplateCache`. |
+
+## Download flow
+
+```mermaid
+flowchart TD
+  A[Caller: TemplateProjectBuilder /\nModuleProjectBuilder / ...] --> B[ISourceCodeStore.GetAsync\nname, type, version?]
+  B --> C{version null?}
+  C -->|yes| D[GetLatestSourceCodeVersionAsync\nPOST abp.io/api/download/{type}/get-version]
+  C -->|no| E[IsVersionExists\nGET abp.io/api/download/all-versions]
+  D --> F[GetTemplateNugetVersionAsync\nPOST get-nuget-version]
+  E --> F
+  F --> G[Compute local cache path\n~/.abp/templates/<name>-<ver>.zip]
+  G --> H{Options.CacheTemplates && !skipCache &&\nFile.Exists?}
+  H -->|hit| I[Read bytes from cache]
+  H -->|miss| J[DownloadSourceCodeContentAsync\nPOST abp.io/api/download/{type}]
+  J --> K[Write bytes to cache if enabled]
+  I --> L[return TemplateFile bytes, version, latestVersion, nugetVersion]
+  K --> L
+```
+
+## `ISourceCodeStore`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/ISourceCodeStore.cs
+public interface ISourceCodeStore
+{
+    Task<TemplateFile> GetAsync(
+        string name,
+        string type,
+        [CanBeNull] string version = null,
+        [CanBeNull] string templateSource = null,
+        bool includePreReleases = false,
+        bool skipCache = false
+    );
+}
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `name` | The template / module / package identifier — `"app"`, `"app-pro"`, `"Volo.Abp.Identity"`, etc. |
+| `type` | One of the constants in `SourceCodeTypes`. Determines the URL segment (`template`, `module`, `nugetPackage`, `npmPackage`). |
+| `version` | `null` → query `abp.io` for the latest. Otherwise must be a known version (checked via `all-versions`). |
+| `templateSource` | If supplied and **not** an HTTP URL, treat as a local folder containing `<name>-<version>.zip`. If HTTP, fetch by GET instead of the normal POST. |
+| `includePreReleases` | Forwarded to the version endpoint; `true` lets `-rc.X` versions count as "latest". |
+| `skipCache` | Bypass the local cache for this call (matches the `--skip-cache` CLI flag). |
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/SourceCodeTypes.cs
+public static class SourceCodeTypes
+{
+    public const string Template = "template";
+    public const string Module = "module";
+    public const string NugetPackage = "nugetPackage";
+    public const string NpmPackage = "npmPackage";
+}
+```
+
+These strings become URL segments — `https://abp.io/api/download/template/`, `https://abp.io/api/download/module/`, and so on.
+
+## `TemplateFile`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/TemplateFile.cs
+public class TemplateFile
+{
+    public string Version { get; }
+    public string LatestVersion { get; }
+    public string RepositoryNugetVersion { get; }
+    public byte[] FileBytes { get; }
+
+    public TemplateFile(byte[] fileBytes, string version, string latestVersion, string repositoryNugetVersion)
+    {
+        FileBytes = fileBytes;
+        Version = version;
+        LatestVersion = latestVersion;
+        RepositoryNugetVersion = repositoryNugetVersion;
+    }
+}
+```
+
+| Field | Used by |
+| --- | --- |
+| `FileBytes` | `FileEntryListReadStep` to unzip into the pipeline. |
+| `Version` | The version that was actually downloaded — propagated into `ProjectBuildArgs.Version` for analytics, and into `ProjectReferenceReplaceStep` to set `<PackageReference Version="...">`. |
+| `LatestVersion` | Diagnostic only — `NewCommand` logs `Your version is lower than X.Y.Z. The latest version is …` when they differ. |
+| `RepositoryNugetVersion` | When the template is being shipped from a non-release branch (`dev`, `rel-X.Y`), the `abp.io` API returns a different NuGet version than the template version. `ProjectReferenceReplaceStep` uses this to choose what to write into the csproj. |
+
+## `AbpIoSourceCodeStore.GetAsync`
+
+The body of the resolution method, condensed but real:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+public async Task<TemplateFile> GetAsync(
+    string name,
+    string type,
+    string version = null,
+    string templateSource = null,
+    bool includePreReleases = false,
+    bool skipCache = false)
+{
+    DirectoryHelper.CreateIfNotExists(CliPaths.TemplateCache);
+    var latestVersion = version
+        ?? await GetLatestSourceCodeVersionAsync(name, type, null, includePreReleases);
+
+    if (version == null)
+    {
+        if (latestVersion == null)
+        {
+            Logger.LogWarning("The remote service is currently unavailable, please specify the version.");
+            // ... print cached templates ...
+            throw new CliUsageException("Use command: abp new Acme.BookStore -v version");
+        }
+
+        version = latestVersion;
+    }
+    else
+    {
+        if (!await IsVersionExists(name, version))
+        {
+            throw new Exception("There is no version found with given version: " + version);
+        }
+    }
+
+    var nugetVersion = (await GetTemplateNugetVersionAsync(name, type, version)) ?? version;
+
+    if (!string.IsNullOrWhiteSpace(templateSource) && !IsNetworkSource(templateSource))
+    {
+        Logger.LogInformation("Using local " + type + ": " + name + ", version: " + version);
+        return new TemplateFile(File.ReadAllBytes(
+            Path.Combine(templateSource, name + "-" + version + ".zip")),
+            version, latestVersion, nugetVersion);
+    }
+
+    var localCacheFile = Path.Combine(CliPaths.TemplateCache,
+        name.Replace("/", ".") + "-" + version + ".zip");
+
+#if DEBUG
+    if (File.Exists(localCacheFile))
+    {
+        return new TemplateFile(File.ReadAllBytes(localCacheFile),
+            version, latestVersion, nugetVersion);
+    }
+#endif
+
+    if (Options.CacheTemplates && !skipCache && File.Exists(localCacheFile) && templateSource.IsNullOrWhiteSpace())
+    {
+        Logger.LogInformation("Using cached " + type + ": " + name + ", version: " + version);
+        return new TemplateFile(File.ReadAllBytes(localCacheFile),
+            version, latestVersion, nugetVersion);
+    }
+
+    Logger.LogInformation("Downloading " + type + ": " + name + ", version: " + version);
+
+    var fileContent = await DownloadSourceCodeContentAsync(
+        new SourceCodeDownloadInputDto
+        {
+            Name = name,
+            Type = type,
+            TemplateSource = templateSource,
+            Version = version,
+            IncludePreReleases = includePreReleases
+        }
+    );
+
+    if (Options.CacheTemplates && templateSource.IsNullOrWhiteSpace())
+    {
+        File.Delete(localCacheFile);
+        File.WriteAllBytes(localCacheFile, fileContent);
+    }
+
+    return new TemplateFile(fileContent, version, latestVersion, nugetVersion);
+}
+```
+
+Five behaviours worth pulling out:
+
+1. **`CliPaths.TemplateCache` is created lazily on first call.** No setup step is required; the directory just appears under `~/.abp/templates/` the first time the CLI runs.
+2. **Cache miss is silent and recoverable.** If the version endpoint fails (network down), `latestVersion == null` triggers the "specify a version" warning *and* a listing of every locally cached template, then a `CliUsageException`. The user can still build offline by passing `-v X.Y.Z` if the matching zip is already cached.
+3. **DEBUG builds always trust the cache.** The `#if DEBUG` block skips the `CacheTemplates && !skipCache` gate so framework developers iterating on the CLI don't keep re-downloading the same template.
+4. **Local source mode is `-ts /path/to/folder`.** When `templateSource` is set and not HTTP, the store reads `<templateSource>/<name>-<version>.zip` directly and returns. This is what `dev/local-templates/` integration testing relies on.
+5. **HTTP local source is `-ts https://my-server/template.zip`.** When `IsNetworkSource(templateSource)` is true, the download path GETs the URL directly instead of POSTing to `abp.io`.
+
+## Version negotiation endpoints
+
+`AbpIoSourceCodeStore` calls three small JSON endpoints. They all share the `CliHttpClientFactory` and `RemoteServiceExceptionHandler`:
+
+| Endpoint | Verb | Purpose |
+| --- | --- | --- |
+| `https://abp.io/api/download/{type}/get-version/` | POST `{ Name, IncludePreReleases }` | Returns the latest version string for `name`. |
+| `https://abp.io/api/download/{type}/get-nuget-version/` | POST `{ Name, Version }` | (Templates only.) Returns the NuGet version that corresponds to a template release. |
+| `https://abp.io/api/download/all-versions?includePreReleases=true` | GET | Returns the union of framework + commercial + LeptonX versions, used to validate `-v`. |
+| `https://abp.io/api/download/{type}/` | POST `{ Name, Type, TemplateSource, Version, IncludePreReleases }` | Returns the zip bytes. |
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+private async Task<string> GetLatestSourceCodeVersionAsync(string name, string type, string url = null,
+    bool includePreReleases = false)
+{
+    if (url == null)
+    {
+        url = $"{CliUrls.WwwAbpIo}api/download/{type}/get-version/";
+    }
+
+    try
+    {
+        var client = _cliHttpClientFactory.CreateClient();
+        var stringContent = new StringContent(
+            JsonSerializer.Serialize(new GetLatestSourceCodeVersionDto
+                { Name = name, IncludePreReleases = includePreReleases }),
+            Encoding.UTF8,
+            MimeTypes.Application.Json
+        );
+
+        using (var response = await client.PostAsync(url, stringContent,
+            _cliHttpClientFactory.GetCancellationToken(TimeSpan.FromMinutes(10))))
+        {
+            await RemoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync(response);
+            var result = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<GetVersionResultDto>(result).Version;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("Error occured while getting the latest version from {0} : {1}", url, ex.Message);
+        return null;
+    }
+}
+```
+
+`GetTemplateNugetVersionAsync` and `IsVersionExists` follow the same pattern. The `IsVersionExists` LeptonX branch is the only place the store special-cases the LeptonX product family:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+return templateName.Contains("LeptonX") ?
+    versions.LeptonXVersions.Any(v => v.Name == version) :
+    versions.FrameworkAndCommercialVersions.Any(v => v.Name == version);
+```
+
+LeptonX has its own release cadence independent of the framework, so its versions are returned in a separate list.
+
+## `DownloadSourceCodeContentAsync`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+private async Task<byte[]> DownloadSourceCodeContentAsync(SourceCodeDownloadInputDto input)
+{
+    var url = $"{CliUrls.WwwAbpIo}api/download/{input.Type}/";
+
+    HttpResponseMessage responseMessage = null;
+
+    try
+    {
+        var client = _cliHttpClientFactory.CreateClient(timeout: TimeSpan.FromMinutes(5));
+
+        if (input.TemplateSource.IsNullOrWhiteSpace())
+        {
+            responseMessage = await client.PostAsync(
+                url,
+                new StringContent(JsonSerializer.Serialize(input), Encoding.UTF8, MimeTypes.Application.Json),
+                _cliHttpClientFactory.GetCancellationToken(TimeSpan.FromMinutes(10))
+            );
+        }
+        else
+        {
+            responseMessage = await client.GetAsync(input.TemplateSource,
+                _cliHttpClientFactory.GetCancellationToken());
+        }
+
+        await RemoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync(responseMessage);
+        var resultAsBytes = await responseMessage.Content.ReadAsByteArrayAsync();
+        responseMessage.Dispose();
+
+        return resultAsBytes;
+    }
+    catch (Exception ex) { /* logs and rethrows */ }
+}
+```
+
+| Behaviour | Detail |
+| --- | --- |
+| Default timeout | `CliHttpClientFactory.DefaultTimeout = 2 minutes`. The store explicitly overrides to **5 minutes** for the download POST because large `microservice-pro` zips can exceed two minutes on slow links. |
+| Auth | `CliHttpClientFactory.CreateClient()` defaults to `needsAuthentication: true`, so `AddAbpAuthenticationToken()` reads `~/.abp/cli/access-token.bin` and attaches the bearer token. Commercial templates (`app-pro`, etc.) require it; community templates work anonymously because `abp.io` ignores the header for them. |
+| Cancellation | `CliHttpClientFactory.GetCancellationToken(TimeSpan.FromMinutes(10))` adds an overall 10-minute ceiling regardless of HTTP timeout, so a stuck connection eventually unblocks the CLI. |
+| Error path | `RemoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync` translates 4xx/5xx into `UserFriendlyException` with the server's message (license expired, version withdrawn, etc.). |
+
+## The on-disk cache
+
+The cache is just a flat folder of zips. Path:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliPaths.cs
+public static string TemplateCache => Path.Combine(AbpRootPath, "templates"); //TODO: Move somewhere else?
+public static readonly string AbpRootPath =
+    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".abp");
+```
+
+So on Windows `%USERPROFILE%\.abp\templates\`, on Linux/macOS `~/.abp/templates/`. File naming is `<name>-<version>.zip` with `/` replaced by `.` (this matters for module names like `Volo.Abp/Identity` that contain a slash in their canonical form).
+
+The cache is read on every `GetAsync` call, written after every successful download (unless `templateSource` is set), and never auto-evicted. The two ways to clear it are:
+
+<AccordionGroup>
+<Accordion title="abp clear-download-cache">
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ClearDownloadCacheCommand.cs
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    Logger.LogInformation("Clearing the templates download cache...");
+    foreach (var cacheFile in Directory.GetFiles(CliPaths.TemplateCache, "*.zip"))
+    {
+        Logger.LogInformation($"Deleting {cacheFile}");
+        try
+        {
+            File.Delete(cacheFile);
+        }
+        catch (Exception e)
+        {
+            Logger.LogError(e, $"Could not delete {cacheFile}");
+        }
+    }
+    Logger.LogInformation("Done.");
+    await Task.CompletedTask;
+}
+```
+Glob: `*.zip` only. Anything else under `~/.abp/templates/` is left alone.
+</Accordion>
+
+<Accordion title="--skip-cache flag per call">
+`NewCommand`, `GetSourceCommand` and `AddModuleCommand` all forward `--skip-cache` into `ProjectBuildArgs.SkipCache`, which becomes the `skipCache: true` argument to `GetAsync`. The cache is consulted on the read side (force redownload) but still **written** on the way out, so a single `--skip-cache` call refreshes the cached zip.
+</Accordion>
+
+<Accordion title="CacheTemplates = false globally">
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliOptions.cs
+public bool CacheTemplates { get; set; } = true;
+```
+A consumer of `Volo.Abp.Cli.Core` (e.g. ABP Studio) can flip this to disable the cache entirely. With `CacheTemplates = false`, every call bypasses both the read and the write side.
+</Accordion>
+</AccordionGroup>
+
+`GetLocalTemplates` is the helper that fuels the "your network is down — here's what's cached" warning:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+private List<(string TemplateName, string Version)> GetLocalTemplates()
+{
+    var templateList = new List<(string TemplateName, string Version)>();
+
+    var stringBuilder = new StringBuilder();
+    foreach (var cacheFile in Directory.GetFiles(CliPaths.TemplateCache))
+    {
+        stringBuilder.AppendLine(cacheFile);
+    }
+
+    var matches = Regex.Matches(stringBuilder.ToString(),
+        $"({AppTemplate.TemplateName}|{AppNoLayersProTemplate.TemplateName}|{AppNoLayersTemplate.TemplateName}|{AppProTemplate.TemplateName}|{ModuleTemplate.TemplateName}|{ModuleProTemplate.TemplateName}|{ConsoleTemplate.TemplateName}|{WpfTemplate.TemplateName}|{MauiTemplate.TemplateName})-(.+).zip");
+    foreach (Match match in matches)
+    {
+        templateList.Add((match.Groups[1].Value, match.Groups[2].Value));
+    }
+
+    return templateList;
+}
+```
+
+The regex is built from the `TemplateName` constants — adding a new template family means it shows up here automatically.
+
+## Internal DTOs
+
+`AbpIoSourceCodeStore` defines five nested types that mirror the `abp.io` JSON wire format:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/AbpIoSourceCodeStore.cs
+public class SourceCodeDownloadInputDto
+{
+    public string Name { get; set; }
+    public string Version { get; set; }
+    public string Type { get; set; }
+    public string TemplateSource { get; set; }
+    public bool IncludePreReleases { get; set; }
+}
+
+public class GetLatestSourceCodeVersionDto
+{
+    public string Name { get; set; }
+    public bool IncludePreReleases { get; set; }
+}
+
+public class GetTemplateNugetVersionDto
+{
+    public string Name { get; set; }
+    public string Version { get; set; }
+    public bool IncludePreReleases { get; set; }
+}
+
+public class GetVersionResultDto
+{
+    public string Version { get; set; }
+}
+
+public class GithubReleaseVersions
+{
+    public List<GithubRelease> FrameworkAndCommercialVersions { get; set; }
+    public List<GithubRelease> LeptonXVersions { get; set; }
+}
+```
+
+They are intentionally `public` so consumers of `Volo.Abp.Cli.Core` (custom CLIs, ABP Studio) can construct them when shimming the store.
+
+## HTTP plumbing
+
+`CliHttpClientFactory` is the single entry point for every outbound call in the CLI. It does three things:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Http/CliHttpClientFactory.cs
+public class CliHttpClientFactory : ISingletonDependency
+{
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(2);
+
+    private readonly IHttpClientFactory _clientFactory;
+    private readonly ICancellationTokenProvider _cancellationTokenProvider;
+
+    public HttpClient CreateClient(bool needsAuthentication = true,
+        TimeSpan? timeout = null, string clientName = null)
+    {
+        var httpClient = _clientFactory.CreateClient(clientName ?? CliConsts.HttpClientName);
+        httpClient.Timeout = timeout ?? DefaultTimeout;
+
+        if (needsAuthentication)
+        {
+            httpClient.AddAbpAuthenticationToken();
+        }
+
+        return httpClient;
+    }
+    // GetCancellationToken(TimeSpan?) ...
+}
+```
+
+`AddAbpAuthenticationToken` (in `Auth/AuthService.cs`) reads `~/.abp/cli/access-token.bin`, decrypts it with the data-protection key, and adds `Authorization: Bearer <token>`. If no token is present, the request goes out unauthenticated.
+
+The two named `HttpClient` instances are registered in `AbpCliCoreModule`:
+
+| Name | Used by | Notes |
+| --- | --- | --- |
+| `CliConsts.HttpClientName` | Default — everything that talks to `abp.io`. | Plain user-agent. |
+| `CliConsts.GithubHttpClientName` | `Volo.Abp.Cli.GitHub.*` | Custom `User-Agent` because GitHub rejects unidentified clients. |
+
+## `RemoteServiceExceptionHandler`
+
+The store never lets a raw `HttpRequestException` reach the caller. `RemoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync` inspects the body for ABP's structured `{"error":{"message": "..."}}` envelope and rethrows as `UserFriendlyException`. That is why a license-related failure surfaces as a single console line like "*This template requires a Pro license.*" rather than a 403 stack trace.
+
+## NuGet feed integration — `AbpNuGetIndexUrlService`
+
+Paid features (`add-package Volo.CmsKit.Pro`, `add-module Volo.Saas`) need access to `https://nuget.abp.io/<api-key>/v3/index.json`, a personalised NuGet v3 service index. The key comes from `IApiKeyService` (cached in `~/.abp/cli/api-key`).
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/Services/AbpNuGetIndexUrlService.cs
+public class AbpNuGetIndexUrlService : ITransientDependency
+{
+    private readonly IApiKeyService _apiKeyService;
+    public ILogger<AbpNuGetIndexUrlService> Logger { get; set; }
+
+    public async Task<string> GetAsync()
+    {
+        var apiKeyResult = await _apiKeyService.GetApiKeyOrNullAsync();
+
+        if (apiKeyResult == null)
+        {
+            Logger.LogWarning("You are not signed in! Use the CLI command \"abp login <username>\" to sign in, then try again.");
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(apiKeyResult.ErrorMessage))
+        {
+            Logger.LogWarning(apiKeyResult.ErrorMessage);
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(apiKeyResult.ApiKey))
+        {
+            Logger.LogError("Couldn't retrieve your NuGet API key! You can re-sign in with the CLI command \"abp login <username>\".");
+            return null;
+        }
+        // ... returns CliUrls.GetNuGetServiceIndexUrl(apiKey)
+    }
+}
+```
+
+The URL helpers live in `CliUrls.cs`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliUrls.cs
+public static string GetNuGetServiceIndexUrl(string apiKey)
+    => $"{NuGetRootPath}{apiKey}/v3/index.json";
+
+public static string GetNuGetPackageInfoUrl(string apiKey, string packageId)
+    => $"{NuGetRootPath}{apiKey}/v3/package/{packageId}/index.json";
+
+public static string GetNuGetPackageSearchUrl(string apiKey, string packageId)
+    => $"{NuGetRootPath}{apiKey}/v3/search?q={packageId}";
+```
+
+Where `NuGetRootPath = "https://nuget.abp.io/"` in production. (`CliUrls` also defines `NuGetRootPathDevelopment` pointing at `https://localhost:44373/` so framework developers can run the local feed.)
+
+| Consumer | What it does with the index URL |
+| --- | --- |
+| `SuiteCommand` (install / update) | Passes `--add-source <indexUrl>` to `dotnet tool install -g Volo.Abp.Suite`. |
+| `NugetPackageInfoProvider` | Queries the search endpoint to resolve the latest available version of a paid package. |
+| `add-package Volo.CmsKit.Pro` | Falls back to the paid feed when the package is not on nuget.org. |
+
+## Cached paths summary
+
+| Path | Owner | Purpose |
+| --- | --- | --- |
+| `~/.abp/templates/<name>-<ver>.zip` | `AbpIoSourceCodeStore` | Template / module / package zip cache. |
+| `~/.abp/cli/access-token.bin` | `AuthService` | OAuth bearer token for `abp.io`. |
+| `~/.abp/cli/computer-id.bin` | analytics | Stable per-machine ID for `abp.io` usage telemetry. |
+| `~/.abp/cli/logs/abp-cli-logs.txt` | Serilog file sink | All CLI logs across sessions. |
+| `<exe-dir>/memory.bin` | `MemoryService` | Persistent dictionary for "last version check date" etc. |
+| `<temp>/AbpLicense.bin` | licensing | Encrypted license cache for Pro tools. |
+
+## Worked example: `abp new Acme.BookStore -t app-pro --skip-cache`
+
+1. `NewCommand` builds `ProjectBuildArgs` with `TemplateName="app-pro"`, `Version=null`, `SkipCache=true`.
+2. `TemplateProjectBuilder.BuildAsync` calls `SourceCodeStore.GetAsync("app-pro", "template", null, null, includePreReleases: false, skipCache: false)`. *(`SkipCache` is forwarded only via `ExtraProperties["skip-cache"]` in newer builds — the store still respects the on-disk cache for non-skip calls.)*
+3. `AbpIoSourceCodeStore.GetAsync` POSTs `https://abp.io/api/download/template/get-version/` with `{"Name":"app-pro","IncludePreReleases":false}`. Auth header is set because `app-pro` is a paid template.
+4. `abp.io` returns `{"Version":"9.0.3"}`. The store then POSTs `get-nuget-version` and receives the same (or a `dev-…` variant for nightly).
+5. `localCacheFile = ~/.abp/templates/app-pro-9.0.3.zip`. The store checks that path — present from a previous run — and returns its bytes without a network download.
+6. The bytes flow into `FileEntryListReadStep`, the pipeline runs, the result is extracted into `./Acme.BookStore/`.
+
+## Where to go next
+
+<CardGroup cols={2}>
+<Card title="Project building and templates" icon="folder-tree" href="/cli/project-building-and-templates">
+The consumer of `ISourceCodeStore` — `TemplateProjectBuilder` and the build pipeline that turns the cached zip into a customised solution.
+</Card>
+<Card title="Project modification" icon="screwdriver-wrench" href="/cli/project-modification">
+The other consumer — `SolutionModuleAdder` calls the store to fetch module source code before splicing it into an existing solution.
+</Card>
+<Card title="New and Update" icon="wand-magic-sparkles" href="/cli/new-and-update">
+`NewCommand` end-to-end, including `--skip-cache`, `--preview`, `-v`, `-ts` flags.
+</Card>
+<Card title="Login and logout" icon="key" href="/cli/auth-and-account">
+How the OAuth token written to `~/.abp/cli/access-token.bin` gets there in the first place.
+</Card>
+<Card title="Application template" icon="layer-group" href="/templates/app-template">
+The end-user description of the `app` template that the store delivers as a zip.
+</Card>
+<Card title="Service proxy generation" icon="bolt" href="/cli/service-proxy-generation">
+The other place `CliHttpClientFactory` is heavily used — calling the running API to fetch its `/api/abp/api-definition`.
+</Card>
+</CardGroup>

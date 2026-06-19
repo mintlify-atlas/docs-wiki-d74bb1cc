@@ -1,0 +1,312 @@
+---
+title: "AbpAspNetCoreModule: Base Web Wiring and Middlewares"
+sidebarTitle: "AspNetCore module"
+description: "Inside Volo.Abp.AspNetCore: AbpAspNetCoreModule, request-localization middleware, ABP middlewares, options classes and the IApplicationBuilder helpers."
+---
+
+`AbpAspNetCoreModule` is the foundation that every ABP web host depends on,
+directly or transitively. It lives in
+[`framework/src/Volo.Abp.AspNetCore`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore)
+and binds the ABP runtime (auditing, security, virtual file system, unit of
+work, HTTP infrastructure, authorization, validation and exception
+handling) to ASP.NET Core's host, options system and request pipeline.
+
+## File inventory
+
+The package is small but dense. Each subfolder is responsible for a
+discrete piece of the request pipeline.
+
+| Folder | Responsibility |
+| --- | --- |
+| `Volo/Abp/AspNetCore` | Module class, ASP.NET Core constants, audit log contributor, controller replacement attribute |
+| `Volo/Abp/AspNetCore/Auditing` | `AbpAuditingMiddleware`, `AbpAspNetCoreAuditingOptions`, `AspNetCoreAuditLogContributor` |
+| `Volo/Abp/AspNetCore/ExceptionHandling` | Authorization exception handler + `IHttpExceptionStatusCodeFinder` |
+| `Volo/Abp/AspNetCore/Security` | Security headers middleware/options, `IgnoreAbpSecurityHeader` |
+| `Volo/Abp/AspNetCore/Security/Claims` | `AbpClaimsMapMiddleware`, `AbpDynamicClaimsMiddleware`, `AbpClaimsMapOptions` |
+| `Volo/Abp/AspNetCore/SecurityLog` | `AspNetCoreSecurityLogManager` (HTTP-aware security log writer) |
+| `Volo/Abp/AspNetCore/Tracing` | `AbpCorrelationIdMiddleware` |
+| `Volo/Abp/AspNetCore/Uow` | `AbpUnitOfWorkMiddleware` + unit-of-work options |
+| `Volo/Abp/AspNetCore/VirtualFileSystem` | Web-content file provider that mounts virtual files on `wwwroot` |
+| `Microsoft/AspNetCore/Builder` | Application builder extension methods (`UseAuditing`, `UseUnitOfWork`, …) |
+| `Microsoft/AspNetCore/RequestLocalization` | `AbpRequestLocalizationMiddleware` and provider abstractions |
+| `Microsoft/AspNetCore/Routing` | `AbpEndpointRouterOptions` consumed by `UseConfiguredEndpoints` |
+
+## Module declaration
+
+```csharp title="framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/AbpAspNetCoreModule.cs"
+[DependsOn(
+    typeof(AbpAuditingModule),
+    typeof(AbpSecurityModule),
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpUnitOfWorkModule),
+    typeof(AbpHttpModule),
+    typeof(AbpAuthorizationModule),
+    typeof(AbpValidationModule),
+    typeof(AbpExceptionHandlingModule)
+    )]
+public class AbpAspNetCoreModule : AbpModule
+```
+
+### PreConfigureServices
+
+Synchronizes ABP's `IAbpHostEnvironment` with ASP.NET Core's
+`IWebHostEnvironment`. This is how the rest of the framework can read the
+environment name without taking an ASP.NET Core dependency.
+
+```csharp title="AbpAspNetCoreModule.PreConfigureServices"
+var abpHostEnvironment = context.Services.GetSingletonInstance<IAbpHostEnvironment>();
+if (abpHostEnvironment.EnvironmentName.IsNullOrWhiteSpace())
+{
+    abpHostEnvironment.EnvironmentName = context.Services.GetHostingEnvironment().EnvironmentName;
+}
+```
+
+### ConfigureServices
+
+Three things happen here:
+
+1. `services.AddAuthorization()` is called so policy evaluation is always
+   available, even for hosts that only call `UseAuthentication`.
+2. `AspNetCoreAuditLogContributor` is added to `AbpAuditingOptions.Contributors`
+   so audit logs automatically capture HTTP method/path/status.
+3. `StaticFileOptions.ContentTypeProvider` is replaced with
+   `AbpFileExtensionContentTypeProvider`, which extends the ASP.NET Core
+   provider with extra MIME entries used by ABP modules.
+
+```csharp title="AbpAspNetCoreModule.ConfigureServices (excerpt)"
+context.Services.AddAuthorization();
+
+Configure<AbpAuditingOptions>(options =>
+{
+    options.Contributors.Add(new AspNetCoreAuditLogContributor());
+});
+
+Configure<StaticFileOptions>(options =>
+{
+    options.ContentTypeProvider = context.Services.GetRequiredService<AbpFileExtensionContentTypeProvider>();
+});
+
+AddAspNetServices(context.Services);
+context.Services.AddObjectAccessor<IApplicationBuilder>();
+context.Services.AddAbpDynamicOptions<RequestLocalizationOptions, AbpRequestLocalizationOptionsManager>();
+```
+
+`AddObjectAccessor<IApplicationBuilder>()` is the trick that lets ABP grab
+the live `IApplicationBuilder` later (the value is set by
+`InitializeApplicationAsync`).
+
+### OnApplicationInitialization
+
+`WebRootFileProvider` is replaced with a `CompositeFileProvider` that
+combines the physical `wwwroot` with `IWebContentFileProvider`. This is
+how virtual files contributed by ABP modules (theme assets, module
+JS/CSS) become discoverable through standard static-file middleware.
+
+```csharp title="AbpAspNetCoreModule.OnApplicationInitialization"
+var environment = context.GetEnvironmentOrNull();
+if (environment != null)
+{
+    environment.WebRootFileProvider =
+        new CompositeFileProvider(
+            context.GetEnvironment().WebRootFileProvider,
+            context.ServiceProvider.GetRequiredService<IWebContentFileProvider>()
+        );
+}
+```
+
+## Constants
+
+`AbpAspNetCoreConsts` exposes a handful of stable strings used throughout
+the codebase. They show up as route prefixes and CSP nonce keys.
+
+```csharp title="Volo/Abp/AspNetCore/AbpAspNetCoreConsts.cs"
+public static class AbpAspNetCoreConsts
+{
+    public const string DefaultApiPrefix = "api";
+    public const string DefaultIntegrationServiceApiPrefix = "integration-api";
+    public const string ScriptNonceKey = "ScriptNonce";
+}
+```
+
+`DefaultApiPrefix` is consumed by `ConventionalRouteBuilder` to generate
+`/api/<root-path>/<controller>` URLs. See
+[API conventions](/web/api-conventions).
+
+## Application builder helpers
+
+`AbpApplicationBuilderExtensions` (in the `Microsoft.AspNetCore.Builder`
+namespace) is where every ABP middleware gets a `Use…` extension method.
+
+| Extension | Adds middleware |
+| --- | --- |
+| `UseAbpRequestLocalization` | `AbpRequestLocalizationMiddleware` (warms up `IAbpRequestLocalizationOptionsProvider`) |
+| `UseCorrelationId` | `AbpCorrelationIdMiddleware` |
+| `UseAbpSecurityHeaders` | `AbpSecurityHeadersMiddleware` (CSP, XFO, nonce) |
+| `UseAbpClaimsMap` | `AbpClaimsMapMiddleware` (maps inbound claim types to ABP-known claims) |
+| `UseDynamicClaims` | `AbpDynamicClaimsMiddleware` (replays per-request claims) |
+| `UseAuditing` | `AbpAuditingMiddleware` |
+| `UseUnitOfWork` | `UseAbpExceptionHandling` (idempotent) + `AbpUnitOfWorkMiddleware` |
+| `UseAbpExceptionHandling` | `AbpExceptionHandlingMiddleware` |
+
+```csharp title="framework/src/Volo.Abp.AspNetCore/Microsoft/AspNetCore/Builder/AbpApplicationBuilderExtensions.cs"
+public static IApplicationBuilder UseUnitOfWork(this IApplicationBuilder app)
+{
+    return app
+        .UseAbpExceptionHandling()
+        .UseMiddleware<AbpUnitOfWorkMiddleware>();
+}
+
+public static IApplicationBuilder UseAbpExceptionHandling(this IApplicationBuilder app)
+{
+    if (app.Properties.ContainsKey(ExceptionHandlingMiddlewareMarker))
+    {
+        return app;
+    }
+
+    app.Properties[ExceptionHandlingMiddlewareMarker] = true;
+    return app.UseMiddleware<AbpExceptionHandlingMiddleware>();
+}
+```
+
+`InitializeApplicationAsync` is the bridge from ABP module initialization
+to ASP.NET Core's startup. It stores the `IApplicationBuilder` in the
+`ObjectAccessor<IApplicationBuilder>` and hooks `IHostApplicationLifetime`
+events so the ABP application shuts down with the host.
+
+```csharp title="InitializeApplicationAsync (excerpt)"
+app.ApplicationServices.GetRequiredService<ObjectAccessor<IApplicationBuilder>>().Value = app;
+var application = app.ApplicationServices.GetRequiredService<IAbpApplicationWithExternalServiceProvider>();
+var applicationLifetime = app.ApplicationServices.GetRequiredService<IHostApplicationLifetime>();
+
+applicationLifetime.ApplicationStopping.Register(() =>
+{
+    AsyncHelper.RunSync(() => application.ShutdownAsync());
+});
+
+await application.InitializeAsync(app.ApplicationServices);
+```
+
+## Request culture middleware
+
+`AbpRequestLocalizationMiddleware` is a thin wrapper around the standard
+`RequestLocalizationMiddleware` that pulls its `RequestLocalizationOptions`
+from `IAbpRequestLocalizationOptionsProvider` &mdash; which is itself an
+`AbpDynamicOptions` registration (see the `ConfigureServices` excerpt
+above). This lets modules contribute supported cultures at runtime instead
+of build time.
+
+```csharp title="Microsoft/AspNetCore/RequestLocalization/AbpRequestLocalizationMiddleware.cs"
+public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+{
+    var middleware = new RequestLocalizationMiddleware(
+        next,
+        new OptionsWrapper<RequestLocalizationOptions>(
+            await _requestLocalizationOptionsProvider.GetLocalizationOptionsAsync()
+        ),
+        _loggerFactory
+    );
+
+    context.Response.OnStarting(() =>
+    {
+        if (context.Items[HttpContextItemName] == null)
+        {
+            var requestCultureFeature = context.Features.Get<IRequestCultureFeature>();
+            if (requestCultureFeature?.Provider is QueryStringRequestCultureProvider)
+            {
+                AbpRequestCultureCookieHelper.SetCultureCookie(
+                    context,
+                    requestCultureFeature.RequestCulture
+                );
+            }
+        }
+
+        return Task.CompletedTask;
+    });
+
+    await middleware.Invoke(context);
+}
+```
+
+The `Response.OnStarting` callback persists the chosen culture as a cookie
+whenever the original selection came from a query-string provider (the
+`?culture=…` pattern used on language pickers).
+
+## Notable options classes
+
+These are the options classes you will configure most often inside a
+module's `ConfigureServices`. All of them live under the `Volo.Abp.AspNetCore`
+package.
+
+| Option | Used by | Purpose |
+| --- | --- | --- |
+| `AbpAspNetCoreContentOptions` | `WebContentFileProvider` | Allowed extensions / excluded folders for the virtual file system on the web side |
+| `AbpAspNetCoreAuditingOptions` | `AbpAuditingMiddleware` | `IgnoredUrls`, HTTP-specific opt-outs |
+| `AbpAspNetCoreUnitOfWorkOptions` + `AspNetCoreUnitOfWorkTransactionBehaviourProviderOptions` | `AbpUnitOfWorkMiddleware` | When a request gets a transactional UoW |
+| `AbpAuthorizationExceptionHandlerOptions` | `DefaultAbpAuthorizationExceptionHandler` | How redirects/error pages render for `AbpAuthorizationException` |
+| `AbpExceptionHttpStatusCodeOptions` | `DefaultHttpExceptionStatusCodeFinder` | Map ABP error codes → HTTP status codes |
+| `AbpClaimsMapOptions` | `AbpClaimsMapMiddleware` | Inbound JWT claim names → ABP claim names |
+| `AbpSecurityHeadersOptions` | `AbpSecurityHeadersMiddleware` | CSP, XFO, etc. |
+| `AbpEndpointRouterOptions` | `UseConfiguredEndpoints` | Endpoint configuration actions added by modules |
+
+### AbpEndpointRouterOptions
+
+This one is worth a closer look because it is how `AbpAspNetCoreMvcModule`
+wires the default MVC + Razor Pages endpoints without forcing application
+hosts to copy the boilerplate:
+
+```csharp title="AbpAspNetCoreMvcModule.cs (excerpt)"
+Configure<AbpEndpointRouterOptions>(options =>
+{
+    options.EndpointConfigureActions.Add(endpointContext =>
+    {
+        endpointContext.Endpoints.MapControllerRoute("defaultWithArea", "{area}/{controller=Home}/{action=Index}/{id?}");
+        endpointContext.Endpoints.MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}");
+        endpointContext.Endpoints.MapRazorPages();
+    });
+});
+```
+
+`UseConfiguredEndpoints` runs each action inside a single scoped
+`IEndpointRouteBuilder`:
+
+```csharp title="AbpAspNetCoreApplicationBuilderExtensions.UseConfiguredEndpoints"
+return app.UseEndpoints(endpoints =>
+{
+    using (var scope = app.ApplicationServices.CreateScope())
+    {
+        if (options.EndpointConfigureActions.Any())
+        {
+            var context = new EndpointRouteBuilderContext(endpoints, scope.ServiceProvider);
+            foreach (var configureAction in options.EndpointConfigureActions)
+            {
+                configureAction(context);
+            }
+        }
+    }
+
+    additionalConfigurationAction?.Invoke(endpoints);
+});
+```
+
+## Integration with cross-cutting features
+
+Most middlewares added here exist to give ABP cross-cutting features an
+HTTP surface. Follow the links to see how the feature itself is structured:
+
+<CardGroup cols={2}>
+  <Card title="Authentication" href="/auth" icon="key">
+    `UseAbpClaimsMap` / `UseDynamicClaims` plug into the principal that authentication produces.
+  </Card>
+  <Card title="Authorization" href="/authz" icon="shield-check">
+    `IAbpAuthorizationExceptionHandler` and `DefaultHttpExceptionStatusCodeFinder` translate `AbpAuthorizationException` into 401/403.
+  </Card>
+  <Card title="Multi-tenancy" href="/multitenancy" icon="building">
+    Tenant resolution middleware composes inside this pipeline ahead of UoW.
+  </Card>
+  <Card title="Auditing" href="/auditing" icon="clipboard-list">
+    `AspNetCoreAuditLogContributor` records HTTP request details inside every audit log scope.
+  </Card>
+</CardGroup>
+
+For controller-side details continue with
+[MVC controllers](/web/mvc-controllers).

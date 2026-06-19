@@ -1,0 +1,334 @@
+---
+title: "Design principles behind the ABP Framework codebase"
+sidebarTitle: "Design Principles"
+description: "DDD layering, modularity, DI conventions, multi-tenancy, source-code replaceability and opinionated database options grounded in real ABP source files."
+---
+
+The ABP Framework is opinionated on purpose. A small number of design principles — DDD layering, modular composition, convention-over-configuration DI, ubiquitous multi-tenancy, replaceable source-code modules, and an opinionated database matrix — recur across every package under `framework/src/` and every business module under `modules/`. This page collects those principles and points at the concrete code that enforces them, so you can predict where a feature will live before reading it and know which extension point to use when extending the framework.
+
+<Note>
+  Each principle is described with the file path of the *interface or attribute that makes it observable in code*. If you ever have to ask "is this an ABP convention or local style?", search for the marker referenced here.
+</Note>
+
+## 1. Strict DDD layering
+
+Every framework package and every business module under `modules/` is split into the same set of layers: `Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `EntityFrameworkCore`, `MongoDB`, `HttpApi`, `HttpApi.Client`, and the UI projects (`Web` for MVC, `Blazor`, `Blazor.Server`, `Blazor.WebAssembly`). The framework itself ships the abstract bases used by every layer in `framework/src/Volo.Abp.Ddd.*/`.
+
+### Marker interfaces drive layer membership
+
+ABP does not invent a new annotation system: it uses plain .NET interfaces as markers so layer membership is checkable at compile time and at registration time.
+
+```csharp framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/IDomainService.cs
+using Volo.Abp.DependencyInjection;
+
+namespace Volo.Abp.Domain.Services;
+
+/// <summary>
+/// This interface can be implemented by all domain services to identify them by convention.
+/// </summary>
+public interface IDomainService : ITransientDependency
+{
+
+}
+```
+
+That single line is the entire definition of "domain service". Because it derives from `ITransientDependency`, the conventional registrar automatically picks up every concrete `IDomainService` implementation. The same story repeats one layer up with `IApplicationService`:
+
+```csharp framework/src/Volo.Abp.Ddd.Application.Contracts/Volo/Abp/Application/Services/IApplicationService.cs
+namespace Volo.Abp.Application.Services;
+
+/// <summary>
+/// This interface must be implemented by all application services to register and identify them by convention.
+/// </summary>
+public interface IApplicationService : IRemoteService
+{
+
+}
+```
+
+The `IRemoteService` parentage is the trigger that lets `framework/src/Volo.Abp.AspNetCore.Mvc` auto-generate MVC controllers for the service, and lets `framework/src/Volo.Abp.Http.Client` generate dynamic client proxies for it — without you ever writing a `[Route]` attribute.
+
+### Dependencies always point inward
+
+The `.csproj` reference graph encodes the layering. A `*.Domain` project may only reference `*.Domain.Shared`. An `*.Application` project may reference `*.Domain` and `*.Application.Contracts`. Infrastructure projects (`*.EntityFrameworkCore`, `*.MongoDB`) reference `*.Domain` to implement repositories; the UI projects reference `*.Application.Contracts` (for DTOs) and `*.HttpApi.Client` (for remote calls). The detailed mapping is on the [/overview/architecture](/overview/architecture) page; the rule of thumb is that no file outside `*.Application` may ever depend on `IRepository<T>` directly.
+
+### Why this discipline matters
+
+<CardGroup cols={2}>
+  <Card title="Provider swap" icon="database">
+    Because the `Domain` layer talks to `IRepository<T>` from `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/`, you can swap `Volo.Abp.EntityFrameworkCore` for `Volo.Abp.MongoDB` (or `Volo.Abp.Dapper`) without touching domain code.
+  </Card>
+  <Card title="Remote vs in-process" icon="globe">
+    Because controllers in `Volo.Abp.AspNetCore.Mvc` are generated from `IApplicationService`, the same interface can be hosted in-process (Blazor Server) or behind HTTP (Blazor WebAssembly) using the dynamic client proxies in `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/`.
+  </Card>
+</CardGroup>
+
+## 2. Modularity is the only composition unit
+
+Every project that contributes services is a module. The base class `AbpModule` (`framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs`) implements every lifecycle hook so a module can override only what it needs. Modules declare what they depend on via `[DependsOn]`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+public class DependsOnAttribute : Attribute, IDependedTypesProvider
+{
+    public Type[] DependedTypes { get; }
+
+    public DependsOnAttribute(params Type[]? dependedTypes)
+    {
+        DependedTypes = dependedTypes ?? Type.EmptyTypes;
+    }
+
+    public virtual Type[] GetDependedTypes()
+    {
+        return DependedTypes;
+    }
+}
+```
+
+`IModuleLoader` walks that graph from the host's startup module, topologically sorts the result, and returns an ordered `IAbpModuleDescriptor[]`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleLoader.cs
+public interface IModuleLoader
+{
+    [NotNull]
+    IAbpModuleDescriptor[] LoadModules(
+        [NotNull] IServiceCollection services,
+        [NotNull] Type startupModuleType,
+        [NotNull] PlugInSourceList plugInSources
+    );
+}
+```
+
+The consequence: **adding a feature is adding a `[DependsOn]` line, not editing global startup code**. A new caching backend, a new EventBus transport, or even a new BLOB provider is composed by referencing its package and depending on its module.
+
+<Tip>
+  See [/modularity/abp-module](/modularity/abp-module) for every override point on `AbpModule`, and [/modularity/depends-on-and-plug-ins](/modularity/depends-on-and-plug-ins) for how plug-in sources extend the static graph at runtime.
+</Tip>
+
+## 3. Convention-over-configuration DI
+
+ABP layers a convention system on top of `Microsoft.Extensions.DependencyInjection`. Three marker interfaces in `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/` declare lifetime by inheritance:
+
+| Marker | Source |
+| --- | --- |
+| `ITransientDependency` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs` |
+| `IScopedDependency` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IScopedDependency.cs` |
+| `ISingletonDependency` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ISingletonDependency.cs` |
+
+When a module's assembly is scanned (during `ConfigureServices` in `AbpApplicationBase`), every concrete type implementing one of these interfaces is registered. The registrar that drives this is `DefaultConventionalRegistrar`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DefaultConventionalRegistrar.cs
+public class DefaultConventionalRegistrar : ConventionalRegistrarBase
+{
+    public override void AddType(IServiceCollection services, Type type)
+    {
+        if (IsConventionalRegistrationDisabled(type))
+        {
+            return;
+        }
+
+        var dependencyAttribute = GetDependencyAttributeOrNull(type);
+        var lifeTime = GetLifeTimeOrNull(type, dependencyAttribute);
+
+        if (lifeTime == null)
+        {
+            return;
+        }
+        // ...
+    }
+}
+```
+
+### Explicit overrides when you need them
+
+Conventions are always overridable. Three attributes from the same folder let you opt out or refine the auto-registration:
+
+| Attribute | Purpose |
+| --- | --- |
+| `[Dependency(...)]` | Override lifetime (`ServiceLifetime.Singleton/Scoped/Transient`), set `ReplaceServices = true` to replace any prior registration, or `TryRegister = true` to skip if already registered. |
+| `[ExposeServices(...)]` | Explicitly list which contract types the class should be exposed as in DI. |
+| `[DisableConventionalRegistration]` | Opt the class out of the auto-scan entirely (you register it manually in `ConfigureServices`). |
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs
+public class ExposeServicesAttribute : Attribute, IExposedServiceTypesProvider
+{
+    public Type[] ServiceTypes { get; }
+
+    public bool IncludeDefaults { get; set; }
+
+    public bool IncludeSelf { get; set; }
+    // ...
+}
+```
+
+See [/di/conventional-registration](/di/conventional-registration) and [/di/exposed-services](/di/exposed-services) for usage patterns. The combination — markers for the 95% case, attributes for the 5% case — keeps composition root code small.
+
+### Lazy resolution to avoid constructor explosion
+
+ABP base classes (`ApplicationService`, `DomainService`, `Controller`) expose `IAbpLazyServiceProvider` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IAbpLazyServiceProvider.cs`) so subclasses can lazily pull dependencies via `LazyServiceProvider.LazyGetRequiredService<T>()` instead of accumulating constructor parameters. The pattern is visible in `DomainService.cs`:
+
+```csharp framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/DomainService.cs
+public abstract class DomainService : IDomainService
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected IClock Clock => LazyServiceProvider.LazyGetRequiredService<IClock>();
+    protected IGuidGenerator GuidGenerator => LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+    protected ILoggerFactory LoggerFactory => LazyServiceProvider.LazyGetRequiredService<ILoggerFactory>();
+    protected ICurrentTenant CurrentTenant => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    protected IAsyncQueryableExecuter AsyncExecuter => LazyServiceProvider.LazyGetRequiredService<IAsyncQueryableExecuter>();
+    // ...
+}
+```
+
+See [/di/lazy-service-provider](/di/lazy-service-provider) for the full pattern.
+
+## 4. Multi-tenancy is built into the kernel, not bolted on
+
+`Volo.Abp.MultiTenancy` lives in `framework/src/Volo.Abp.MultiTenancy/` and is referenced (transitively) by almost every cross-cutting concern. The headline contract is `ICurrentTenant`, implemented by `CurrentTenant`:
+
+```csharp framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs
+public class CurrentTenant : ICurrentTenant, ITransientDependency
+{
+    public virtual bool IsAvailable => Id.HasValue;
+
+    public virtual Guid? Id => _currentTenantAccessor.Current?.TenantId;
+
+    public string? Name => _currentTenantAccessor.Current?.Name;
+    // ...
+    public IDisposable Change(Guid? id, string? name = null)
+    {
+        return SetCurrent(id, name);
+    }
+}
+```
+
+Tenant resolution is itself modular — `TenantResolveContributorBase` plus built-in contributors (`ActionTenantResolveContributor.cs`, `CurrentUserTenantResolveContributor.cs`, and the ASP.NET Core ones in `framework/src/Volo.Abp.AspNetCore.MultiTenancy/`) compose to figure out the active tenant. Every persistence stack (EF Core, MongoDB) automatically filters `IMultiTenant` entities by `ICurrentTenant.Id`, every setting/permission/feature provider stack inserts a tenant-scoped layer, and every distributed event is annotated with the source tenant.
+
+<Tip>
+  The cost of multi-tenancy when you don't use it is essentially zero: `IsAvailable` is `false`, no global query filters add predicates, and tenant-scoped settings/permissions short-circuit to the host layer. You can keep the module in your dependency chain without paying for what you don't use.
+</Tip>
+
+## 5. Source-code replaceability for application modules
+
+Application modules under `modules/` are *intended* to be replaced. Two parallel directories implement the "swap a NuGet reference for a project reference" workflow:
+
+- `source-code/` — `SourceCodes.sln` plus 18 `*.SourceCode` projects (`Volo.Abp.Identity.SourceCode`, `Volo.Abp.OpenIddict.SourceCode`, `Volo.CmsKit.SourceCode`, etc.).
+- `studio/source-codes/` — the same set wired for the ABP Studio "Get source code" command.
+
+The mechanic is straightforward: every `*.SourceCode` project references the actual `src/` of the corresponding module so changing a `<PackageReference Include="Volo.Abp.Identity" />` to a `<ProjectReference>` against `source-code/Volo.Abp.Identity.SourceCode/` gives you a customisable copy without leaving the framework's conventions.
+
+This is why the framework code goes out of its way to use `virtual` methods, `Configure<T>` options, `[DependsOn]` and `ExtraProperties` (on `AggregateRoot`) — every base class assumes that any consumer might want to override or augment it.
+
+## 6. Convention over configuration in the HTTP surface
+
+ABP's MVC convention-based controllers and dynamic client proxies are a direct consequence of treating `IApplicationService` as the canonical contract.
+
+| Server side | Client side |
+| --- | --- |
+| `framework/src/Volo.Abp.AspNetCore.Mvc` generates a controller per `IApplicationService` derivative, mapping route and verb by method name (`GetListAsync` → `GET`, `CreateAsync` → `POST`, `UpdateAsync` → `PUT`, `DeleteAsync` → `DELETE`). | `framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/` generates a dynamic `IBookAppService` proxy that calls the controller over HTTP, transparently for the caller. |
+| The application API description model (`framework/src/Volo.Abp.Http/Volo/Abp/Http/Modeling/ApplicationApiDescriptionModel.cs`) describes the routing for tooling. | The CLI proxy generators in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ServiceProxying/` (`CSharpServiceProxyGenerator.cs`, `AngularServiceProxyGenerator.cs`, `JavaScriptServiceProxyGenerator.cs`) materialise typed clients for build-time consumption. |
+
+The net effect is that the same `IBookAppService` interface is the contract used by tests, in-process Blazor Server hosts, HTTP controllers, the JavaScript/Angular client, and the dynamic C# remote proxy. The convention guarantees that signature changes propagate everywhere.
+
+## 7. Opinionated but pluggable database options
+
+ABP commits to a small, opinionated set of database providers and exposes them through a uniform module pattern.
+
+### Relational
+
+| Provider | Package | Module |
+| --- | --- | --- |
+| SQL Server | `framework/src/Volo.Abp.EntityFrameworkCore.SqlServer` | `AbpEntityFrameworkCoreSqlServerModule` |
+| PostgreSQL | `framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql` | `AbpEntityFrameworkCorePostgreSqlModule` |
+| MySQL | `framework/src/Volo.Abp.EntityFrameworkCore.MySQL` | `AbpEntityFrameworkCoreMySQLModule` |
+| SQLite | `framework/src/Volo.Abp.EntityFrameworkCore.Sqlite` | `AbpEntityFrameworkCoreSqliteModule` |
+| Oracle (OSS) | `framework/src/Volo.Abp.EntityFrameworkCore.Oracle` | `AbpEntityFrameworkCoreOracleModule` |
+| Oracle (Devart) | `framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `AbpEntityFrameworkCoreOracleDevartModule` |
+
+All of them depend on `Volo.Abp.EntityFrameworkCore` for `AbpDbContext`, the EF Core `IUnitOfWork` integration and the `EfCoreRepository<TDbContext, TEntity>` base.
+
+### NoSQL & alternates
+
+| Provider | Package |
+| --- | --- |
+| MongoDB | `framework/src/Volo.Abp.MongoDB` |
+| Dapper (raw ADO sidecar) | `framework/src/Volo.Abp.Dapper` |
+| In-memory | `framework/src/Volo.Abp.MemoryDb` |
+
+Choosing a stack is a one-line `[DependsOn]` change in the solution's `EntityFrameworkCore`/`MongoDB` module. Domain code never observes the swap.
+
+<Tip>
+  This opinionated set is what powers the `-d` switch on `abp new`: `abp new BookStore -u mvc -d ef` materialises an EF Core stack, `-d mongodb` swaps it for MongoDB. The CLI works because every supported provider follows the same module shape.
+</Tip>
+
+## 8. Versioning, target framework, and central package management
+
+The repo standardises tooling so contributions are reproducible.
+
+```json global.json
+{
+  "sdk": {
+    "version": "8.0.100",
+    "rollForward": "latestFeature"
+  }
+}
+```
+
+Central package versions live in `Directory.Packages.props` (`<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>`), so per-`csproj` `<PackageReference>` entries omit `Version=` and inherit from the root. The result: there is exactly one place to bump `Autofac`, `EntityFrameworkCore`, `OpenIddict` or `Castle.Core` across the entire solution.
+
+The root `Directory.Build.props` is deliberately minimal — it only flips `IsTestProject` for projects whose names end in `.Tests` / `.TestBase` and adds `coverlet.collector` to those — so the rest of the configuration is per-area:
+
+```xml Directory.Build.props
+<Project>
+  <PropertyGroup>
+    <IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test')) and ($(MSBuildProjectName.EndsWith('.Tests')) or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Condition="'$(IsTestProject)' == 'true'" Include="coverlet.collector">
+        <PrivateAssets>all</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>
+```
+
+## 9. Composition over inheritance for cross-cutting concerns
+
+Most ABP cross-cutting features are *interceptors* registered against the conventional pipeline (see [/di/property-injection-and-interception](/di/property-injection-and-interception)). Audit logging, exception handling, validation, unit-of-work boundaries, authorization and feature checks are applied by interceptors plugged into Autofac through `framework/src/Volo.Abp.Castle.Core` and `framework/src/Volo.Abp.Autofac`. The advantage: a developer writes a plain `BookAppService : ApplicationService, IBookAppService` with no attributes, and the framework still:
+
+- Opens an `IUnitOfWork` around every `IApplicationService` method (via the UoW interceptor in `framework/src/Volo.Abp.Uow/`),
+- Validates DTOs (via `IObjectValidator` in `framework/src/Volo.Abp.Validation/`),
+- Authorizes calls against `IPermissionChecker` (via `framework/src/Volo.Abp.Authorization.Abstractions/`),
+- Logs audit entries (via `framework/src/Volo.Abp.Auditing/`),
+- Maps known exceptions through `framework/src/Volo.Abp.ExceptionHandling/`.
+
+The "do nothing and get everything" experience is the whole point.
+
+## 10. Explicit kernel, implicit hosts
+
+The kernel — `AbpApplicationBase`, `AbpApplicationFactory`, `IModuleLoader`, `IModuleManager`, the conventional registrar pipeline — is small and explicit, so you can trace what happens at startup line-by-line. The hosts that build on it (the ASP.NET Core integration, the Blazor integration, the MAUI integration, the WPF integration, the console host) are thin adapters whose job is to call `AbpApplicationFactory.Create*` or `Create*Async` and then `InitializeModulesAsync`. See [/modularity/initialization-shutdown](/modularity/initialization-shutdown) for the host-specific wiring.
+
+## Where these principles show up
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="layer-group" href="/overview/architecture">
+    The layered diagram and the full startup sequence diagram corresponding to principle 1, 2 and 10.
+  </Card>
+  <Card title="Repository layout" icon="folder-tree" href="/overview/repository-layout">
+    Annotated map showing where every module / provider / template lives — principle 5 in particular references `source-code/` and `studio/`.
+  </Card>
+  <Card title="DI overview" icon="syringe" href="/di/overview">
+    The conventional / explicit registration system that implements principles 3 and 9.
+  </Card>
+  <Card title="Multi-tenancy" icon="users" href="/multitenancy/overview">
+    Tenant resolution and data filtering that implements principle 4.
+  </Card>
+  <Card title="DDD overview" icon="cube" href="/ddd/overview">
+    Aggregates, repositories, value objects, domain services backing principle 1.
+  </Card>
+  <Card title="EF Core integration" icon="database" href="/data/entity-framework-core">
+    Provider matrix and `AbpDbContext` work referenced in principle 7.
+  </Card>
+</CardGroup>

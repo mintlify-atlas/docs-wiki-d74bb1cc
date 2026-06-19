@@ -1,0 +1,316 @@
+---
+title: "Aliyun SMS provider: AliCloud Dysmsapi sender for ABP"
+sidebarTitle: "SMS Aliyun"
+description: "Volo.Abp.Sms.Aliyun walkthrough: AliyunSmsSender, AbpAliyunSmsOptions, SignName/TemplateCode conventions, and the Alibaba Cloud SDK integration pattern."
+---
+
+The `Volo.Abp.Sms.Aliyun` package plugs Alibaba Cloud's [Dysmsapi](https://www.alibabacloud.com/help/en/sms) SMS service into ABP's `ISmsSender` abstraction. It is the reference example of how a provider integrates with the SMS module: a single `ISmsSender` implementation, a strongly-typed options class bound to an `AbpAliyunSms` configuration section, and a small set of conventions for passing `SignName` and `TemplateCode` through `SmsMessage.Properties`. Application code that already depends on the [SMS overview](/messaging/sms-overview) does not change.
+
+This page walks the package: `AbpSmsAliyunModule`, `AbpAliyunSmsOptions`, and the `AliyunSmsSender` implementation that builds the AliCloud SDK client and dispatches each message.
+
+## Package layout
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpSmsAliyunModule.cs` | `AbpModule` | Depends on `AbpSmsModule`; binds `AbpAliyunSmsOptions` to the `AbpAliyunSms` configuration section. |
+| `AbpAliyunSmsOptions.cs` | Options | `AccessKeyId`, `AccessKeySecret`, `EndPoint`. |
+| `AliyunSmsSender.cs` | Class | `ISmsSender` implementation that calls AliCloud's `Dysmsapi20170525.Client.SendSmsAsync`. |
+
+## `AbpSmsAliyunModule`
+
+The module depends on `AbpSmsModule` (the abstractions) and binds the options class to the `AbpAliyunSms` configuration section:
+
+```csharp Volo.Abp.Sms.Aliyun/AbpSmsAliyunModule.cs
+[DependsOn(typeof(AbpSmsModule))]
+public class AbpSmsAliyunModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        Configure<AbpAliyunSmsOptions>(configuration.GetSection("AbpAliyunSms"));
+    }
+}
+```
+
+Because `AliyunSmsSender` carries `ITransientDependency` and `NullSmsSender` was registered with `TryRegister = true` (see [SMS overview](/messaging/sms-overview)), the Aliyun sender supplants the null one as soon as `AbpSmsAliyunModule` is in the dependency graph.
+
+## `AbpAliyunSmsOptions`
+
+The options class is intentionally minimal — only the connection information lives here. Vendor-specific message metadata (sign name, template code) travels through `SmsMessage.Properties` instead, because it changes per message rather than per host:
+
+```csharp Volo.Abp.Sms.Aliyun/AbpAliyunSmsOptions.cs
+public class AbpAliyunSmsOptions
+{
+    public string AccessKeySecret { get; set; } = default!;
+    public string AccessKeyId     { get; set; } = default!;
+    public string EndPoint        { get; set; } = default!;
+}
+```
+
+| Property | Description |
+| --- | --- |
+| `AccessKeyId` | AliCloud sub-account access key id. |
+| `AccessKeySecret` | AliCloud sub-account access key secret. |
+| `EndPoint` | Regional Dysmsapi endpoint, e.g. `dysmsapi.aliyuncs.com` (international) or a region-specific override. |
+
+Matching `appsettings.json`:
+
+```json
+{
+  "AbpAliyunSms": {
+    "AccessKeyId":     "LTAI…",
+    "AccessKeySecret": "…",
+    "EndPoint":        "dysmsapi.aliyuncs.com"
+  }
+}
+```
+
+<Note>
+The package uses `IOptionsMonitor` (see below), so updating the underlying configuration source — for example via a reload-on-change `appsettings.json` provider — refreshes the values without restarting the host.
+</Note>
+
+## `AliyunSmsSender`
+
+The sender is a thin facade over the official AliCloud .NET SDK:
+
+```csharp Volo.Abp.Sms.Aliyun/AliyunSmsSender.cs
+using AliyunClient = AlibabaCloud.SDK.Dysmsapi20170525.Client;
+using AliyunConfig = AlibabaCloud.OpenApiClient.Models.Config;
+using AliyunSendSmsRequest = AlibabaCloud.SDK.Dysmsapi20170525.Models.SendSmsRequest;
+
+public class AliyunSmsSender : ISmsSender, ITransientDependency
+{
+    protected AbpAliyunSmsOptions Options { get; }
+
+    public AliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+
+        await client.SendSmsAsync(new AliyunSendSmsRequest
+        {
+            PhoneNumbers  = smsMessage.PhoneNumber,
+            SignName      = smsMessage.Properties.GetOrDefault("SignName") as string,
+            TemplateCode  = smsMessage.Properties.GetOrDefault("TemplateCode") as string,
+            TemplateParam = smsMessage.Text
+        });
+    }
+
+    protected virtual AliyunClient CreateClient()
+    {
+        return new(new AliyunConfig
+        {
+            AccessKeyId     = Options.AccessKeyId,
+            AccessKeySecret = Options.AccessKeySecret,
+            Endpoint        = Options.EndPoint
+        });
+    }
+}
+```
+
+A few design points to understand:
+
+- **Per-call client** — `CreateClient()` constructs a fresh `AlibabaCloud.SDK.Dysmsapi20170525.Client` for every message. The SDK is designed to be cheap to instantiate; for higher throughput, derive the class and cache one client per `(AccessKeyId, EndPoint)` tuple.
+- **`SignName` and `TemplateCode`** — both are looked up from `SmsMessage.Properties` with `GetOrDefault(...)`. These are AliCloud's vendor concepts:
+  - `SignName` is the registered SMS signature (e.g. `MyApp`).
+  - `TemplateCode` is the registered template id (e.g. `SMS_123456789`).
+  - The actual template parameters are passed as a JSON string in `TemplateParam` — which the sender maps from `SmsMessage.Text`.
+- **`TemplateParam = Text`** — the sender's interpretation is that `Text` is a JSON string of template variables, *not* a free-form message. AliCloud requires templates to be pre-registered, so this is the correct mapping for the platform.
+
+### Calling the sender
+
+A typical OTP send looks like this:
+
+```csharp
+public class OtpService : ITransientDependency
+{
+    private readonly ISmsSender _smsSender;
+
+    public OtpService(ISmsSender smsSender) => _smsSender = smsSender;
+
+    public Task SendOtpAsync(string phoneNumber, string code)
+    {
+        var message = new SmsMessage(
+            phoneNumber: phoneNumber,
+            text:        $"{{\"code\":\"{code}\"}}"); // matches the template variable name
+
+        message.Properties["SignName"]     = "MyApp";
+        message.Properties["TemplateCode"] = "SMS_123456789";
+
+        return _smsSender.SendAsync(message);
+    }
+}
+```
+
+If `SignName` or `TemplateCode` is missing, the AliCloud SDK rejects the request — there is no fallback in the sender.
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    participant App     as Application code
+    participant Sender  as AliyunSmsSender
+    participant Opt     as IOptionsMonitor&lt;AbpAliyunSmsOptions&gt;
+    participant SDK     as AlibabaCloud Dysmsapi SDK
+    participant Cloud   as AliCloud Dysmsapi service
+
+    App->>Sender: SendAsync(SmsMessage)
+    Sender->>Opt:    CurrentValue
+    Opt-->>Sender:   AccessKeyId, AccessKeySecret, EndPoint
+    Sender->>SDK:    new Client(new Config { … })
+    Sender->>SDK:    SendSmsAsync(SendSmsRequest {<br/>PhoneNumbers, SignName, TemplateCode, TemplateParam })
+    SDK->>Cloud:     POST /SendSms
+    Cloud-->>SDK:    SendSmsResponse
+    SDK-->>Sender:   Task completes
+    Sender-->>App:   done
+```
+
+## Convention table
+
+| `SmsMessage` field | Maps to AliCloud field |
+| --- | --- |
+| `PhoneNumber` | `SendSmsRequest.PhoneNumbers` |
+| `Text` | `SendSmsRequest.TemplateParam` (typically a JSON string) |
+| `Properties["SignName"]` (string) | `SendSmsRequest.SignName` |
+| `Properties["TemplateCode"]` (string) | `SendSmsRequest.TemplateCode` |
+
+Any other key in `Properties` is ignored by this sender. If you fork it to support outbound contexts (e.g. `OutId` for callback correlation), derive a custom subclass and read the extra keys yourself.
+
+## Operational notes
+
+- **Endpoint selection** — Aliyun Dysmsapi exposes regional endpoints (e.g. `dysmsapi.ap-southeast-1.aliyuncs.com` for Singapore). Pick the endpoint closest to your sending region; the global endpoint `dysmsapi.aliyuncs.com` works for mainland China-based accounts.
+- **Credentials rotation** — `IOptionsMonitor` reads `CurrentValue` on each request through DI, so values reload when the configuration source supports reload-on-change. Combine with an encrypted configuration provider in production.
+- **Sub-accounts and STS** — the sender uses static AccessKey credentials. If you need STS (assume-role) credentials, derive the sender, replace `CreateClient()` with code that fetches a short-lived token, and follow the same pattern used by the [Aliyun OSS blob provider](/blobs/aliyun-provider) — including caching the encrypted credentials via `IDistributedCache`.
+- **Rate limiting & retries** — AliCloud enforces per-template / per-signature rate limits. Wrap the call in a background job (see [background jobs](/background/jobs-overview)) and apply exponential backoff on `Common.OpenApiUtilClient`-style errors.
+- **Multi-tenancy** — `AbpAliyunSmsOptions` is host-wide. To use per-tenant `SignName` defaults, populate `SmsMessage.Properties` in your application layer based on `ICurrentTenant.Id`. For per-tenant access keys, derive `AliyunSmsSender` and resolve options through a tenant-aware service.
+
+## Building the template parameter payload
+
+AliCloud SMS templates are pre-registered server-side with named placeholders like `${code}` or `${name}`. The sender expects `SmsMessage.Text` to be a JSON object that the AliCloud service can substitute into the template:
+
+```csharp
+var payload = JsonSerializer.Serialize(new
+{
+    code = "123456",
+    name = "Alice"
+});
+
+var message = new SmsMessage(phoneNumber, payload);
+message.Properties["SignName"]     = "MyApp";
+message.Properties["TemplateCode"] = "SMS_123456789";
+
+await _smsSender.SendAsync(message);
+```
+
+Keep the JSON keys aligned with the placeholder names registered in the AliCloud console — they are case-sensitive. The sender does no validation; AliCloud rejects the request with `isv.PARAM_LENGTH_LIMIT` (or similar) for malformed payloads.
+
+## Resilience and retries
+
+The sender does not implement retries — the AliCloud SDK call is awaited once and any exception propagates to the caller. For production:
+
+1. Wrap the send in a background job (see the pattern in [SMS overview](/messaging/sms-overview)).
+2. Apply exponential backoff using a library like Polly.
+3. Distinguish recoverable errors (`isv.BUSINESS_LIMIT_CONTROL`, throttling) from permanent ones (`isv.MOBILE_NUMBER_ILLEGAL`).
+
+A naive Polly-based wrapper:
+
+```csharp
+public class ResilientAliyunSmsSender : AliyunSmsSender
+{
+    private readonly IAsyncPolicy _policy = Policy
+        .Handle<Exception>(IsTransient)
+        .WaitAndRetryAsync(3, attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)));
+
+    public ResilientAliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
+        : base(options) { }
+
+    public override Task SendAsync(SmsMessage smsMessage)
+        => _policy.ExecuteAsync(() => base.SendAsync(smsMessage));
+
+    private static bool IsTransient(Exception ex)
+        => ex.Message.Contains("BUSINESS_LIMIT_CONTROL", StringComparison.Ordinal);
+}
+```
+
+## Caching the SDK client
+
+The default `CreateClient()` builds a fresh `AlibabaCloud.SDK.Dysmsapi20170525.Client` per message. For a high-throughput service, cache it:
+
+```csharp
+public class PooledAliyunSmsSender : AliyunSmsSender
+{
+    private static AliyunClient? _cached;
+    private static readonly object _gate = new();
+
+    public PooledAliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
+        : base(options) { }
+
+    protected override AliyunClient CreateClient()
+    {
+        if (_cached != null) return _cached;
+        lock (_gate)
+        {
+            return _cached ??= base.CreateClient();
+        }
+    }
+}
+```
+
+The AliCloud SDK clients are thread-safe for `SendSmsAsync` so a singleton is appropriate.
+
+## STS-based credentials
+
+For production AliCloud deployments where you do not want to store long-lived AccessKey credentials, derive the sender to call STS `AssumeRole` and exchange the role for short-lived credentials. The pattern mirrors what the [Aliyun OSS blob provider](/blobs/aliyun-provider) does in `DefaultOssClientFactory`:
+
+```csharp
+public class StsAliyunSmsSender : AliyunSmsSender
+{
+    private readonly IDistributedCache<AliyunStsCacheItem> _cache;
+    private readonly IStringEncryptionService _encryption;
+
+    public StsAliyunSmsSender(
+        IOptionsMonitor<AbpAliyunSmsOptions> options,
+        IDistributedCache<AliyunStsCacheItem> cache,
+        IStringEncryptionService encryption)
+        : base(options)
+    {
+        _cache = cache;
+        _encryption = encryption;
+    }
+
+    protected override AliyunClient CreateClient()
+    {
+        var cached = _cache.Get("sms-sts");
+        if (cached == null)
+        {
+            // Call STS AssumeRole, encrypt the result, cache with TTL < lifetime.
+        }
+        // Build a client with the cached credentials + security token.
+        return base.CreateClient();
+    }
+}
+```
+
+Pair with [StackExchange.Redis caching](/caching/stackexchange-redis) so multiple replicas share the same STS credentials.
+
+## Operational notes
+
+- **Endpoint selection** — Aliyun Dysmsapi exposes regional endpoints (e.g. `dysmsapi.ap-southeast-1.aliyuncs.com` for Singapore). Pick the endpoint closest to your sending region; the global endpoint `dysmsapi.aliyuncs.com` works for mainland China-based accounts.
+- **Credentials rotation** — `IOptionsMonitor` reads `CurrentValue` on each request through DI, so values reload when the configuration source supports reload-on-change. Combine with an encrypted configuration provider in production.
+- **Sub-accounts and STS** — the sender uses static AccessKey credentials. If you need STS (assume-role) credentials, derive the sender, replace `CreateClient()` with code that fetches a short-lived token, and follow the same pattern used by the [Aliyun OSS blob provider](/blobs/aliyun-provider) — including caching the encrypted credentials via `IDistributedCache`.
+- **Rate limiting & retries** — AliCloud enforces per-template / per-signature rate limits. Wrap the call in a background job (see [background jobs](/background/jobs-overview)) and apply exponential backoff on `Common.OpenApiUtilClient`-style errors.
+- **Multi-tenancy** — `AbpAliyunSmsOptions` is host-wide. To use per-tenant `SignName` defaults, populate `SmsMessage.Properties` in your application layer based on `ICurrentTenant.Id`. For per-tenant access keys, derive `AliyunSmsSender` and resolve options through a tenant-aware service.
+- **Compliance** — AliCloud SMS requires registration of both the signature (`SignName`) and the template (`TemplateCode`). Templates are reviewed and approved separately — keep your template inventory in version control alongside the code that references them.
+
+## Cross-references
+
+- [SMS overview](/messaging/sms-overview) — `ISmsSender`, `SmsMessage`, `NullSmsSender`, `SmsSenderExtensions`.
+- [Aliyun OSS blob provider](/blobs/aliyun-provider) — sister AliCloud integration with STS / `IDistributedCache` patterns you may want to reuse.
+- [Background jobs](/background/jobs-overview) — natural home for retries and rate-limit handling.
+- [Settings](/settings-features) — production-grade home for AccessKey secrets.
+- [Distributed cache](/caching/distributed-cache) — used by the optional STS-based credentials pattern shown above.
