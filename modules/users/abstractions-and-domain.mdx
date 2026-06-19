@@ -226,7 +226,9 @@ public interface IUser : IAggregateRoot<Guid>, IMultiTenant, IHasExtraProperties
 
 Implementations in the wild:
 
-- `Volo.Abp.Identity.IdentityUser` — the canonical implementation in the Identity module.
+- `Volo.Abp.Identity.IdentityUser` — the canonical implementation in the Identity module (`FullAuditedAggregateRoot<Guid>, IUser, IHasEntityVersion`).
+- `Volo.Blogging.Users.BlogUser` — Blogging's shadow user aggregate used for blog post authorship.
+- `Volo.CmsKit.Users.CmsUser` — CMS Kit's shadow user aggregate for comments, reactions and ratings.
 - `Volo.Abp.LinkUsers.LinkUser` (commercial) — implements the same contract on a separate aggregate so link‑user impersonation reuses every Users module helper.
 
 <Note>
@@ -263,7 +265,7 @@ The base type is `IBasicRepository<TUser, Guid>` rather than the queryable `IRep
 
 ## `IUserLookupService<TUser>` and `UserLookupService<,>`
 
-The lookup service interface mirrors the federation provider but is *generic over the aggregate*, so callers receive `IdentityUser` (not just `IUserData`) on local hits.
+The lookup service interface mirrors the federation provider but is *generic over the aggregate*, so callers receive a concrete `TUser` (for instance `CmsUser` or `BlogUser` — not just `IUserData`) on local hits.
 
 ```csharp title="Volo.Abp.Users.Domain/Volo/Abp/Users/IUserLookupService.cs"
 public interface IUserLookupService<TUser> where TUser : class, IUser
@@ -356,7 +358,7 @@ Three behaviours worth highlighting:
 
 - **Fail‑open.** If the external provider throws, the local user (possibly stale) is returned. The lookup never blocks the caller on IdP downtime.
 - **Silent sync.** If the external provider returns a user but the local doesn't have one, the service inserts the local shadow inside a new UoW (`WithNewUowAsync`). The caller never sees the insert.
-- **Optional update.** If `TUser` implements `IUpdateUserData`, the service asks the aggregate to apply the external data to itself. Only if `Update` returns `true` (the aggregate considers itself dirty) is `UpdateAsync` called. This is how Identity keeps `IdentityUser.UserName`, `Name`, `Surname` in sync without overwriting password/role state.
+- **Optional update.** If `TUser` implements `IUpdateUserData`, the service asks the aggregate to apply the external data to itself. Only if `Update` returns `true` (the aggregate considers itself dirty) is `UpdateAsync` called. In the OSS source, `BlogUser` and `CmsUser` implement this seam so their shadow rows keep `UserName`, `Name`, `Surname`, `Email` in sync with the upstream user store without ever overwriting domain‑specific state.
 
 ```mermaid
 sequenceDiagram
@@ -468,28 +470,46 @@ The shared package is intentionally empty of behaviour — it carries only the l
 
 ## A consumer example
 
-A module that wants to display a user reference (say, "last edited by") asks for `IUserLookupService<IdentityUser>` from the Identity module:
+A consumer that ships its own user aggregate — for instance the CMS Kit, which needs `CmsUser` rows for comment authorship — derives a concrete lookup service from the abstract `UserLookupService<,>` and exposes it through a narrower interface:
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Users/CmsUserLookupService.cs"
+public class CmsUserLookupService
+    : UserLookupService<CmsUser, ICmsUserRepository>, ICmsUserLookupService
+{
+    public CmsUserLookupService(
+        ICmsUserRepository userRepository,
+        IUnitOfWorkManager unitOfWorkManager)
+        : base(userRepository, unitOfWorkManager) { }
+
+    protected override CmsUser CreateUser(IUserData externalUser)
+    {
+        return new CmsUser(externalUser);  // map IUserData → CmsUser shadow row
+    }
+}
+```
+
+Then an app service simply asks for the narrow interface:
 
 ```csharp
-public class BookAppService
+public class CommentAppService
 {
-    private readonly IUserLookupService<IdentityUser> _userLookup;
+    private readonly ICmsUserLookupService _userLookup;
 
-    public async Task<BookDto> GetAsync(Guid id)
+    public async Task<CommentDto> GetAsync(Guid id)
     {
-        var book = await _bookRepository.GetAsync(id);
-        var editor = await _userLookup.FindByIdAsync(book.LastEditorId);
+        var comment = await _commentRepository.GetAsync(id);
+        var author = await _userLookup.FindByIdAsync(comment.AuthorId);
 
-        return new BookDto
+        return new CommentDto
         {
-            Title = book.Title,
-            LastEditor = editor?.UserName ?? "(deleted user)"
+            Text = comment.Text,
+            Author = author?.UserName ?? "(deleted user)"
         };
     }
 }
 ```
 
-If the host runs against an external IdP, that single call may produce a shadow `IdentityUser` row on first use, and `editor` resolves to a full Identity aggregate on subsequent calls. The caller never sees the federation logic.
+If the host runs against an external IdP, that single call may produce a shadow `CmsUser` row on first use, and `author` resolves to a full aggregate on subsequent calls. The caller never sees the federation logic. The same pattern is followed by `BlogUserLookupService : UserLookupService<BlogUser, IBlogUserRepository>` in the Blogging module.
 
 ## Where to next
 
@@ -501,7 +521,7 @@ If the host runs against an external IdP, that single call may produce a shadow 
 Package matrix, dependency graph, and where the Users module fits among siblings.
 </Card>
 <Card title="Identity module" icon="user" href="/modules/identity">
-The canonical consumer — `IdentityUser : IUser` and `IdentityUserLookupService : UserLookupService<…>`.
+The canonical `IUser` implementer — `IdentityUser : IUser`. Identity's own repository extends `EfCoreRepository<,,>` directly rather than `EfCoreUserRepositoryBase`, but it consumes everything else (the contracts, `ConfigureAbpUser`, ETOs).
 </Card>
 </CardGroup>
 

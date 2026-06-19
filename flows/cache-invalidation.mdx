@@ -1,0 +1,406 @@
+---
+title: "Cache invalidation flow: UoW-aware DistributedCache and entity events"
+sidebarTitle: "Cache Invalidation"
+description: "Trace how ABP's DistributedCache stages writes inside the Unit of Work, dispatches on OnCompleted, and how PermissionGrantCacheItemInvalidator listens to entity events to purge."
+---
+
+ABP layers a strongly-typed, multi-tenant-aware `IDistributedCache<TCacheItem>` on top of `Microsoft.Extensions.Caching.Distributed.IDistributedCache`. The interesting behaviour — and the source of most "stale cache" bugs in ABP applications — is the **UoW-aware path**: when a caller passes `considerUow: true`, every `Set` / `Remove` is buffered in a dictionary attached to the current `IUnitOfWork`, served from there for the rest of the UoW, and only flushed to the real backing store on `IUnitOfWork.OnCompleted`. The other side of cache invalidation is **entity-event-driven**: modules such as Permission Management ship handlers that listen to `EntityCreated/Updated/Deleted` events on rows whose data they cached, and call `RemoveAsync` to purge the affected keys.
+
+This page traces both paths against the real source: the UoW staging in `DistributedCache<TCacheItem, TCacheKey>`, the key-normalization that scopes a key by cache name and tenant id, the `OnCompleted` flush, and the entity-event invalidator pattern used by `PermissionGrantCacheItemInvalidator`.
+
+## Source map
+
+| File | Role |
+| ---- | ---- |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCache.cs` | Strongly-typed `IDistributedCache<TCacheItem>` and `IDistributedCache<TCacheItem, TCacheKey>` contracts. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs` | Default implementation. Houses the UoW staging logic. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/UnitOfWorkCacheItem.cs` | The `IsRemoved`/`Value` envelope used in the UoW dictionary. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/UnitOfWorkCacheItemExtensions.cs` | `GetUnRemovedValueOrNull()` helper. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCacheKeyNormalizer.cs` | Builds the final key as `t:{tenant},c:{cacheName},k:{prefix}{key}`. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/AbpDistributedCacheOptions.cs` | Module-level options: `KeyPrefix`, `HideErrors`, per-cache entry options. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/CacheNameAttribute.cs` | `[CacheName]` on the cache-item class. |
+| `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IgnoreMultiTenancyAttribute.cs` | Opt out of per-tenant key scoping. |
+| `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWork.cs` | `GetOrAddItem`, `OnCompleted`, ambient flow. |
+| `modules/permission-management/.../PermissionGrantCacheItemInvalidator.cs` | Canonical event-handler-based invalidator. |
+
+## Flow at a glance
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Code as App service
+    participant Cache as DistributedCache&lt;TCacheItem,TKey&gt;
+    participant Norm as DistributedCacheKeyNormalizer
+    participant UoW as IUnitOfWork
+    participant Inner as IDistributedCache (Memory/Redis)
+    participant Handler as PermissionGrantCacheItemInvalidator
+    participant Bus as ILocalEventBus
+
+    Code->>Cache: GetOrAddAsync(key, factory, considerUow:true)
+    Cache->>UoW: GetOrAddItem("AbpDistributedCache" + CacheName)
+    UoW-->>Cache: Dictionary&lt;TKey, UoWCacheItem&lt;TCacheItem&gt;&gt;
+    Cache->>Inner: GetAsync(NormalizeKey(key))
+    Inner-->>Cache: bytes or miss
+    Cache->>Cache: factory() on miss
+    Cache->>UoW: uowCache.Add(key, new UoWCacheItem(value))
+    Cache->>UoW: OnCompleted(SetRealCache)
+    Note over Cache,Inner: Real Set happens only when UoW commits
+
+    Code->>Code: repo.UpdateAsync(permissionGrant)
+    Code->>UoW: CompleteAsync
+    UoW->>Bus: PublishLocalEventsAsync(EntityUpdatedEventData)
+    Bus->>Handler: HandleEventAsync(EntityChangedEventData)
+    Handler->>Cache: RemoveAsync(cacheKey)
+    Handler-->>Bus: done
+```
+
+The two arrows that are easy to miss: (1) the cache *Set* is deferred behind `OnCompleted` when `considerUow: true`, and (2) the *Remove* triggered by an entity event runs **inside the UoW** that produced the event, so its own `RemoveAsync` is itself UoW-aware if the handler asks for it.
+
+## Anatomy of the UoW-aware cache
+
+`DistributedCache<TCacheItem, TCacheKey>` is the engine; the single-generic `DistributedCache<TCacheItem>` (the one most code injects) is a thin forwarder onto `IDistributedCache<TCacheItem, string>`. Both honour the `considerUow` parameter on every read/write.
+
+### The cache-item envelope
+
+The UoW dictionary stores `UnitOfWorkCacheItem<TValue>` rather than the raw value, so a *staged removal* can be distinguished from "not present":
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/UnitOfWorkCacheItem.cs"
+[Serializable]
+public class UnitOfWorkCacheItem<TValue>
+    where TValue : class
+{
+    public bool IsRemoved { get; set; }
+
+    public TValue? Value { get; set; }
+
+    public UnitOfWorkCacheItem(TValue value) { Value = value; }
+    public UnitOfWorkCacheItem(TValue value, bool isRemoved) { Value = value; IsRemoved = isRemoved; }
+
+    public UnitOfWorkCacheItem<TValue> SetValue(TValue value)
+    {
+        Value = value;
+        IsRemoved = false;
+        return this;
+    }
+
+    public UnitOfWorkCacheItem<TValue> RemoveValue()
+    {
+        Value = null;
+        IsRemoved = true;
+        return this;
+    }
+}
+```
+
+Reads through the UoW use `GetUnRemovedValueOrNull()`, which returns `null` for an entry whose `IsRemoved == true` — so a staged removal makes the cache *miss* inside the same UoW even before the real backing store is touched.
+
+### The UoW dictionary
+
+`GetUnitOfWorkCache()` is the single helper that materialises (or finds) the staging dictionary on the current UoW:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs"
+public const string UowCacheName = "AbpDistributedCache";
+
+protected virtual bool ShouldConsiderUow(bool considerUow)
+{
+    return considerUow && UnitOfWorkManager.Current != null;
+}
+
+protected virtual string GetUnitOfWorkCacheKey()
+{
+    return UowCacheName + CacheName;
+}
+
+protected virtual Dictionary<TCacheKey, UnitOfWorkCacheItem<TCacheItem>> GetUnitOfWorkCache()
+{
+    if (UnitOfWorkManager.Current == null)
+    {
+        throw new AbpException($"There is no active UOW.");
+    }
+
+    return UnitOfWorkManager.Current.GetOrAddItem(GetUnitOfWorkCacheKey(),
+        key => new Dictionary<TCacheKey, UnitOfWorkCacheItem<TCacheItem>>());
+}
+```
+
+Key things to internalize:
+
+- The dictionary is keyed by **the raw `TCacheKey`** the caller passed — `NormalizeKey` is only applied when the backing `IDistributedCache` is touched.
+- The dictionary itself is keyed inside the UoW by `"AbpDistributedCache" + CacheName`. Different cache-item types do not collide because each `DistributedCache<TCacheItem, TCacheKey>` instance has a unique `CacheName` derived from `[CacheName]` on the item class.
+- `ShouldConsiderUow(considerUow)` is **false** when no UoW is ambient, so calls from background workers without an open UoW silently degrade to a non-staged write — there is no exception unless the caller explicitly enters `GetUnitOfWorkCache()` themselves.
+
+### Key normalisation
+
+The key that hits Redis (or any backing store) is shaped by `DistributedCacheKeyNormalizer`:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCacheKeyNormalizer.cs"
+public virtual string NormalizeKey(DistributedCacheKeyNormalizeArgs args)
+{
+    var normalizedKey = $"c:{args.CacheName},k:{DistributedCacheOptions.KeyPrefix}{args.Key}";
+
+    if (!args.IgnoreMultiTenancy && CurrentTenant.Id.HasValue)
+    {
+        normalizedKey = $"t:{CurrentTenant.Id.Value},{normalizedKey}";
+    }
+
+    return normalizedKey;
+}
+```
+
+This is why tenants cannot read each other's cache entries by default — every key is prefixed with `t:{tenantId},`. Setting `[IgnoreMultiTenancy]` on the cache-item class flips `IgnoreMultiTenancy` to true and the key drops the tenant prefix; use it for caches that are intentionally host-scoped (permission definitions, feature definitions, localisation resources).
+
+`AbpDistributedCacheOptions.KeyPrefix` is the global prefix — typically the application name — and lets you share one Redis instance between multiple ABP deployments without collisions.
+
+## Read path with `considerUow: true`
+
+The `GetOrAddAsync` read shape is the most common entry point and shows the staging clearly:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs"
+if (ShouldConsiderUow(considerUow))
+{
+    var value = GetUnitOfWorkCache().GetOrDefault(key)?.GetUnRemovedValueOrNull();
+    if (value != null)
+    {
+        return value;
+    }
+}
+// fall through to backing-store fetch / factory call
+```
+
+Three observations:
+
+1. **UoW staging is checked first.** A value set or removed earlier in the same UoW is what the caller sees — even before the backing store is consulted. This is what makes "read your writes" work transactionally.
+2. **`GetUnRemovedValueOrNull()`** returns `null` for a staged removal, so the code falls through to the factory and re-creates the value. The new value is itself staged, so a later read in the same UoW returns it.
+3. The backing-store fetch is wrapped in a `try`/`catch` that respects `hideErrors ?? AbpDistributedCacheOptions.HideErrors`. With the default `HideErrors = true`, a Redis outage produces a log entry and a cache miss — the factory runs and the application keeps moving.
+
+## Write path: defer `Set` until `OnCompleted`
+
+The `Set` write is where the deferral lives. When the UoW is active and `considerUow: true`, the value is placed in the dictionary immediately *and* a callback is registered to write the real backing store at commit time:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs"
+if (ShouldConsiderUow(considerUow))
+{
+    var uowCache = GetUnitOfWorkCache();
+    if (uowCache.TryGetValue(key, out _))
+    {
+        uowCache[key].SetValue(value);
+    }
+    else
+    {
+        uowCache.Add(key, new UnitOfWorkCacheItem<TCacheItem>(value));
+    }
+
+    UnitOfWorkManager.Current?.OnCompleted(SetRealCache);
+}
+else
+{
+    await SetRealCache();
+}
+```
+
+`SetRealCache` is the local function that calls the underlying `Cache.SetAsync(NormalizeKey(key), Serializer.Serialize(value), …)`. The behaviour to remember:
+
+- If the UoW **rolls back**, `OnCompleted` is never invoked — the staged value is silently discarded and the backing store is unchanged. This is the contract that gives you "cache stays consistent on rollback".
+- Multiple `SetAsync` calls in the same UoW for the same key collapse into a single staged item plus a single trailing real-Set (the callback closes over the final state of the dictionary entry).
+- The same pattern is used by `SetManyAsync`, with a single `OnCompleted` callback that flushes the whole batch.
+
+See [Unit of work lifecycle](/flows/unit-of-work-lifecycle) for what `OnCompleted` actually fires against — it runs **after** `CommitTransactionsAsync`, so a successful commit is the gate.
+
+## Write path: `RemoveAsync`
+
+`RemoveAsync` follows the same shape — stage in the UoW dictionary, schedule the real remove on `OnCompleted`:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs"
+public virtual async Task RemoveAsync(
+    TCacheKey key,
+    bool? hideErrors = null,
+    bool considerUow = false,
+    CancellationToken token = default)
+{
+    async Task RemoveRealCache()
+    {
+        hideErrors = hideErrors ?? _distributedCacheOption.HideErrors;
+        try
+        {
+            await Cache.RemoveAsync(NormalizeKey(key), CancellationTokenProvider.FallbackToProvider(token));
+        }
+        catch (Exception ex)
+        {
+            if (hideErrors == true)
+            {
+                await HandleExceptionAsync(ex);
+                return;
+            }
+            throw;
+        }
+    }
+
+    if (ShouldConsiderUow(considerUow))
+    {
+        var uowCache = GetUnitOfWorkCache();
+        if (uowCache.TryGetValue(key, out _))
+        {
+            uowCache[key].RemoveValue();
+        }
+
+        UnitOfWorkManager.Current?.OnCompleted(RemoveRealCache);
+    }
+    else
+    {
+        await RemoveRealCache();
+    }
+}
+```
+
+Note `uowCache[key].RemoveValue()` only runs when the key was already staged (i.e., the same UoW had `Set` the value). When the key isn't in the staging dictionary the in-UoW removal is implicit — any later read inside the UoW will reach the backing store, see the value, and (because `RemoveRealCache` hasn't fired yet) cache it in-process. To force a UoW-local "this key is gone" semantic, set then remove: `await cache.SetAsync(key, value, considerUow: true)` then `await cache.RemoveAsync(key, considerUow: true)`.
+
+## Failure handling
+
+`HandleException`/`HandleExceptionAsync` opens a fresh DI scope and forwards through `IExceptionNotifier`:
+
+```csharp title="framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs"
+protected virtual async Task HandleExceptionAsync(Exception ex)
+{
+    Logger.LogException(ex, LogLevel.Warning);
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        await scope.ServiceProvider
+            .GetRequiredService<IExceptionNotifier>()
+            .NotifyAsync(new ExceptionNotificationContext(ex));
+    }
+}
+```
+
+So a Redis blip turns into a warning log + an exception notification, not a thrown exception. Set `AbpDistributedCacheOptions.HideErrors = false` (or pass `hideErrors: false` per call) when you want a hard failure for a specific cache — common for caches whose miss is unrecoverable.
+
+## Event-driven invalidation
+
+The second cache-invalidation flow is reactive: handlers subscribe to the entity events ABP raises during `SaveChangesAsync` and call `RemoveAsync` on the affected key. The Permission Management module is the canonical example because permission grants and definitions both have to be evicted on any change to the underlying rows.
+
+```csharp title="modules/permission-management/.../PermissionGrantCacheItemInvalidator.cs"
+public class PermissionGrantCacheItemInvalidator :
+    ILocalEventHandler<EntityChangedEventData<PermissionGrant>>,
+    ITransientDependency
+{
+    protected IDistributedCache<PermissionGrantCacheItem> Cache { get; }
+
+    public PermissionGrantCacheItemInvalidator(IDistributedCache<PermissionGrantCacheItem> cache)
+    {
+        Cache = cache;
+    }
+
+    public virtual async Task HandleEventAsync(EntityChangedEventData<PermissionGrant> eventData)
+    {
+        var cacheKey = PermissionGrantCacheItem.CalculateCacheKey(
+            eventData.Entity.Name,
+            eventData.Entity.ProviderName,
+            eventData.Entity.ProviderKey
+        );
+
+        await Cache.RemoveAsync(cacheKey);
+    }
+}
+```
+
+Two details that matter:
+
+- The handler subscribes to `EntityChangedEventData<T>` — the *base* of `Created/Updated/Deleted`. ABP raises it for every mutation, so a single handler covers insert/update/delete.
+- The handler does **not** pass `considerUow: true`. The local-event publishing loop runs inside the UoW that produced the change, but the desired semantic is "evict the cache immediately so any sibling request reading the same row at the same time sees nothing stale" — so the immediate `RemoveAsync` against the backing store is intentional. (If the UoW is rolled back later, the next read repopulates from the DB; the staged value would have lived briefly but is harmless.)
+
+See [Authentication and authorization](/flows/authentication-and-authorization) for how `PermissionStore` reads from this same `IDistributedCache<PermissionGrantCacheItem>` and what `PermissionGrantCacheItem.CalculateCacheKey` produces.
+
+## Distributed entity events for cross-service invalidation
+
+When the row that backs a cache lives in a different microservice, a *local* event won't reach you — that is where the distributed event bus comes in. Subscribe to `EntityUpdatedEto<T>` (or your own `Eto`) and call `RemoveAsync` from the handler. The mechanics are documented in [Distributed event publishing](/flows/distributed-event-publishing); the cache-invalidation pattern is identical to the local case.
+
+```csharp
+public class PermissionGrantDistributedCacheInvalidator :
+    IDistributedEventHandler<EntityUpdatedEto<PermissionGrantEto>>,
+    ITransientDependency
+{
+    private readonly IDistributedCache<PermissionGrantCacheItem> _cache;
+
+    public Task HandleEventAsync(EntityUpdatedEto<PermissionGrantEto> eventData)
+        => _cache.RemoveAsync(PermissionGrantCacheItem.CalculateCacheKey(
+            eventData.Entity.Name,
+            eventData.Entity.ProviderName,
+            eventData.Entity.ProviderKey));
+}
+```
+
+## When to use `considerUow`
+
+<AccordionGroup>
+<Accordion title="Pass considerUow: true when the cache value is derived from data you are about to write">
+The classic example: a `GetActiveProductCount` query that the same UoW will mutate. Reading without `considerUow` returns a stale number; reading with `considerUow` plus a follow-up `Remove` on the same key keeps the count consistent inside the UoW and only flushes the new value to the backing store after commit.
+</Accordion>
+
+<Accordion title="Pass considerUow: false (default) for cross-call reads">
+Cache items whose source of truth is owned by a different process (other services, external APIs) should *not* be UoW-staged — the staging dictionary is per UoW and gives no isolation against the outside world.
+</Accordion>
+
+<Accordion title="Pass considerUow: true for batches that must commit atomically">
+`SetManyAsync` followed by a UoW commit gives you "all or nothing" semantics for the batch. The single `OnCompleted` callback fires only on a successful commit; rollback discards every staged entry in the batch.
+</Accordion>
+
+<Accordion title="Do not call IDistributedCache directly from a constructor or static initialiser">
+`UnitOfWorkManager.Current` is `AsyncLocal` and may be `null` outside a request scope. `ShouldConsiderUow` already guards the staging path, but constructor-time `Set`/`Remove` calls bypass the deferral entirely.
+</Accordion>
+</AccordionGroup>
+
+## Manual invalidation surface
+
+`IDistributedCache<TCacheItem, TCacheKey>` exposes the standard `Remove`/`RemoveAsync`/`RemoveMany`/`RemoveManyAsync` quartet plus the `KeyValuePair`-based bulk get/set. The forwarder `IDistributedCache<TCacheItem>` (single-generic) constrains the key to `string` and is what most service code injects:
+
+```csharp
+public class CatalogAppService : ApplicationService
+{
+    private readonly IDistributedCache<ProductCacheItem> _cache;
+
+    public async Task UpdateAsync(Guid id, ProductUpdateDto input)
+    {
+        var product = await _productRepo.UpdateAsync(/* … */);
+        await _cache.RemoveAsync(product.Id.ToString());
+    }
+}
+```
+
+Because this `RemoveAsync` runs inside the application-service UoW, it executes immediately (no `considerUow: true`). If the UoW rolls back, the cache entry is *gone* even though the row didn't change — the next read repopulates from the DB, which is fine. The opposite ordering (cache stays, DB rolled back) is the dangerous one and is why event-driven invalidators tend to `Remove` rather than `Set`.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Caching overview" icon="bolt" href="/caching/overview">
+    `[CacheName]`, `[IgnoreMultiTenancy]`, `IDistributedCache<TCacheItem>` registration patterns.
+  </Card>
+  <Card title="Unit of work lifecycle" icon="circle-arrow-right" href="/flows/unit-of-work-lifecycle">
+    `OnCompleted` semantics that drive the deferred flush.
+  </Card>
+  <Card title="Local event bus" icon="bell" href="/events/local-event-bus">
+    `EntityChangedEventData<T>` and the handler discovery used by `PermissionGrantCacheItemInvalidator`.
+  </Card>
+  <Card title="Distributed event publishing" icon="tower-broadcast" href="/flows/distributed-event-publishing">
+    Cross-service cache invalidation via `IDistributedEventHandler<TEto>`.
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Reads inside a UoW see the old value even though I called RemoveAsync">
+    You did not pass `considerUow: true` on the read **or** on the remove. Stage the removal in the UoW dictionary by calling `RemoveAsync(key, considerUow: true)` and read with the same flag.
+  </Accordion>
+  <Accordion title="Set never reaches Redis">
+    The UoW rolled back. `OnCompleted` does not fire on a rolled-back UoW; the staged value is discarded. Check `IUnitOfWork.Failed` and the inner exception.
+  </Accordion>
+  <Accordion title="Two tenants see each other's cache values">
+    The cache item is decorated with `[IgnoreMultiTenancy]` or the resolved `CurrentTenant.Id` is null because the request hit before `MultiTenancyMiddleware`. Verify the middleware order and the `[IgnoreMultiTenancy]` attribute.
+  </Accordion>
+  <Accordion title="`AbpException: There is no active UOW`">
+    A caller invoked `GetUnitOfWorkCache()` (typically by passing `considerUow: true`) while `UnitOfWorkManager.Current` was null. Wrap the call in `using (var uow = _uowManager.Begin())` or set `considerUow: false`.
+  </Accordion>
+  <Accordion title="Permission changes don't take effect until app restart">
+    The `EntityChangedEventData<PermissionGrant>` handler did not run. Check that `Volo.Abp.PermissionManagement.Domain` is referenced and that the local event bus is wired — see [Local event bus](/events/local-event-bus).
+  </Accordion>
+</AccordionGroup>

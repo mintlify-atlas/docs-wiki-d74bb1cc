@@ -257,23 +257,29 @@ public class AbpUsersMongoDbModule : AbpModule { }
 
 Again — no DI registrations. The Mongo base is inherited; the consuming module (Identity, etc.) registers the concrete.
 
-## How Identity plugs in (reference example)
+## Who actually uses these bases
 
-To make the abstract pattern concrete, here's the inheritance chain in Identity:
+The Identity module is the most visible `IUser` implementer, but it does **not** inherit from `EfCoreUserRepositoryBase`. Identity needs joins onto `IdentityUserRole`, `IdentityUserClaim`, `IdentityUserLogin`, etc., so it derives directly from the framework's `EfCoreRepository<IIdentityDbContext, IdentityUser, Guid>` and exposes a fatter `IIdentityUserRepository : IBasicRepository<IdentityUser, Guid>` contract.
 
-```csharp
-// In Volo.Abp.Identity.EntityFrameworkCore
-public class EfCoreIdentityUserRepository
-    : EfCoreUserRepositoryBase<IIdentityDbContext, IdentityUser>,
-      IIdentityUserRepository
+The OSS modules that *do* ride these generic bases are Blogging and CMS Kit, both of which keep a thin shadow of `IUser` for things like comment authorship:
+
+```csharp title="modules/blogging/src/Volo.Blogging.EntityFrameworkCore/Volo/Blogging/Users/EfCoreBlogUserRepository.cs"
+public class EfCoreBlogUserRepository
+    : EfCoreUserRepositoryBase<IBloggingDbContext, BlogUser>, IBlogUserRepository
 {
-    public EfCoreIdentityUserRepository(IDbContextProvider<IIdentityDbContext> dbContextProvider)
-        : base(dbContextProvider) { }
-
-    // Override FindByUserNameAsync to use NormalizedUserName for case-insensitive lookups
-    // Add Identity-specific queries (GetRolesAsync, GetClaimsAsync, …)
+    // inherits FindByUserNameAsync, SearchAsync, GetCountAsync, GetListAsync(ids)
 }
 ```
+
+```csharp title="modules/cms-kit/src/Volo.CmsKit.EntityFrameworkCore/Volo/CmsKit/Users/EfCoreCmsUserRepository.cs"
+public class EfCoreCmsUserRepository
+    : EfCoreUserRepositoryBase<ICmsKitDbContext, CmsUser>, ICmsUserRepository
+{
+    // same — adds CmsUser-specific overloads only when needed
+}
+```
+
+The Mongo siblings — `MongoBlogUserRepository` and `MongoCmsUserRepository` — derive from `MongoUserRepositoryBase<TDbContext, TUser>` with identical shape. That's the structural payoff: if Blogging swaps its persistence provider, the `IBlogUserRepository` consumers never notice.
 
 ```mermaid
 classDiagram
@@ -289,6 +295,12 @@ classDiagram
     class EfCoreUserRepositoryBase {
         <<users module abstract>>
     }
+    class IBlogUserRepository {
+        <<blogging module>>
+    }
+    class EfCoreBlogUserRepository {
+        <<blogging module>>
+    }
     class IIdentityUserRepository {
         <<identity module>>
     }
@@ -297,14 +309,19 @@ classDiagram
     }
 
     IRepository_TUser_Guid_ <|.. EfCoreRepository
-    IUserRepository_TUser_ <|-- IIdentityUserRepository
+    IUserRepository_TUser_ <|-- IBlogUserRepository
     EfCoreRepository <|-- EfCoreUserRepositoryBase
     IUserRepository_TUser_ <|.. EfCoreUserRepositoryBase
-    EfCoreUserRepositoryBase <|-- EfCoreIdentityUserRepository
+    EfCoreUserRepositoryBase <|-- EfCoreBlogUserRepository
+    IBlogUserRepository <|.. EfCoreBlogUserRepository
+
+    EfCoreRepository <|-- EfCoreIdentityUserRepository
     IIdentityUserRepository <|.. EfCoreIdentityUserRepository
 ```
 
-The Identity module also has a `MongoIdentityUserRepository` extending `MongoUserRepositoryBase<IIdentityMongoDbContext, IdentityUser>` with the exact same shape. That's why switching Identity from EF to Mongo is a *package swap*, not a code change.
+<Note>
+The Identity branch on the right intentionally skips `EfCoreUserRepositoryBase`. Identity reuses the `IUser` aggregate contract and the `ConfigureAbpUser<TUser>` mapping extension, but its repository surface is too rich to be expressed through `IUserRepository<TUser>`. That's the seam between the Users module (cross‑module abstractions) and the Identity module (full‑fat user management).
+</Note>
 
 ## How to use it for a custom aggregate
 
